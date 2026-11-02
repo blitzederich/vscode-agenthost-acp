@@ -29,21 +29,25 @@ import type {
 	AcpXaiToolMeta,
 } from './protocol/acpTypes.js';
 
+export interface IGrokBuildToolCallEntry {
+	readonly toolCallId: string;
+	readonly toolName: string;
+	displayName: string;
+	readonly permissionKind: AgentPermissionKind;
+	readonly permissionPath?: string;
+	readonly toolKind?: 'subagent' | 'exit_plan';
+	readonly subagentDescription?: string;
+	/** Plan markdown attached when `_x.ai/exit_plan_mode` arrives. */
+	planContent?: string;
+	started: boolean;
+	completed: boolean;
+}
+
 export interface IGrokBuildMapState {
 	readonly turnId: string;
 	markdownPartId: string | undefined;
 	reasoningPartId: string | undefined;
-	readonly toolCalls: Map<string, {
-		readonly toolCallId: string;
-		readonly toolName: string;
-		readonly displayName: string;
-		readonly permissionKind: AgentPermissionKind;
-		readonly permissionPath?: string;
-		readonly toolKind?: 'subagent';
-		readonly subagentDescription?: string;
-		started: boolean;
-		completed: boolean;
-	}>;
+	readonly toolCalls: Map<string, IGrokBuildToolCallEntry>;
 	planSnapshots: number;
 	/**
 	 * Live grok emits `todo_write` and ACP `plan` for the same list.
@@ -51,6 +55,9 @@ export interface IGrokBuildMapState {
 	 */
 	todoSource?: 'tool' | 'plan';
 }
+
+/** Host display title for grok's `exit_plan_mode` / `_x.ai/exit_plan_mode` tool card. */
+export const GROK_PRESENT_PLAN_DISPLAY_NAME = 'Present plan';
 
 export function createGrokBuildMapState(turnId: string): IGrokBuildMapState {
 	return {
@@ -190,7 +197,7 @@ function resolveToolIdentity(update: AcpToolCallUpdate): {
 	permissionKind: AgentPermissionKind;
 	permissionPath?: string;
 	isEdit: boolean;
-	toolKind?: 'subagent';
+	toolKind?: 'subagent' | 'exit_plan';
 	subagentDescription?: string;
 } {
 	const xai = xaiToolMeta(update);
@@ -198,6 +205,17 @@ function resolveToolIdentity(update: AcpToolCallUpdate): {
 	const name = xai?.name ?? update.title ?? 'tool';
 	const label = xai?.label ?? update.title ?? name;
 	const path = extractPath(update);
+
+	if (kind === 'exit_plan' || name === 'exit_plan_mode') {
+		return {
+			toolName: 'exit_plan_mode',
+			displayName: GROK_PRESENT_PLAN_DISPLAY_NAME,
+			permissionKind: AgentPermissionKind.Read,
+			permissionPath: path,
+			isEdit: false,
+			toolKind: 'exit_plan',
+		};
+	}
 
 	if (isSubagentTool(kind, typeof name === 'string' ? name : undefined) || name === 'spawn_subagent') {
 		const description = subagentDescription(update) ?? (typeof label === 'string' ? label : name);
@@ -262,11 +280,50 @@ function subagentDescription(update: AcpToolCallUpdate): string | undefined {
 	return undefined;
 }
 
-function toolCallMeta(entry: { readonly toolKind?: 'subagent'; readonly subagentDescription?: string }): Record<string, unknown> | undefined {
-	if (entry.toolKind !== 'subagent') {
+function toolCallMeta(entry: { readonly toolKind?: 'subagent' | 'exit_plan'; readonly subagentDescription?: string }): Record<string, unknown> | undefined {
+	if (entry.toolKind === 'subagent') {
+		return toToolCallMeta({ toolKind: 'subagent', subagentDescription: entry.subagentDescription });
+	}
+	return undefined;
+}
+
+/** Nested ACP `{ type: 'content', content: { type: 'text', text } }` blocks become tool result text. */
+export function textFromToolCallContent(content: readonly unknown[] | undefined): string | undefined {
+	if (!content || content.length === 0) {
 		return undefined;
 	}
-	return toToolCallMeta({ toolKind: 'subagent', subagentDescription: entry.subagentDescription });
+	const parts: string[] = [];
+	for (const block of content) {
+		if (!block || typeof block !== 'object') {
+			continue;
+		}
+		const record = block as { type?: unknown; content?: unknown; text?: unknown };
+		if (record.type === 'content' && record.content && typeof record.content === 'object') {
+			const nested = record.content as { type?: unknown; text?: unknown };
+			if (typeof nested.text === 'string' && nested.text.length > 0) {
+				parts.push(nested.text);
+			}
+			continue;
+		}
+		if (record.type === 'text' && typeof record.text === 'string' && record.text.length > 0) {
+			parts.push(record.text);
+		}
+	}
+	return parts.length > 0 ? parts.join('\n') : undefined;
+}
+
+function isExitPlanPlaceholderInput(raw: unknown): boolean {
+	if (raw === undefined || raw === null) {
+		return true;
+	}
+	if (typeof raw !== 'object' || Array.isArray(raw)) {
+		return false;
+	}
+	const keys = Object.keys(raw as Record<string, unknown>);
+	if (keys.length === 0) {
+		return true;
+	}
+	return keys.length === 1 && (raw as { variant?: unknown }).variant === 'ExitPlanMode';
 }
 
 function mapPlanUpdate(state: IGrokBuildMapState, entries: unknown): (SessionAction | ChatAction)[] {
@@ -349,7 +406,15 @@ function extractPath(update: AcpToolCallUpdate): string | undefined {
 	return typeof xaiPath === 'string' ? xaiPath : undefined;
 }
 
-function toolInputText(update: AcpToolCallUpdate): string {
+function toolInputText(update: AcpToolCallUpdate, entry?: IGrokBuildToolCallEntry): string {
+	if (entry?.toolKind === 'exit_plan' || xaiToolMeta(update)?.kind === 'exit_plan' || xaiToolMeta(update)?.name === 'exit_plan_mode') {
+		if (entry?.planContent) {
+			return entry.planContent;
+		}
+		if (isExitPlanPlaceholderInput(update.rawInput)) {
+			return '';
+		}
+	}
 	if (update.rawInput === undefined || update.rawInput === null) {
 		return update.title ?? '';
 	}
@@ -427,12 +492,17 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 		};
 		state.toolCalls.set(toolCallId, entry);
 	} else if (update.title || identity.displayName !== entry.displayName || identity.toolKind) {
+		const keepPresentPlanTitle = entry.toolKind === 'exit_plan' || identity.toolKind === 'exit_plan';
 		entry = {
 			...entry,
-			displayName: update.title ?? identity.displayName,
+			displayName: keepPresentPlanTitle
+				? GROK_PRESENT_PLAN_DISPLAY_NAME
+				: (update.title ?? identity.displayName),
 			permissionPath: identity.permissionPath ?? entry.permissionPath,
 			permissionKind: identity.permissionKind,
-			toolName: identity.toolKind === 'subagent' ? identity.toolName : identity.isEdit ? 'file_edit' : entry.toolName,
+			toolName: identity.toolKind === 'subagent' || identity.toolKind === 'exit_plan'
+				? identity.toolName
+				: identity.isEdit ? 'file_edit' : entry.toolName,
 			toolKind: identity.toolKind ?? entry.toolKind,
 			subagentDescription: identity.subagentDescription ?? entry.subagentDescription,
 		};
@@ -443,7 +513,7 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 		entry.started = true;
 		// Post-tool assistant text must open a new markdown part.
 		state.markdownPartId = undefined;
-		const input = toolInputText(update);
+		const input = toolInputText(update, entry);
 		const callMeta = meta();
 		actions.push(
 			{
@@ -454,13 +524,13 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 				displayName: entry.displayName,
 				...(callMeta ? { _meta: callMeta } : {}),
 			},
-			{
-				type: ActionType.ChatToolCallDelta,
+			...(input ? [{
+				type: ActionType.ChatToolCallDelta as const,
 				turnId: state.turnId,
 				toolCallId,
 				content: input,
 				...(callMeta ? { _meta: callMeta } : {}),
-			},
+			}] : []),
 			{
 				type: ActionType.ChatToolCallReady,
 				turnId: state.turnId,
@@ -471,41 +541,67 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 				...(callMeta ? { _meta: callMeta } : {}),
 			},
 		);
-	} else if (update.title && update.sessionUpdate === 'tool_call_update') {
+	} else if (update.title && update.sessionUpdate === 'tool_call_update' && entry.toolKind !== 'exit_plan') {
 		// Refresh invocation presentation when Grok upgrades the title (e.g. edit path).
-		actions.push({
-			type: ActionType.ChatToolCallDelta,
-			turnId: state.turnId,
-			toolCallId,
-			content: toolInputText(update),
-		});
+		const input = toolInputText(update, entry);
+		if (input) {
+			actions.push({
+				type: ActionType.ChatToolCallDelta,
+				turnId: state.turnId,
+				toolCallId,
+				content: input,
+			});
+		}
 	}
 
 	const diffContent = mapDiffContents(update);
-	if (diffContent.length > 0) {
+	const contentText = textFromToolCallContent(update.content);
+	const contentBlocks: { type: ToolResultContentType.Text; text: string }[] = [
+		...diffContent,
+		...(contentText && entry.toolKind === 'exit_plan'
+			? [{ type: ToolResultContentType.Text as const, text: contentText }]
+			: []),
+		...(entry.planContent && entry.toolKind === 'exit_plan' && !contentText
+			? [{ type: ToolResultContentType.Text as const, text: entry.planContent }]
+			: []),
+	];
+	if (contentBlocks.length > 0 && (diffContent.length > 0 || (entry.toolKind === 'exit_plan' && (contentText || entry.planContent) && !entry.completed))) {
 		actions.push({
 			type: ActionType.ChatToolCallContentChanged,
 			turnId: state.turnId,
 			toolCallId,
-			content: diffContent,
+			content: contentBlocks,
 		});
 	}
 
 	const status = (update.status ?? '').toLowerCase();
 	if ((status === 'completed' || status === 'failed' || status === 'cancelled') && !entry.completed) {
 		entry.completed = true;
-		const outputText = update.rawOutput !== undefined
-			? (typeof update.rawOutput === 'string' ? update.rawOutput : (() => { try { return JSON.stringify(update.rawOutput); } catch { return ''; } })())
-			: undefined;
+		const contentMessage = textFromToolCallContent(update.content);
+		const outputText = contentMessage
+			?? (update.rawOutput !== undefined
+				? (typeof update.rawOutput === 'string' ? update.rawOutput : (() => { try { return JSON.stringify(update.rawOutput); } catch { return ''; } })())
+				: undefined);
 		const success = status === 'completed';
+		const failureMessage = contentMessage || outputText || 'Tool call failed';
+		const resultContent: { type: ToolResultContentType.Text; text: string }[] = [
+			...diffContent,
+			...(entry.planContent && entry.toolKind === 'exit_plan'
+				? [{ type: ToolResultContentType.Text as const, text: entry.planContent }]
+				: []),
+			...(outputText && outputText !== entry.planContent
+				? [{ type: ToolResultContentType.Text as const, text: outputText }]
+				: []),
+		];
 		const result: ToolCallResult = {
 			success,
-			pastTenseMessage: success ? entry.displayName : `${entry.displayName} failed`,
-			content: [
-				...diffContent,
-				...(outputText ? [{ type: ToolResultContentType.Text as const, text: outputText }] : []),
-			],
-			...(status === 'failed' ? { error: { message: outputText || 'Tool call failed' } } : {}),
+			pastTenseMessage: success
+				? (entry.toolKind === 'exit_plan' ? GROK_PRESENT_PLAN_DISPLAY_NAME : entry.displayName)
+				: (status === 'cancelled'
+					? localizeCancelledTool(entry.displayName)
+					: `${entry.displayName} failed`),
+			content: resultContent,
+			...(status === 'failed' ? { error: { message: failureMessage } } : {}),
 		};
 		const callMeta = meta();
 		actions.push({
@@ -518,6 +614,72 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 	}
 
 	return actions;
+}
+
+function localizeCancelledTool(displayName: string): string {
+	return `${displayName} cancelled`;
+}
+
+/**
+ * Attach plan markdown to an in-flight `exit_plan` tool card so the plan stays
+ * visible in chat history after the review UI closes.
+ */
+export function mapExitPlanContent(
+	state: IGrokBuildMapState,
+	toolCallId: string,
+	planContent: string,
+): (SessionAction | ChatAction)[] {
+	const entry = state.toolCalls.get(toolCallId);
+	if (!entry) {
+		return [];
+	}
+	entry.planContent = planContent;
+	entry.displayName = GROK_PRESENT_PLAN_DISPLAY_NAME;
+	if (entry.completed || !planContent) {
+		return [];
+	}
+	return [
+		{
+			type: ActionType.ChatToolCallDelta,
+			turnId: state.turnId,
+			toolCallId,
+			content: planContent,
+		},
+		{
+			type: ActionType.ChatToolCallContentChanged,
+			turnId: state.turnId,
+			toolCallId,
+			content: [{ type: ToolResultContentType.Text, text: planContent }],
+		},
+	];
+}
+
+/**
+ * Locally complete an `exit_plan_mode` tool card as cancelled. grok sends no
+ * `tool_call_update` for that card when the client cancels while the review is pending.
+ */
+export function mapExitPlanCancelled(
+	state: IGrokBuildMapState,
+	toolCallId: string,
+): (SessionAction | ChatAction)[] {
+	const entry = state.toolCalls.get(toolCallId);
+	if (!entry || entry.completed) {
+		return [];
+	}
+	entry.completed = true;
+	const content = entry.planContent
+		? [{ type: ToolResultContentType.Text as const, text: entry.planContent }]
+		: [];
+	return [{
+		type: ActionType.ChatToolCallComplete,
+		turnId: state.turnId,
+		toolCallId,
+		result: {
+			success: false,
+			pastTenseMessage: localizeCancelledTool(entry.displayName),
+			content,
+		},
+	}];
 }
 
 export function mapUsage(turnId: string, usage: AcpUsage | undefined): (SessionAction | ChatAction)[] {

@@ -195,6 +195,46 @@ suite('GrokBuild AcpClient', () => {
 		assert.strictEqual(reply.result.outcome.optionId, 'allow-once');
 	});
 
+	test('exit_plan_mode server request reaches a registered handler', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		store.add(client.onRequest('_x.ai/exit_plan_mode', async params => {
+			assert.strictEqual(params.sessionId, 'sess-plan');
+			assert.strictEqual(params.toolCallId, 'call-plan');
+			assert.strictEqual(params.planContent, '# Plan');
+			return { result: { outcome: 'approved' } };
+		}));
+
+		peer.push({
+			jsonrpc: '2.0',
+			id: 7,
+			method: '_x.ai/exit_plan_mode',
+			params: {
+				sessionId: 'sess-plan',
+				toolCallId: 'call-plan',
+				planContent: '# Plan',
+			},
+		});
+		const reply = await readNextMessage(peer.outbound) as { id: number; result: { outcome: string } };
+		assert.strictEqual(reply.id, 7);
+		assert.strictEqual(reply.result.outcome, 'approved');
+	});
+
+	test('unregistered exit_plan_mode still returns MethodNotFound', async () => {
+		const peer = store.add(makeFakePeer());
+		store.add(new AcpClient(peer.transport));
+		peer.push({
+			jsonrpc: '2.0',
+			id: 8,
+			method: '_x.ai/exit_plan_mode',
+			params: { sessionId: 's', toolCallId: 'c', planContent: '# x' },
+		});
+		const reply = await readNextMessage(peer.outbound) as { id: number; error: { code: number; message: string } };
+		assert.strictEqual(reply.id, 8);
+		assert.strictEqual(reply.error.code, AcpJsonRpcErrorCode.MethodNotFound);
+		assert.match(reply.error.message, /Method not found/);
+	});
+
 	test('session/cancel notification is written with jsonrpc', async () => {
 		const peer = store.add(makeFakePeer());
 		const client = store.add(new AcpClient(peer.transport));
