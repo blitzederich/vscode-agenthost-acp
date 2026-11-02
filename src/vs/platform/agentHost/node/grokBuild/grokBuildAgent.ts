@@ -86,8 +86,8 @@ import {
 } from './grokBuildLaunchConfig.js';
 import {
 	createGrokBuildMapState,
-	mapExitPlanCancelled,
 	mapExitPlanContent,
+	mapPendingRequestCancelled,
 	mapPermissionRequest,
 	mapSessionUpdate,
 	mapTurnCompleted,
@@ -1153,6 +1153,9 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			}
 			rethrowAcpFailure(err);
 		} finally {
+			// Grok may finish the ask/plan card (timeout, decline text) without
+			// waiting for our ACP reply. Drop leftover UI without writing late results.
+			this._abandonPendingInteractiveRequestsForChat(chat, { cancelToolCards: true });
 			backing.activeTurnId = undefined;
 			backing.mapState = undefined;
 			backing.turnAssistantMarkdown = undefined;
@@ -1362,6 +1365,48 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 	}
 
 	/**
+	 * Drop parked ask / plan-review UIs for a chat without writing ACP replies.
+	 * Used when grok already finished the tool (timeout) or the turn ended.
+	 */
+	private _abandonPendingInteractiveRequestsForChat(chat: URI, options?: { readonly cancelToolCards?: boolean }): void {
+		const chatKeyStr = chat.toString();
+		for (const [requestId, pending] of [...this._pendingAskUserQuestions]) {
+			if (pending.chat.toString() !== chatKeyStr) {
+				continue;
+			}
+			this._abandonAskUserQuestion(requestId, pending, options?.cancelToolCards !== false);
+		}
+		for (const [requestId, pending] of [...this._pendingPlanReviews]) {
+			if (pending.chat.toString() !== chatKeyStr) {
+				continue;
+			}
+			this._abandonPlanReview(requestId, pending, options?.cancelToolCards !== false);
+		}
+	}
+
+	/**
+	 * When grok completes/fails a tool card that still has a parked agent→client
+	 * request, drop the ChatInput UI without sending a late ACP reply.
+	 */
+	private _abandonPendingInteractiveForToolCall(sessionId: string, toolCallId: string | undefined): void {
+		if (!toolCallId) {
+			return;
+		}
+		for (const [requestId, pending] of [...this._pendingAskUserQuestions]) {
+			if (pending.sessionId !== sessionId || pending.toolCallId !== toolCallId) {
+				continue;
+			}
+			this._abandonAskUserQuestion(requestId, pending, false);
+		}
+		for (const [requestId, pending] of [...this._pendingPlanReviews]) {
+			if (pending.sessionId !== sessionId || pending.toolCallId !== toolCallId) {
+				continue;
+			}
+			this._abandonPlanReview(requestId, pending, false);
+		}
+	}
+
+	/**
 	 * Resolve a parked plan review without approving, dismiss the review UI, and
 	 * mark the exit_plan_mode tool card cancelled (grok sends no update for it).
 	 */
@@ -1383,7 +1428,33 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		});
 		const backing = this._backings.get(chatKey(pending.chat));
 		if (backing?.mapState) {
-			for (const action of mapExitPlanCancelled(backing.mapState, pending.toolCallId)) {
+			for (const action of mapPendingRequestCancelled(backing.mapState, pending.toolCallId)) {
+				this._fireAction(pending.chat, action);
+			}
+		}
+	}
+
+	/**
+	 * Drop a parked plan review without an ACP reply (grok already finished the
+	 * card or stopped waiting). Intentionally does not call `pending.resolve`.
+	 */
+	private _abandonPlanReview(requestId: string, pending: IPendingPlanReview, cancelToolCard: boolean): void {
+		if (!this._pendingPlanReviews.has(requestId)) {
+			return;
+		}
+		this._pendingPlanReviews.delete(requestId);
+		this._sessionsExitingPlanMode.delete(pending.sessionId);
+		this._fireAction(pending.chat, {
+			type: ActionType.ChatInputCompleted,
+			requestId,
+			response: ChatInputResponseKind.Cancel,
+		});
+		if (!cancelToolCard) {
+			return;
+		}
+		const backing = this._backings.get(chatKey(pending.chat));
+		if (backing?.mapState) {
+			for (const action of mapPendingRequestCancelled(backing.mapState, pending.toolCallId)) {
 				this._fireAction(pending.chat, action);
 			}
 		}
@@ -1425,7 +1496,32 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		});
 		const backing = this._backings.get(chatKey(pending.chat));
 		if (backing?.mapState) {
-			for (const action of mapExitPlanCancelled(backing.mapState, pending.toolCallId)) {
+			for (const action of mapPendingRequestCancelled(backing.mapState, pending.toolCallId)) {
+				this._fireAction(pending.chat, action);
+			}
+		}
+	}
+
+	/**
+	 * Drop a parked ask without an ACP reply (timeout / turn end). Intentionally
+	 * does not call `pending.resolve` so AcpClient writes nothing.
+	 */
+	private _abandonAskUserQuestion(requestId: string, pending: IPendingAskUserQuestion, cancelToolCard: boolean): void {
+		if (!this._pendingAskUserQuestions.has(requestId)) {
+			return;
+		}
+		this._pendingAskUserQuestions.delete(requestId);
+		this._fireAction(pending.chat, {
+			type: ActionType.ChatInputCompleted,
+			requestId,
+			response: ChatInputResponseKind.Cancel,
+		});
+		if (!cancelToolCard) {
+			return;
+		}
+		const backing = this._backings.get(chatKey(pending.chat));
+		if (backing?.mapState) {
+			for (const action of mapPendingRequestCancelled(backing.mapState, pending.toolCallId)) {
 				this._fireAction(pending.chat, action);
 			}
 		}
@@ -2035,6 +2131,14 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		const actions = mapSessionUpdate(backing.mapState, params);
 		for (const action of actions) {
 			this._fireAction(chat, action);
+		}
+		const update = params.update;
+		if (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') {
+			const status = (update.status ?? '').toLowerCase();
+			if (status === 'completed' || status === 'failed' || status === 'cancelled') {
+				// Grok finished the card (e.g. ask timeout) without waiting for our reply.
+				this._abandonPendingInteractiveForToolCall(params.sessionId, update.toolCallId);
+			}
 		}
 	}
 

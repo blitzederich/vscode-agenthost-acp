@@ -13,6 +13,7 @@ import { ActionType, type ChatAction } from '../../../common/state/sessionAction
 import { ChatOriginKind, ResponsePartKind, SessionStatus, ToolResultContentType, type ChatState } from '../../../common/state/sessionState.js';
 import {
 	createGrokBuildMapState,
+	GROK_ASK_USER_DISPLAY_NAME,
 	GROK_PRESENT_PLAN_DISPLAY_NAME,
 	mapExitPlanContent,
 	mapPermissionRequest,
@@ -452,5 +453,80 @@ suite('GrokBuild mapSessionUpdates', () => {
 		assert.strictEqual(complete.result.success, true);
 		assert.ok(complete.result.content?.some(block => block.type === ToolResultContentType.Text && block.text === 'src/a.ts:1:foo\nsrc/b.ts:2:foo\n'));
 		assert.ok(!complete.result.content?.some(block => block.type === ToolResultContentType.Text && block.text === 'found 40 matches'));
+	});
+
+	test('ask_user tool cards keep Ask User label and prefer content / UserAnswered.message', () => {
+		const state = createGrokBuildMapState('turn-1');
+		const start = mapSessionUpdate(state, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'tool_call',
+				toolCallId: 'call-ask',
+				title: 'ask_user_question',
+				rawInput: { questions: [{ question: 'Q?', options: [{ label: 'A', description: 'a' }], multiSelect: null }] },
+				_meta: { 'x.ai/tool': { name: 'ask_user_question', kind: 'ask_user', label: 'Ask User', read_only: true } },
+			},
+		});
+		const startAction = start.find(action => action.type === ActionType.ChatToolCallStart);
+		assert.ok(startAction && startAction.type === ActionType.ChatToolCallStart);
+		assert.strictEqual(startAction.displayName, GROK_ASK_USER_DISPLAY_NAME);
+		assert.strictEqual(startAction.toolName, 'ask_user_question');
+
+		const titleOnly = mapSessionUpdate(state, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'tool_call_update',
+				toolCallId: 'call-ask',
+				kind: 'other',
+				title: 'Ask: Q?',
+				rawInput: { variant: 'AskUserQuestion', questions: [{ question: 'Q?', options: [{ label: 'A', description: 'a' }], multiSelect: null }] },
+			},
+		});
+		assert.ok(!titleOnly.some(action => action.type === ActionType.ChatToolCallComplete));
+		assert.strictEqual(state.toolCalls.get('call-ask')?.displayName, GROK_ASK_USER_DISPLAY_NAME);
+
+		const declined = 'User declined to answer the questions. Continue with the task using your best judgment, or ask different questions.';
+		const withContent = mapSessionUpdate(state, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'tool_call_update',
+				toolCallId: 'call-ask',
+				status: 'completed',
+				content: [{ type: 'content', content: { type: 'text', text: declined } }],
+				rawOutput: { type: 'AskUserQuestion', UserAnswered: { message: declined } },
+			},
+		});
+		const complete = withContent.find(action => action.type === ActionType.ChatToolCallComplete);
+		assert.ok(complete && complete.type === ActionType.ChatToolCallComplete);
+		assert.strictEqual(complete.result.success, true);
+		assert.strictEqual(complete.result.pastTenseMessage, GROK_ASK_USER_DISPLAY_NAME);
+		assert.ok(complete.result.content?.some(block => block.type === ToolResultContentType.Text && block.text === declined));
+		assert.ok(!complete.result.content?.some(block => block.type === ToolResultContentType.Text && block.text.includes('"type":"AskUserQuestion"')));
+
+		const state2 = createGrokBuildMapState('turn-2');
+		mapSessionUpdate(state2, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'tool_call',
+				toolCallId: 'call-ask-2',
+				title: 'ask_user_question',
+				_meta: { 'x.ai/tool': { name: 'ask_user_question', kind: 'ask_user', label: 'Ask User', read_only: true } },
+			},
+		});
+		const messageOnly = 'User has answered your questions: "Q?"="A" … You can now continue with the user\'s answers in mind.';
+		const rawOnly = mapSessionUpdate(state2, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'tool_call_update',
+				toolCallId: 'call-ask-2',
+				status: 'completed',
+				rawOutput: { type: 'AskUserQuestion', UserAnswered: { message: messageOnly } },
+			},
+		});
+		const complete2 = rawOnly.find(action => action.type === ActionType.ChatToolCallComplete);
+		assert.ok(complete2 && complete2.type === ActionType.ChatToolCallComplete);
+		assert.strictEqual(complete2.result.pastTenseMessage, GROK_ASK_USER_DISPLAY_NAME);
+		assert.ok(complete2.result.content?.some(block => block.type === ToolResultContentType.Text && block.text === messageOnly));
+		assert.ok(!JSON.stringify(complete2.result.content).includes('"type":"AskUserQuestion"'));
 	});
 });
