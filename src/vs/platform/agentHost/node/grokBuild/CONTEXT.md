@@ -26,19 +26,42 @@ Agents window / Chat view
 
 Binary resolution (first hit wins): setting
 `chat.agentHost.grokBuildAgent.binaryPath` → `PATH` → `~/.grok/bin/grok` →
-`~/.local/bin/grok`. Registration requires
+`~/.local/bin/grok`. When the setting/env path is set but missing, fail
+(`grokCliMissingError`) — do **not** fall back to PATH. Registration requires
 `chat.agentHost.grokBuildAgent.enabled` (default `false`, experimental) **and**
 a resolvable binary.
 
-Launch always forces an interactive permission mode so
-`session/request_permission` reaches VS Code even when the user's
-`~/.grok/config.toml` sets `permission_mode = "always-approve"`. Never default
-to auto-approve / yolo.
+Verified launch argv (grok **1.0.70**):
 
-Verified against grok **1.0.70** (2026-11-02 wire logs): must call
-`authenticate { methodId: "grok.com" }` before `session/new`; models come from
-the `session/new` result; tolerate unknown `sessionUpdate` kinds and
-`_x.ai/*` notifications.
+```
+['--no-auto-update', '--permission-mode', 'default', 'agent', '--no-leader', 'stdio']
+```
+
+- `--permission-mode` is **top-level only** (`default|acceptEdits|auto|dontAsk|bypassPermissions|plan`). After `agent`/`stdio` it exits 2.
+- `--no-leader` is valid **only after** `agent`. Top-level `--no-leader` exits 1 ("applies to the interactive Grok UI").
+- Never pass `--always-approve` / `bypassPermissions` / `dontAsk`.
+
+Handshake: `initialize` → `authenticate { methodId: "grok.com" }` →
+`session/new`. On 1.0.70, `session/new` without authenticate also succeeded
+(cached token), but we still authenticate so the host owns the auth path.
+Connection is published only after handshake succeeds so concurrent
+`createChat` callers share `_connectionInFlight`.
+
+Models: from `session/new`; `session/set_model { sessionId, modelId }` on
+create (when `options.model` is set) and `changeModel`. Success
+`_meta.model.Ok`; unknown id → `-32602` / data `"unknown model id"`.
+
+Usage field is `cachedReadTokens` (not `cachedTokens`).
+
+Ignorable session updates / notifications: `available_commands_update`,
+`config_option_update`, `session_info_update`, `tool_call_delta_chunk`,
+`response_completed`, `turn_completed`, `session_summary_generated`,
+`pending_interaction`, `interaction_resolved`, plus `_x.ai/*` (including
+`_x.ai/session/prompt_complete`, `_x.ai/mcp_initialized`).
+
+Live edit permission options (1.0.70): `allow-edits-session` (`allow_always`),
+`allow-once` (`allow_once`), `reject-once` (`reject_once`) — no `reject_always`.
+Reject ends the prompt with `stopReason: "cancelled"`.
 
 ## Stages
 
@@ -56,13 +79,13 @@ the `session/new` result; tolerate unknown `sessionUpdate` kinds and
 
 | Member | MVP | Notes |
 |--------|-----|--------|
-| `createChat` | **Implemented** | `session/new` after shared ACP handshake + `authenticate` |
-| `sendMessage` | **Implemented** | `session/prompt`; maps `session/update` → AHP actions |
-| `abort` | **Implemented** | `session/cancel` notification; pending permissions → cancelled |
+| `createChat` | **Implemented** | `session/new` after shared ACP handshake + `authenticate`; optional `session/set_model` |
+| `sendMessage` | **Implemented** | `session/prompt`; maps `session/update` → AHP actions; failures throw only |
+| `abort` | **Implemented** | `session/cancel` on **existing** connection only (never spawn) |
 | `getMessages` | **Implemented** | In-memory `Turn[]` for the live process only |
-| `disposeChat` | **Implemented** | Drops backing; `session/close` when advertised |
+| `disposeChat` | **Implemented** | Drops backing; `session/close` when connection already up |
 | `releaseChat` | **Implemented** | Same as dispose for MVP (no durable resume yet) |
-| `changeModel` | **Implemented** | Stores selection for next prompt; `session/set_model` TODO if confirmed live |
+| `changeModel` | **Implemented** | `session/set_model` then update backing |
 | `getModel` | **Implemented** | From backing |
 | `changeAgent` | Stub | No-op (no custom agents in MVP) |
 | `prepareTurn` / `prepareChat` / `warmChat` | Stub | Omitted |
@@ -80,7 +103,7 @@ the `session/new` result; tolerate unknown `sessionUpdate` kinds and
 | `onDidSpawnChat` / `onDidDiscoverChats` | **Implemented** | Emitters present; discovery empty in MVP |
 | `chats` | **Implemented** | See table above |
 | `materializeChat` | **Implemented** | Restores opaque `{ sessionId, model }` into memory; live ACP resume is Stage 2 |
-| `respondToPermissionRequest` | **Implemented** | Maps approve → `allow_once` / deny → `reject_once` (or `reject`) |
+| `respondToPermissionRequest` | **Implemented** | Maps approve → `allow_once` / deny → `reject_once` |
 | `getOrCreateActiveClient` / `removeActiveClient` | **Implemented** | Minimal in-memory handles |
 | `onClientToolCallComplete` | Stub | No-op |
 | `respondToUserInputRequest` | Stub | No-op |
@@ -95,10 +118,8 @@ the `session/new` result; tolerate unknown `sessionUpdate` kinds and
 | All marketplace / canvas / MCP / sandbox / steering / truncate / plugin APIs | Stub | Omitted optional members |
 | `refreshModels` / discovery / legacy migration extras | Stub | Omitted or no-op |
 
-## Open TODOs (need live grok login)
+## Open TODOs
 
-1. **Exact CLI flags** — `--permission-mode default` and `--no-leader` placement vs `grok --help` (binary absent in this agent VM).
-2. **`session/set_model` / reasoning effort** — confirm method names against a logged-in CLI before wiring the model picker beyond stored selection.
-3. **Permission option ids** — wire2 was captured under always-approve (no `session/request_permission`); fixtures use ACP v1 shapes (`allow_once` / `allow_always` / `reject_once` / `reject_always`). Confirm Grok's optionId strings live.
-4. **Minimum supported version** — version gate string once `--version` format is confirmed on 1.0.70+.
-5. **Auth error taxonomy** — map additional CLI error codes beyond `-32000 Authentication required` when seen live.
+1. **Reasoning effort** — wire `session/set_model` (or sibling) effort when product UX needs it; live models advertise `reasoningEfforts` in `_meta`.
+2. **Auth error taxonomy** — auth-required is `-32000` + `/authentication required/i` only. Other live failures are `-32602 Invalid params` with detail in `error.data` (`unknown session id`, `unsupported auth method: x`, `unknown model id`); already surfaced via `formatAcpError`. Expand localized mapping if product needs friendlier copy.
+3. **Stage 2 persistence** — `session/load` / resume / discovery once durable reload is productized.

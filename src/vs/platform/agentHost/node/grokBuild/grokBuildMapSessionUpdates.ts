@@ -75,6 +75,7 @@ export function mapSessionUpdate(
 			return mapToolCall(state, update as AcpToolCallUpdate);
 		case 'available_commands_update':
 		case 'session_info_update':
+		case 'config_option_update':
 		case 'user_message_chunk':
 		case 'tool_call_delta_chunk':
 		case 'response_completed':
@@ -133,15 +134,28 @@ function mapAgentThoughtChunk(state: IGrokBuildMapState, update: AcpSessionUpdat
 	if (!text) {
 		return [];
 	}
+	const actions: (SessionAction | ChatAction)[] = [];
 	if (!state.reasoningPartId) {
+		// Reducer drops ChatReasoning for unknown part ids — seed an empty
+		// Reasoning part first (same pattern as Codex ensureReasoningPart).
 		state.reasoningPartId = generateUuid();
+		actions.push({
+			type: ActionType.ChatResponsePart,
+			turnId: state.turnId,
+			part: {
+				kind: ResponsePartKind.Reasoning,
+				id: state.reasoningPartId,
+				content: '',
+			},
+		});
 	}
-	return [{
+	actions.push({
 		type: ActionType.ChatReasoning,
 		turnId: state.turnId,
 		partId: state.reasoningPartId,
 		content: text,
-	}];
+	});
+	return actions;
 }
 
 function xaiToolMeta(update: AcpToolCallUpdate): AcpXaiToolMeta | undefined {
@@ -291,6 +305,8 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 
 	if (!entry.started) {
 		entry.started = true;
+		// Post-tool assistant text must open a new markdown part.
+		state.markdownPartId = undefined;
 		const input = toolInputText(update);
 		actions.push(
 			{
@@ -369,7 +385,7 @@ export function mapUsage(turnId: string, usage: AcpUsage | undefined): (SessionA
 	const info: UsageInfo = {
 		inputTokens: typeof usage.inputTokens === 'number' ? usage.inputTokens : undefined,
 		outputTokens: typeof usage.outputTokens === 'number' ? usage.outputTokens : undefined,
-		cacheReadTokens: typeof usage.cachedTokens === 'number' ? usage.cachedTokens : undefined,
+		cacheReadTokens: typeof usage.cachedReadTokens === 'number' ? usage.cachedReadTokens : undefined,
 	};
 	if (info.inputTokens === undefined && info.outputTokens === undefined && info.cacheReadTokens === undefined) {
 		return [];
@@ -464,7 +480,8 @@ function extractPathFromUnknown(raw: unknown): string | undefined {
 
 /**
  * Map an AHP permission response onto an ACP optionId.
- * Prefers allow_once / reject_once; falls back to allow_always / reject* kinds.
+ * Live grok 1.0.70 edit permissions expose `allow_once`, `allow_always`
+ * (`allow-edits-session`), and `reject_once` — no `reject_always`.
  */
 export function selectPermissionOptionId(
 	options: readonly { readonly optionId: string; readonly kind: string }[],

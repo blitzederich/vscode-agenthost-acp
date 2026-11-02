@@ -19,12 +19,23 @@ export const GROK_CLIENT_NAME_ENV = 'GROK_CLIENT_NAME';
 export const GROK_CLIENT_VERSION_ENV = 'GROK_CLIENT_VERSION';
 
 /**
- * Minimum major.minor.patch we accept. Confirmed against the 1.0.70 wire
- * logs used for fixtures; raise once a newer floor is verified live.
- *
- * TODO(live-grok): confirm `--version` output format on a logged-in install.
+ * Minimum major.minor.patch we accept. Verified against
+ * `grok --version` → `grok 1.0.70 (f50904eaee6c)`.
  */
 export const GROK_BUILD_MIN_VERSION = '1.0.70';
+
+/**
+ * Exact argv for ACP stdio, verified against grok 1.0.70:
+ * top-level `--permission-mode` (not after `agent`/`stdio`), and
+ * `--no-leader` only after `agent`.
+ */
+export const GROK_BUILD_ACP_ARGV = [
+	'--no-auto-update',
+	'--permission-mode', 'default',
+	'agent',
+	'--no-leader',
+	'stdio',
+] as const;
 
 export interface IGrokBuildResolvedBinary {
 	readonly path: string;
@@ -67,21 +78,36 @@ export function grokVersionTooOldError(version: string): Error {
 	));
 }
 
+export function grokHandshakeTimeoutError(phase: 'initialize' | 'authenticate'): Error {
+	return new Error(nls.localize(
+		'grokBuild.handshakeTimeout',
+		"Timed out waiting for the Grok CLI to respond to {0}. Check that `grok` is installed and responsive.",
+		phase,
+	));
+}
+
 /**
  * Resolve the `grok` binary: setting/env → PATH → ~/.grok/bin/grok →
  * ~/.local/bin/grok.
+ *
+ * When an explicit configured path is set but missing, returns `undefined`
+ * without falling back to PATH (callers throw {@link grokCliMissingError}).
  */
 export async function resolveGrokBinaryPath(
 	configuredPath: string | undefined,
 	env: NodeJS.ProcessEnv = process.env,
 	userHome: string = homedir(),
 ): Promise<string | undefined> {
-	const candidates: string[] = [];
 	const configured = (configuredPath?.trim() || env[AgentHostGrokBuildBinaryPathEnvVar]?.trim()) || undefined;
 	if (configured) {
-		candidates.push(configured);
+		if (await Promises.exists(configured)) {
+			return configured;
+		}
+		// Explicit path must not silently fall back to PATH / well-known locations.
+		return undefined;
 	}
 
+	const candidates: string[] = [];
 	const fromPath = await findExecutable('grok', undefined, undefined, env).catch(() => undefined);
 	if (fromPath) {
 		candidates.push(fromPath);
@@ -104,7 +130,7 @@ export async function resolveGrokBinaryPath(
 }
 
 /**
- * Sync existence check used at host registration time (no version spawn).
+ * Async existence check used at host registration time (no version spawn).
  */
 export async function isGrokBinaryAvailable(
 	configuredPath: string | undefined,
@@ -114,6 +140,9 @@ export async function isGrokBinaryAvailable(
 	return (await resolveGrokBinaryPath(configuredPath, env, userHome)) !== undefined;
 }
 
+/**
+ * Parse `grok --version` output such as `grok 1.0.70 (f50904eaee6c)`.
+ */
 export function parseGrokVersion(output: string): string | undefined {
 	const match = output.match(/(\d+\.\d+\.\d+)/);
 	return match?.[1];
@@ -166,11 +195,10 @@ export async function resolveGrokBinary(
 /**
  * Build argv + env for the Grok ACP stdio process.
  *
- * TODO(live-grok): verify exact flag names/placement with `grok --help`
- * (`--permission-mode default`, `--no-leader`) on a logged-in install. The
- * interactive permission mode MUST be forced so ACP
+ * Interactive `--permission-mode default` is forced so ACP
  * `session/request_permission` reaches VS Code even when the user's
- * `~/.grok/config.toml` sets always-approve.
+ * `~/.grok/config.toml` sets always-approve. Never pass
+ * `--always-approve` / `bypassPermissions` / `dontAsk`.
  */
 export function buildGrokBuildLaunchConfig(
 	binaryPath: string,
@@ -186,14 +214,7 @@ export function buildGrokBuildLaunchConfig(
 
 	return {
 		binaryPath,
-		args: [
-			'--no-auto-update',
-			'--no-leader',
-			// Force interactive permissions for this process.
-			'--permission-mode', 'default',
-			'agent',
-			'stdio',
-		],
+		args: [...GROK_BUILD_ACP_ARGV],
 		env,
 	};
 }

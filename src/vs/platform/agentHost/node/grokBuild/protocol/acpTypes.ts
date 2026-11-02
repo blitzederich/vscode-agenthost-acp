@@ -111,8 +111,21 @@ export interface AcpUsage {
 	readonly inputTokens?: number;
 	readonly outputTokens?: number;
 	readonly totalTokens?: number;
-	readonly cachedTokens?: number;
+	/** Live grok 1.0.70 field name (not `cachedTokens`). */
+	readonly cachedReadTokens?: number;
 	readonly [key: string]: unknown;
+}
+
+export interface AcpSessionSetModelParams {
+	readonly sessionId: string;
+	readonly modelId: string;
+	readonly _meta?: Record<string, unknown>;
+}
+
+export interface AcpSessionSetModelResult {
+	readonly _meta?: Record<string, unknown> & {
+		readonly model?: { readonly Ok?: string;[key: string]: unknown };
+	};
 }
 
 export interface AcpSessionCancelParams {
@@ -256,6 +269,7 @@ export type AcpClientRequestMethod =
 	| 'initialize'
 	| 'authenticate'
 	| 'session/new'
+	| 'session/set_model'
 	| 'session/prompt'
 	| 'session/close';
 
@@ -272,6 +286,7 @@ export type AcpClientRequestParams = {
 	'initialize': AcpInitializeParams;
 	'authenticate': AcpAuthenticateParams;
 	'session/new': AcpSessionNewParams;
+	'session/set_model': AcpSessionSetModelParams;
 	'session/prompt': AcpSessionPromptParams;
 	'session/close': AcpSessionCloseParams;
 };
@@ -280,6 +295,7 @@ export type AcpClientRequestResult = {
 	'initialize': AcpInitializeResult;
 	'authenticate': AcpAuthenticateResult;
 	'session/new': AcpSessionNewResult;
+	'session/set_model': AcpSessionSetModelResult;
 	'session/prompt': AcpSessionPromptResult;
 	'session/close': unknown;
 };

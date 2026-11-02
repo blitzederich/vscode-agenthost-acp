@@ -74,6 +74,12 @@ export interface IAcpClient extends IDisposable {
 		params: AcpClientNotificationParams[M],
 	): void;
 
+	/**
+	 * Reject every in-flight request (e.g. child process EACCES / EPIPE).
+	 * Does not dispose the client.
+	 */
+	rejectAllPending(reason: unknown): void;
+
 	onNotification(
 		method: AcpServerNotificationMethod,
 		handler: (params: unknown) => void,
@@ -310,6 +316,13 @@ export class AcpClient extends Disposable implements IAcpClient {
 			method,
 			params,
 		});
+	}
+
+	rejectAllPending(reason: unknown): void {
+		for (const pending of this._pending.values()) {
+			pending.reject(reason);
+		}
+		this._pending.clear();
 	}
 
 	onNotification(

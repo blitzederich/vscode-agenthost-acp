@@ -4,8 +4,9 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
+import { raceTimeout } from '../../../../base/common/async.js';
 import { Emitter } from '../../../../base/common/event.js';
-import { Disposable, DisposableStore } from '../../../../base/common/lifecycle.js';
+import { Disposable, DisposableStore, toDisposable } from '../../../../base/common/lifecycle.js';
 import { type IObservable, observableValue } from '../../../../base/common/observable.js';
 import { URI } from '../../../../base/common/uri.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
@@ -50,18 +51,19 @@ import {
 	AcpJsonRpcResponseError,
 	transportFromChildProcess,
 	type IAcpClient,
+	type IAcpTransport,
 	type AcpServerRequestHandlerResult,
 } from './acpClient.js';
 import { decodeGrokBuildChat, encodeGrokBuildChat, type IGrokBuildPersistedChat } from './grokBuildChatBacking.js';
 import {
 	buildGrokBuildLaunchConfig,
-	grokCliMissingError,
+	grokHandshakeTimeoutError,
 	grokNotLoggedInError,
 	resolveGrokBinary,
+	type IGrokBuildLaunchConfig,
 } from './grokBuildLaunchConfig.js';
 import {
 	createGrokBuildMapState,
-	mapAuthRequiredAsTurnError,
 	mapPermissionRequest,
 	mapSessionUpdate,
 	mapTurnCompleted,
@@ -81,6 +83,15 @@ import {
 } from './protocol/acpTypes.js';
 
 const emptySessionSchema = createSchema({});
+const HANDSHAKE_TIMEOUT_MS = 30_000;
+
+export type GrokBuildTestSpawnResult = {
+	readonly transport: IAcpTransport;
+	readonly child?: ChildProcessWithoutNullStreams;
+	readonly onDispose?: () => void;
+};
+
+export type GrokBuildTestSpawn = (launch: IGrokBuildLaunchConfig) => GrokBuildTestSpawnResult;
 
 interface IGrokBuildTurnRecord {
 	readonly id: string;
@@ -125,10 +136,35 @@ function isGrokAuthError(error: unknown): boolean {
 	if (!(error instanceof AcpJsonRpcResponseError)) {
 		return false;
 	}
-	if (error.code === AcpJsonRpcErrorCode.ApplicationError || error.code === -32000) {
-		return true;
+	return error.code === -32000 && /authentication required/i.test(error.message);
+}
+
+/**
+ * Surface ACP JSON-RPC failures with `error.data` when present (live grok
+ * puts detail such as `unknown model id` / `unknown session id` there).
+ */
+export function formatAcpError(error: unknown): Error {
+	if (error instanceof AcpJsonRpcResponseError) {
+		const detail = error.data === undefined || error.data === null
+			? ''
+			: typeof error.data === 'string'
+				? `: ${error.data}`
+				: `: ${JSON.stringify(error.data)}`;
+		const formatted = new Error(`${error.message}${detail}`);
+		formatted.name = error.name;
+		return formatted;
 	}
-	return /auth/i.test(error.message);
+	if (error instanceof Error) {
+		return error;
+	}
+	return new Error(String(error));
+}
+
+function rethrowAcpFailure(error: unknown): never {
+	if (isGrokAuthError(error)) {
+		throw grokNotLoggedInError();
+	}
+	throw formatAcpError(error);
 }
 
 function toAgentModelInfo(model: AcpModelInfo, provider: AgentProvider): IAgentModelInfo {
@@ -147,7 +183,7 @@ function toUsageInfo(usage: AcpUsage | undefined): UsageInfo | undefined {
 	const info: UsageInfo = {
 		inputTokens: typeof usage.inputTokens === 'number' ? usage.inputTokens : undefined,
 		outputTokens: typeof usage.outputTokens === 'number' ? usage.outputTokens : undefined,
-		cacheReadTokens: typeof usage.cachedTokens === 'number' ? usage.cachedTokens : undefined,
+		cacheReadTokens: typeof usage.cachedReadTokens === 'number' ? usage.cachedReadTokens : undefined,
 	};
 	if (info.inputTokens === undefined && info.outputTokens === undefined && info.cacheReadTokens === undefined) {
 		return undefined;
@@ -225,6 +261,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 	private _connection: IConnection | undefined;
 	private _connectionInFlight: Promise<IAcpClient> | undefined;
 	private _testClient: IAcpClient | undefined;
+	private _testSpawn: GrokBuildTestSpawn | undefined;
 
 	constructor(
 		@ILogService private readonly _logService: ILogService,
@@ -248,8 +285,18 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		this._disposeConnection();
 		this._testClient = client;
 		const store = new DisposableStore();
+		store.add(client);
 		this._connection = { client, child: undefined, store };
 		this._wireClient(client, store);
+	}
+
+	/**
+	 * @internal Test seam: replace `spawn(grok …)` with a fake transport so
+	 * handshake order (`initialize` → `authenticate` → `session/new`) and the
+	 * publish-after-handshake race can be asserted.
+	 */
+	bindTestSpawn(spawnFn: GrokBuildTestSpawn): void {
+		this._testSpawn = spawnFn;
 	}
 
 	readonly chats: IAgentChats = {
@@ -451,13 +498,21 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		try {
 			sessionNew = await client.request('session/new', { cwd, mcpServers: [] });
 		} catch (err) {
-			if (isGrokAuthError(err)) {
-				throw grokNotLoggedInError();
-			}
-			throw err;
+			rethrowAcpFailure(err);
 		}
 
 		applyModelState(models => this._models.set(models, undefined), this.id, sessionNew.models);
+
+		if (options?.model?.id) {
+			try {
+				await client.request('session/set_model', {
+					sessionId: sessionNew.sessionId,
+					modelId: options.model.id,
+				});
+			} catch (err) {
+				rethrowAcpFailure(err);
+			}
+		}
 
 		const persisted: IGrokBuildPersistedChat = {
 			sessionId: sessionNew.sessionId,
@@ -522,13 +577,8 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			}
 			this._finalizeTurn(backing, turn, result.stopReason === 'cancelled' ? TurnState.Cancelled : TurnState.Complete, usage);
 		} catch (err) {
-			if (isGrokAuthError(err)) {
-				for (const action of mapAuthRequiredAsTurnError(turn, grokNotLoggedInError().message)) {
-					this._fireAction(chat, action);
-				}
-				throw grokNotLoggedInError();
-			}
-			throw err;
+			// agentSideEffects maps a rejected sendMessage; do not also fire ChatError.
+			rethrowAcpFailure(err);
 		} finally {
 			backing.activeTurnId = undefined;
 			backing.mapState = undefined;
@@ -543,8 +593,11 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			return;
 		}
 		this._cancelPendingPermissionsForChat(chat);
+		const client = this._connection?.client;
+		if (!client) {
+			return;
+		}
 		try {
-			const client = await this._ensureConnection();
 			client.notify('session/cancel', { sessionId: backing.sessionId });
 		} catch (err) {
 			this._logService.trace(`[GrokBuild] session/cancel failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -553,9 +606,17 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 
 	private async _changeModel(chat: URI, model: ModelSelection): Promise<void> {
 		const backing = this._requireBacking(chat);
+		const client = await this._ensureConnection();
+		try {
+			await client.request('session/set_model', {
+				sessionId: backing.sessionId,
+				modelId: model.id,
+			});
+		} catch (err) {
+			rethrowAcpFailure(err);
+		}
 		backing.model = model;
 		backing.modifiedTime = Date.now();
-		// TODO(live-grok): session/set_model when confirmed on a logged-in CLI.
 		this._emitProviderDataChange(chat, backing);
 	}
 
@@ -567,11 +628,13 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		}
 		this._cancelPendingPermissionsForChat(chat);
 		if (closeSession) {
-			try {
-				const client = await this._ensureConnection();
-				await client.request('session/close', { sessionId: backing.sessionId });
-			} catch (err) {
-				this._logService.trace(`[GrokBuild] session/close failed: ${err instanceof Error ? err.message : String(err)}`);
+			const client = this._connection?.client;
+			if (client) {
+				try {
+					await client.request('session/close', { sessionId: backing.sessionId });
+				} catch (err) {
+					this._logService.trace(`[GrokBuild] session/close failed: ${err instanceof Error ? err.message : String(err)}`);
+				}
 			}
 		}
 		this._sessionToChat.delete(backing.sessionId);
@@ -618,6 +681,13 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		}
 	}
 
+	private _cancelAllPendingPermissions(): void {
+		for (const [toolCallId, pending] of this._pendingPermissions) {
+			pending.resolve({ result: { outcome: { outcome: 'cancelled' } } });
+			this._pendingPermissions.delete(toolCallId);
+		}
+	}
+
 	private async _ensureConnection(): Promise<IAcpClient> {
 		if (this._testClient && this._connection?.client === this._testClient) {
 			return this._testClient;
@@ -635,22 +705,36 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 
 	private async _connect(): Promise<IAcpClient> {
 		const configuredPath = process.env[AgentHostGrokBuildBinaryPathEnvVar];
-		const resolved = await resolveGrokBinary(configuredPath);
+		const resolved = this._testSpawn
+			? { path: configuredPath?.trim() || 'grok', version: undefined as string | undefined }
+			: await resolveGrokBinary(configuredPath);
 		const clientName = this._productService.nameShort || 'Code - OSS';
 		const clientVersion = this._productService.version || '0.0.0';
 		const launch = buildGrokBuildLaunchConfig(resolved.path, process.env, clientName, clientVersion);
 
 		this._logService.info(`[GrokBuild] spawning ACP from ${launch.binaryPath}`);
-		const child = spawn(launch.binaryPath, [...launch.args], {
-			stdio: ['pipe', 'pipe', 'pipe'],
-			env: launch.env,
-		});
-		child.stderr.setEncoding('utf8');
-		child.stderr.on('data', chunk => {
-			this._logService.trace(`[GrokBuild stderr] ${String(chunk).trimEnd()}`);
-		});
 
-		const transport = transportFromChildProcess(child);
+		let child: ChildProcessWithoutNullStreams | undefined;
+		let transport: IAcpTransport;
+		let onSpawnDispose: (() => void) | undefined;
+
+		if (this._testSpawn) {
+			const spawned = this._testSpawn(launch);
+			transport = spawned.transport;
+			child = spawned.child;
+			onSpawnDispose = spawned.onDispose;
+		} else {
+			child = spawn(launch.binaryPath, [...launch.args], {
+				stdio: ['pipe', 'pipe', 'pipe'],
+				env: launch.env,
+			});
+			child.stderr.setEncoding('utf8');
+			child.stderr.on('data', chunk => {
+				this._logService.trace(`[GrokBuild stderr] ${String(chunk).trimEnd()}`);
+			});
+			transport = transportFromChildProcess(child);
+		}
+
 		const client = new AcpClient(transport, (level, message) => {
 			if (level === 'error') {
 				this._logService.error(`[GrokBuild ACP] ${message}`);
@@ -660,41 +744,93 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		});
 
 		const store = new DisposableStore();
-		this._connection = { client, child, store };
+		store.add(client);
+		if (onSpawnDispose) {
+			store.add(toDisposable(onSpawnDispose));
+		}
 		this._wireClient(client, store);
+
+		const failConnection = (err: Error) => {
+			this._logService.error(`[GrokBuild] process/transport error: ${err.message}`);
+			client.rejectAllPending(err);
+			this._cancelAllPendingPermissions();
+			if (this._connection?.client === client || !this._connection) {
+				// During handshake `_connection` is still unset; dispose the local store.
+				if (this._connection?.client === client) {
+					this._disposeConnection();
+				} else {
+					store.dispose();
+					if (child && child.exitCode === null && child.signalCode === null) {
+						try {
+							child.kill('SIGTERM');
+						} catch {
+							// already dead
+						}
+					}
+				}
+			}
+		};
 
 		store.add(client.onExit(e => {
 			this._logService.warn(`[GrokBuild] ACP exited code=${e.code} signal=${e.signal}`);
+			this._cancelAllPendingPermissions();
 			if (this._connection?.client === client) {
 				this._disposeConnection();
 			}
 		}));
 		store.add(client.onTransportError(err => {
-			this._logService.error(`[GrokBuild] transport error: ${err.message}`);
+			failConnection(err);
 		}));
 
-		try {
-			const init = await client.request('initialize', {
-				protocolVersion: ACP_PROTOCOL_VERSION,
-				clientCapabilities: {
-					fs: { readTextFile: false, writeTextFile: false },
-					terminal: false,
-				},
-				clientInfo: { name: clientName, version: clientVersion },
+		if (child) {
+			child.on('error', (err: Error) => {
+				failConnection(err);
 			});
-			applyModelState(models => this._models.set(models, undefined), this.id, init._meta?.modelState);
-			await client.request('authenticate', { methodId: 'grok.com' });
-		} catch (err) {
-			this._disposeConnection();
-			if (isGrokAuthError(err)) {
-				throw grokNotLoggedInError();
-			}
-			if (err instanceof Error && err.message.includes('not found')) {
-				throw grokCliMissingError();
-			}
-			throw err;
+			child.stdin.on('error', (err: Error) => {
+				failConnection(err);
+			});
 		}
 
+		try {
+			const init = await raceTimeout(
+				client.request('initialize', {
+					protocolVersion: ACP_PROTOCOL_VERSION,
+					clientCapabilities: {
+						fs: { readTextFile: false, writeTextFile: false },
+						terminal: false,
+					},
+					clientInfo: { name: clientName, version: clientVersion },
+				}),
+				HANDSHAKE_TIMEOUT_MS,
+			);
+			if (init === undefined) {
+				throw grokHandshakeTimeoutError('initialize');
+			}
+			applyModelState(models => this._models.set(models, undefined), this.id, init._meta?.modelState);
+
+			// Do not log the authenticate result — `_meta` includes email / team / tier.
+			const auth = await raceTimeout(
+				client.request('authenticate', { methodId: 'grok.com' }),
+				HANDSHAKE_TIMEOUT_MS,
+			);
+			if (auth === undefined) {
+				throw grokHandshakeTimeoutError('authenticate');
+			}
+		} catch (err) {
+			store.dispose();
+			if (child && child.exitCode === null && child.signalCode === null) {
+				try {
+					child.kill('SIGTERM');
+				} catch {
+					// already dead
+				}
+			}
+			rethrowAcpFailure(err);
+		}
+
+		// Publish only after a successful handshake so concurrent createChat
+		// callers await `_connectionInFlight` instead of an un-handshaked client.
+		this._connection = { client, child, store };
 		return client;
 	}
 
