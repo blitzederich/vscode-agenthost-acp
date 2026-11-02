@@ -40,7 +40,18 @@ export const GROK_BUILD_ACP_ARGV = [
 export interface IGrokBuildResolvedBinary {
 	readonly path: string;
 	readonly version?: string;
+	/** `grok --version` produced no semver. A parseable version is readable even when the process exits non-zero. */
+	readonly versionUnreadable?: boolean;
+	readonly versionOutput?: string;
 }
+
+export interface IGrokVersionRead {
+	readonly version?: string;
+	readonly output?: string;
+	readonly unreadable: boolean;
+}
+
+export type GrokBinaryProbe = 'found' | 'not-installed' | 'explicit-path-missing';
 
 export interface IGrokBuildLaunchConfig {
 	readonly binaryPath: string;
@@ -84,6 +95,63 @@ export function grokHandshakeTimeoutError(phase: 'initialize' | 'authenticate'):
 		"Timed out waiting for the Grok CLI to respond to {0}. Check that `grok` is installed and responsive.",
 		phase,
 	));
+}
+
+export function grokProcessExitedError(code: number | null, signal: NodeJS.Signals | null, stderrTail: string): Error {
+	const base = nls.localize(
+		'grokBuild.processExited',
+		"The Grok CLI exited unexpectedly (code {0}, signal {1}).",
+		code === null ? 'null' : String(code),
+		signal ?? 'none',
+	);
+	return new Error(withStderrTail(base, stderrTail));
+}
+
+export function grokCannotRestoreSessionError(): Error {
+	return new Error(nls.localize(
+		'grokBuild.cannotRestore',
+		"This Grok CLI cannot restore a previous session. It does not advertise session/load or session/resume.",
+	));
+}
+
+export function grokWorkingDirectoryRejectedError(): Error {
+	return new Error(nls.localize(
+		'grokBuild.workingDirectoryNotLocal',
+		"Grok Build can only use a local absolute folder as the working directory.",
+	));
+}
+
+export function grokWorkingDirectoryBusyError(): Error {
+	return new Error(nls.localize(
+		'grokBuild.workingDirectoryBusy',
+		"Cannot change the Grok Build working directory while a turn is in progress.",
+	));
+}
+
+/** Last ~2 KB of grok stderr included in handshake and process-exit errors. */
+export const GROK_STDERR_TAIL_MAX = 2048;
+
+export function appendStderrTail(previous: string, chunk: string, max: number = GROK_STDERR_TAIL_MAX): string {
+	const next = previous + chunk;
+	return next.length <= max ? next : next.slice(next.length - max);
+}
+
+export function withStderrTail(message: string, stderrTail: string): string {
+	const tail = stderrTail.trim();
+	if (!tail) {
+		return message;
+	}
+	const clipped = tail.length > GROK_STDERR_TAIL_MAX ? tail.slice(tail.length - GROK_STDERR_TAIL_MAX) : tail;
+	return `${message}\n${clipped}`;
+}
+
+export function grokUnreadableVersionWarning(output: string | undefined): string {
+	const shown = (output ?? '').trim().replace(/\s+/g, ' ').slice(0, 500);
+	return nls.localize(
+		'grokBuild.versionUnreadable',
+		"Could not read the Grok CLI version from `grok --version`. The CLI will still be started. Output: {0}",
+		shown || nls.localize('grokBuild.versionUnreadableEmpty', "(no output)"),
+	);
 }
 
 /**
@@ -137,7 +205,27 @@ export async function isGrokBinaryAvailable(
 	env: NodeJS.ProcessEnv = process.env,
 	userHome: string = homedir(),
 ): Promise<boolean> {
-	return (await resolveGrokBinaryPath(configuredPath, env, userHome)) !== undefined;
+	return (await probeGrokBinaryAvailability(configuredPath, env, userHome)) === 'found';
+}
+
+/**
+ * Distinguish "nothing installed" from "the user configured a path that is
+ * missing". An explicit missing path must not be treated as "provider
+ * unavailable" — callers surface {@link grokCliMissingError} and still register.
+ */
+export async function probeGrokBinaryAvailability(
+	configuredPath: string | undefined,
+	env: NodeJS.ProcessEnv = process.env,
+	userHome: string = homedir(),
+): Promise<GrokBinaryProbe> {
+	const configured = (configuredPath?.trim() || env[AgentHostGrokBuildBinaryPathEnvVar]?.trim()) || undefined;
+	if (configured) {
+		return await Promises.exists(configured) ? 'found' : 'explicit-path-missing';
+	}
+	const searchEnv: NodeJS.ProcessEnv = { ...env };
+	delete searchEnv[AgentHostGrokBuildBinaryPathEnvVar];
+	const found = await resolveGrokBinaryPath(undefined, searchEnv, userHome);
+	return found ? 'found' : 'not-installed';
 }
 
 /**
@@ -164,14 +252,24 @@ export function isGrokVersionAtLeast(version: string, minimum: string = GROK_BUI
 	return true;
 }
 
-export async function readGrokVersion(binaryPath: string): Promise<string | undefined> {
+/**
+ * A parseable semver wins even when the process exits non-zero. Otherwise the
+ * banner is unreadable (live `grok --version` is
+ * `grok 1.0.70 (f50904eaee6c) [stable]`).
+ */
+export function interpretGrokVersion(stdout: string, stderr: string): IGrokVersionRead {
+	const output = `${stdout ?? ''}\n${stderr ?? ''}`.trim();
+	const version = parseGrokVersion(output);
+	if (version) {
+		return { version, output, unreadable: false };
+	}
+	return { output, unreadable: true };
+}
+
+export async function readGrokVersion(binaryPath: string): Promise<IGrokVersionRead> {
 	return new Promise(resolve => {
-		execFile(binaryPath, ['--version'], { timeout: 5_000, windowsHide: true }, (err, stdout, stderr) => {
-			if (err) {
-				resolve(undefined);
-				return;
-			}
-			resolve(parseGrokVersion(`${stdout}\n${stderr}`));
+		execFile(binaryPath, ['--version'], { timeout: 5_000, windowsHide: true }, (_err, stdout, stderr) => {
+			resolve(interpretGrokVersion(stdout ?? '', stderr ?? ''));
 		});
 	});
 }
@@ -185,11 +283,16 @@ export async function resolveGrokBinary(
 	if (!path) {
 		throw grokCliMissingError();
 	}
-	const version = await readGrokVersion(path);
-	if (version && !isGrokVersionAtLeast(version)) {
-		throw grokVersionTooOldError(version);
+	const read = await readGrokVersion(path);
+	if (read.version && !isGrokVersionAtLeast(read.version)) {
+		throw grokVersionTooOldError(read.version);
 	}
-	return { path, version };
+	return {
+		path,
+		version: read.version,
+		versionUnreadable: read.unreadable ? true : undefined,
+		versionOutput: read.output,
+	};
 }
 
 /**
@@ -200,21 +303,92 @@ export async function resolveGrokBinary(
  * `~/.grok/config.toml` sets always-approve. Never pass
  * `--always-approve` / `bypassPermissions` / `dontAsk`.
  */
+/**
+ * Environment grok actually needs. Codex copies the full host environment
+ * (it has no strip policy). Claude strips `VSCODE_*` / `ELECTRON_*` but sets
+ * `ELECTRON_RUN_AS_NODE=1` because its SDK is Node. Grok is a native binary,
+ * so the host passes this allowlist only and never sets `ELECTRON_RUN_AS_NODE`.
+ * `GROK_*` values the user already set are kept (telemetry stays in the user's
+ * config; we do not invent overrides) except the client identity vars, which
+ * the host owns. `XAI_API_KEY` is the documented auth fallback. Never read
+ * `~/.grok/auth.json`.
+ */
+const GROK_SUBPROCESS_ENV_KEYS = [
+	'PATH',
+	'HOME',
+	'USERPROFILE',
+	'HOMEDRIVE',
+	'HOMEPATH',
+	'USER',
+	'USERNAME',
+	'LOGNAME',
+	'SHELL',
+	'COMSPEC',
+	'PATHEXT',
+	'SystemRoot',
+	'SYSTEMROOT',
+	'WINDIR',
+	'TMPDIR',
+	'TMP',
+	'TEMP',
+	'LANG',
+	'LC_ALL',
+	'LC_CTYPE',
+	'LC_MESSAGES',
+	'XAI_API_KEY',
+	'GROK_SANDBOX',
+	'XDG_CONFIG_HOME',
+	'XDG_DATA_HOME',
+	'XDG_CACHE_HOME',
+	'HTTP_PROXY',
+	'HTTPS_PROXY',
+	'NO_PROXY',
+	'ALL_PROXY',
+	'http_proxy',
+	'https_proxy',
+	'no_proxy',
+	'all_proxy',
+	'SSL_CERT_FILE',
+	'SSL_CERT_DIR',
+	'CURL_CA_BUNDLE',
+	'REQUESTS_CA_BUNDLE',
+] as const;
+
+export function buildGrokSubprocessEnv(
+	inheritedEnv: NodeJS.ProcessEnv,
+	clientName: string,
+	clientVersion: string,
+): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = {};
+	for (const key of GROK_SUBPROCESS_ENV_KEYS) {
+		const value = inheritedEnv[key];
+		if (typeof value === 'string') {
+			env[key] = value;
+		}
+	}
+	for (const key of Object.keys(inheritedEnv)) {
+		if (!key.startsWith('GROK_') || key === GROK_CLIENT_NAME_ENV || key === GROK_CLIENT_VERSION_ENV) {
+			continue;
+		}
+		const value = inheritedEnv[key];
+		if (typeof value === 'string') {
+			env[key] = value;
+		}
+	}
+	env[GROK_CLIENT_NAME_ENV] = clientName;
+	env[GROK_CLIENT_VERSION_ENV] = clientVersion;
+	return env;
+}
+
 export function buildGrokBuildLaunchConfig(
 	binaryPath: string,
 	inheritedEnv: NodeJS.ProcessEnv,
 	clientName: string,
 	clientVersion: string,
 ): IGrokBuildLaunchConfig {
-	const env: NodeJS.ProcessEnv = { ...inheritedEnv };
-	env[GROK_CLIENT_NAME_ENV] = clientName;
-	env[GROK_CLIENT_VERSION_ENV] = clientVersion;
-	// Pass through XAI_API_KEY when present; never read ~/.grok/auth.json.
-	// Do not touch the user's telemetry settings.
-
 	return {
 		binaryPath,
 		args: [...GROK_BUILD_ACP_ARGV],
-		env,
+		env: buildGrokSubprocessEnv(inheritedEnv, clientName, clientVersion),
 	};
 }

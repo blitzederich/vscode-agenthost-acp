@@ -234,6 +234,7 @@ async function startAgentHost(): Promise<void> {
 			providerService,
 			instantiationService,
 			disposables,
+			logService,
 		});
 		completionTriggerCharacters = runtimeServices.completions.triggerCharacters;
 	} catch (err) {

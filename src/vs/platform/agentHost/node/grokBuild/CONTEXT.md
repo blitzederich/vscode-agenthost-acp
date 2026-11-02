@@ -1,5 +1,5 @@
 <!--
-  CONTEXT.md — Grok Build Agent Host provider (Stage 0/1 design)
+  CONTEXT.md — Grok Build Agent Host provider (Stage 0–2)
   Living note — keep in sync with code after each significant change.
 -->
 
@@ -28,8 +28,19 @@ Binary resolution (first hit wins): setting
 `chat.agentHost.grokBuildAgent.binaryPath` → `PATH` → `~/.grok/bin/grok` →
 `~/.local/bin/grok`. When the setting/env path is set but missing, fail
 (`grokCliMissingError`) — do **not** fall back to PATH. Registration requires
-`chat.agentHost.grokBuildAgent.enabled` (default `false`, experimental) **and**
-a resolvable binary.
+`chat.agentHost.grokBuildAgent.enabled` (default `false`, experimental). A
+missing install skips registration. An explicitly configured path that does
+not exist still registers and logs `grokCliMissingError()` so the hint is not
+swallowed. `grok --version` output such as
+`grok 1.0.70 (f50904eaee6c) [stable]` is readable; output with no semver warns
+and the CLI is still started. A parsed version older than 1.0.70 throws.
+
+The spawned environment is an allowlist (`PATH`, `HOME`, `XAI_API_KEY`,
+`GROK_SANDBOX`, user `GROK_*` except the client identity vars the host sets,
+plus locale / proxy / CA / temp). It does **not** copy `ELECTRON_RUN_AS_NODE`
+or `VSCODE_*`. Codex copies the full host environment; Claude strips those
+prefixes but sets `ELECTRON_RUN_AS_NODE=1` because its SDK is Node. Grok is a
+native binary, so this allowlist is intentional. Never read `~/.grok/auth.json`.
 
 Verified launch argv (grok **1.0.70**):
 
@@ -69,9 +80,9 @@ Reject ends the prompt with `stopReason: "cancelled"`.
 |-------|--------|
 | **0** | This design doc + IAgent surface table |
 | **1 (MVP)** | ACP client, launch, mapping, create/send/abort/getMessages/materialize, settings, unit tests |
-| 2 | Persistence (`session/load` / resume), history → `Turn[]`, discovery |
-| 3 | Plan, subagents, slash commands, reasoning effort, permission presets |
-| 4 | Hardening, docs, CI-safe e2e replay |
+| **2 (persistence)** | `session/load` / `session/resume`, history → `Turn[]`, `session/list` discovery, crash reload, `setWorkingDirectory`, `session/close`, stage 1 leftovers. **Implemented** in this branch. Shapes marked below are still **to verify live**. |
+| 3 | Plan, subagents, slash commands, reasoning effort, permission presets. **Deferred** |
+| 4 | Hardening, docs, CI-safe e2e replay. **Deferred** |
 
 ## IAgent / IAgentChats — MVP vs stub
 
@@ -82,9 +93,9 @@ Reject ends the prompt with `stopReason: "cancelled"`.
 | `createChat` | **Implemented** | `session/new` after shared ACP handshake + `authenticate`; optional `session/set_model` |
 | `sendMessage` | **Implemented** | `session/prompt`; maps `session/update` → AHP actions; failures throw only |
 | `abort` | **Implemented** | `session/cancel` on **existing** connection only (never spawn) |
-| `getMessages` | **Implemented** | In-memory `Turn[]` for the live process only |
-| `disposeChat` | **Implemented** | Drops backing; `session/close` when connection already up |
-| `releaseChat` | **Implemented** | Same as dispose for MVP (no durable resume yet) |
+| `getMessages` | **Implemented** | In-memory `Turn[]`. `session/load` replaces them with replayed history. Does not connect on its own, so a crashed turn stays visible until the next send |
+| `disposeChat` | **Implemented** | Drops backing. `session/close` when `sessionCapabilities.close` was advertised and this session is loaded on the current process |
+| `releaseChat` | **Implemented** | Same as dispose, including `session/close` |
 | `changeModel` | **Implemented** | `session/set_model` then update backing |
 | `getModel` | **Implemented** | From backing |
 | `changeAgent` | Stub | No-op (no custom agents in MVP) |
@@ -100,9 +111,9 @@ Reject ends the prompt with `stopReason: "cancelled"`.
 | `models` | **Implemented** | From `session/new` (and initialize `_meta.modelState` seed) |
 | `onDidChatProgress` | **Implemented** | Action + `pending_confirmation` signals |
 | `onDidMaterializeChat` / `onDidChangeChatData` | **Implemented** | Fired on create / providerData updates |
-| `onDidSpawnChat` / `onDidDiscoverChats` | **Implemented** | Emitters present; discovery empty in MVP |
+| `onDidSpawnChat` / `onDidDiscoverChats` | **Implemented** | `startChatDiscovery` lists sessions and emits external chats whose ACP session id is not already in memory |
 | `chats` | **Implemented** | See table above |
-| `materializeChat` | **Implemented** | Restores opaque `{ sessionId, model }` into memory; live ACP resume is Stage 2 |
+| `materializeChat` | **Implemented** | Decodes `{ sessionId, model, cwd }` and attaches it with `session/load` or `session/resume` |
 | `respondToPermissionRequest` | **Implemented** | Maps approve → `allow_once` / deny → `reject_once` |
 | `getOrCreateActiveClient` / `removeActiveClient` | **Implemented** | Minimal in-memory handles |
 | `onClientToolCallComplete` | Stub | No-op |
@@ -111,15 +122,66 @@ Reject ends the prompt with `stopReason: "cancelled"`.
 | `getChatCustomizations` | **Implemented** | Returns host customizations only |
 | `getProtectedResources` | **Implemented** | `[]` — CLI owns grok.com auth; never GitHub-gated |
 | `authenticate` | **Implemented** | No-op `false` for unknown resources (CLI auth path) |
-| `getChatMetadata` | **Implemented** | Minimal metadata from in-memory backing |
-| `listChatsToMigrate` | **Implemented** | `[]` |
-| `setWorkingDirectory` | Stub | Throws unsupported |
+| `getChatMetadata` | **Implemented** | Live backing, or providerData. `activation: 'restore'` attaches the runtime; a passive read does not |
+| `listChatsToMigrate` | **Implemented** | `session/list` pages for known working directories (unfiltered when none are known). `[]` when list is not advertised. `undefined` when the catalog cannot be read |
+| `setWorkingDirectory` | **Implemented** | `workspaceConversion: true`. Stores the absolute file URI, persists `cwd`, and `session/load` or `session/resume` at that cwd |
 | `shutdown` / `dispose` | **Implemented** | Tears down ACP child |
 | All marketplace / canvas / MCP / sandbox / steering / truncate / plugin APIs | Stub | Omitted optional members |
 | `refreshModels` / discovery / legacy migration extras | Stub | Omitted or no-op |
 
+## Stage 2 — persistence
+
+Durable handle is `{ sessionId, model?, cwd? }` in host `providerData`. A session
+id from a dead grok process is never used for `session/prompt` until
+`session/load` or `session/resume` succeeds on the current process generation.
+
+| Capability | Behavior |
+|------------|----------|
+| `agentCapabilities.loadSession === true` | `session/load`. Replay replaces in-memory turns. Preferred whenever both load and resume are advertised (live 1.0.70 advertises both). |
+| else `sessionCapabilities.resume` present (`{}` counts; `null` / omitted do not) | `session/resume`. No history replay. |
+| neither | Localized `grokCannotRestoreSessionError`. |
+| `sessionCapabilities.list` | `session/list`. Optional `cwd` is an exact directory match. `cursor` / `nextCursor` are opaque. Omitted or `null` `nextCursor` ends the list; `''` is a valid cursor. Stop on a repeated cursor or after 20 pages. |
+| `sessionCapabilities.close` | `session/close` on `disposeChat` / `releaseChat` when that session is loaded on the current process. `-32002` (unknown session) is success. Does not respawn just to close. |
+
+`session/load` replay keeps the same `Turn[]` shape as a live turn: user text
+plus assistant markdown. Thoughts and tool calls are not copied onto the turn.
+`user_message_chunk`s that share a `messageId` (or have no id before any
+assistant text) concatenate. A new user chunk after assistant text starts the
+next turn. `session_info_update.title` becomes `summary`.
+
+Crash: process exit or handshake failure records active turns as
+`TurnState.Error` (`errorType: GrokProcessExited`), cancels pending
+permissions, and includes the last ~2 KB of stderr. The host maps the rejected
+`sendMessage` to `ChatError`; the provider does not also fire one. The next
+send respawns and runs `session/load` (or `session/resume`). `getMessages`
+does not auto-load, so the failed turn stays visible until that reload
+replaces history.
+
+`session/new`, `session/load`, and `session/resume` receive
+`cwd` = `workingDirectories[0].fsPath` (or `process.cwd()` when the host sent
+none). `additionalDirectories` is not sent. `session/set_model` failure during
+`createChat` is logged and the CLI's `currentModelId` is kept. `changeModel`
+still throws. Spawn is `this._spawn` (tests inject it); `_connect` has no
+test-only branch. Handshake failure, transport failure, and process exit share
+one idempotent teardown.
+
+### To verify live (ACP v1 shapes; not in the grok 1.0.70 logs)
+
+- `session/load` response (`{}` vs `models` / `modes` / `configOptions`) and the replay chunk sequence (`user_message_chunk` / `agent_message_chunk` `messageId` grouping, `session_info_update.title`).
+- `session/resume` response, and that grok does not replay history for it. We do not call resume when `loadSession` is true.
+- `session/list` response: `sessions[]` of `{ sessionId, cwd, title?, updatedAt? }` and `nextCursor` pagination, including the exact-`cwd` filter.
+- Whether grok accepts a **changed** `cwd` on `session/load` / `session/resume`. The spec says `cwd` should match the session's cwd. `setWorkingDirectory` still sends the new directory.
+
+### Deferred
+
+- `sessionCapabilities.additionalDirectories` (not advertised on 1.0.70).
+- `setChatWorkingDirectory` / per-chat worktree isolation. Session-level host worktree conversion uses `setWorkingDirectory` only.
+- Cross-restart dedupe of `session/list` rows against host chats that already store the same `sessionId` in `providerData` (no metadata store). In-process ids are excluded from `onDidDiscoverChats`.
+- `session/delete`.
+- Reasoning effort, richer auth-error copy, plan / subagents / slash commands (stage 3).
+
 ## Open TODOs
 
-1. **Reasoning effort** — wire `session/set_model` (or sibling) effort when product UX needs it; live models advertise `reasoningEfforts` in `_meta`.
+1. **Reasoning effort** — wire `session/set_model` (or sibling) effort when product UX needs it; live models advertise `reasoningEfforts` in `_meta`. **Deferred** (stage 3).
 2. **Auth error taxonomy** — auth-required is `-32000` + `/authentication required/i` only. Other live failures are `-32602 Invalid params` with detail in `error.data` (`unknown session id`, `unsupported auth method: x`, `unknown model id`); already surfaced via `formatAcpError`. Expand localized mapping if product needs friendlier copy.
-3. **Stage 2 persistence** — `session/load` / resume / discovery once durable reload is productized.
+3. **Verify stage 2 wire shapes live** — see the list above. Unit tests drive the ACP v1 shapes against the fake server.

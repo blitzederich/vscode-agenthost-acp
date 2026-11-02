@@ -7,15 +7,20 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
 import { raceTimeout } from '../../../../base/common/async.js';
 import { Emitter } from '../../../../base/common/event.js';
 import { Disposable, DisposableStore, toDisposable } from '../../../../base/common/lifecycle.js';
+import { Schemas } from '../../../../base/common/network.js';
 import { type IObservable, observableValue } from '../../../../base/common/observable.js';
+import { isAbsolute } from '../../../../base/common/path.js';
+import { extUri } from '../../../../base/common/resources.js';
 import { URI } from '../../../../base/common/uri.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { localize } from '../../../../nls.js';
 import { ILogService } from '../../../log/common/log.js';
 import { IProductService } from '../../../product/common/productService.js';
 import { createSchema } from '../../common/agentHostSchema.js';
+import { deriveLegacyDefaultChat } from '../../common/agentHostLegacyDefaultChat.js';
 import {
 	AgentChatMigrationResult,
+	AgentSession,
 	GROK_BUILD_AGENT_PROVIDER_ID,
 	type AgentProvider,
 	type IActiveClient,
@@ -30,6 +35,7 @@ import {
 	type IAgentCreateChatResult,
 	type IAgentDescriptor,
 	type IAgentDiscoveredChat,
+	type IAgentListedChat,
 	type IAgentMaterializeChatEvent,
 	type IAgentModelInfo,
 	type IAgentResolveChatConfigParams,
@@ -41,7 +47,7 @@ import {
 } from '../../common/agent.js';
 import { AgentHostGrokBuildBinaryPathEnvVar } from '../../common/agentService.js';
 import type { ChatInputAnswer, ChatInputResponseKind, ClientPluginCustomization, Customization, ModelSelection, ToolCallResult, Turn, UsageInfo } from '../../common/state/sessionState.js';
-import { MessageKind, ResponsePartKind, TurnState } from '../../common/state/sessionState.js';
+import { createErrorResponsePart, MessageKind, ResponsePartKind, TurnState } from '../../common/state/sessionState.js';
 import type { ProtectedResourceMetadata, ToolDefinition } from '../../common/state/protocol/state.js';
 import type { ResolveSessionConfigResult, SessionConfigCompletionsResult } from '../../common/state/protocol/commands.js';
 import type { SessionAction, ChatAction } from '../../common/state/sessionActions.js';
@@ -56,11 +62,21 @@ import {
 } from './acpClient.js';
 import { decodeGrokBuildChat, encodeGrokBuildChat, type IGrokBuildPersistedChat } from './grokBuildChatBacking.js';
 import {
+	appendStderrTail,
 	buildGrokBuildLaunchConfig,
+	GROK_BUILD_MIN_VERSION,
+	grokCannotRestoreSessionError,
+	grokCliMissingError,
 	grokHandshakeTimeoutError,
 	grokNotLoggedInError,
+	grokProcessExitedError,
+	grokUnreadableVersionWarning,
+	grokWorkingDirectoryBusyError,
+	grokWorkingDirectoryRejectedError,
 	resolveGrokBinary,
+	withStderrTail,
 	type IGrokBuildLaunchConfig,
+	type IGrokBuildResolvedBinary,
 } from './grokBuildLaunchConfig.js';
 import {
 	createGrokBuildMapState,
@@ -73,17 +89,30 @@ import {
 	type IGrokBuildMapState,
 } from './grokBuildMapSessionUpdates.js';
 import {
-	ACP_PROTOCOL_VERSION,
-	type AcpModelInfo,
+	applyGrokHistoryUpdate,
+	createGrokHistoryReplay,
+	finishGrokHistoryReplay,
+	readGrokSessionTitle,
+	type IGrokHistoryReplay,
+} from './grokBuildSessionReplay.js';
+import {
+	type AcpAgentCapabilities,
 	type AcpModelState,
 	type AcpRequestPermissionParams,
 	type AcpRequestPermissionResult,
+	type AcpSessionInfo,
+	type AcpSessionListParams,
+	type AcpSessionListResult,
 	type AcpSessionUpdateParams,
 	type AcpUsage,
+	ACP_PROTOCOL_VERSION,
 } from './protocol/acpTypes.js';
 
 const emptySessionSchema = createSchema({});
 const HANDSHAKE_TIMEOUT_MS = 30_000;
+const GROK_SESSION_LIST_MAX_PAGES = 20;
+/** ACP v1: `session/close` of an unknown session is success. */
+const ACP_UNKNOWN_SESSION = -32002;
 
 export type GrokBuildTestSpawnResult = {
 	readonly transport: IAcpTransport;
@@ -99,16 +128,20 @@ interface IGrokBuildTurnRecord {
 	readonly assistantMarkdown: string;
 	readonly state: TurnState;
 	readonly usage?: Turn['usage'];
+	readonly errorMessage?: string;
 }
 
 interface IGrokBuildChatBacking {
 	readonly chat: URI;
 	sessionId: string;
 	model?: ModelSelection;
+	summary?: string;
 	readonly startTime: number;
 	modifiedTime: number;
 	workingDirectories?: readonly URI[];
 	turns: IGrokBuildTurnRecord[];
+	/** Connection generation that created or loaded this session. Undefined means it must be restored. */
+	loadedGeneration?: number;
 	activeTurnId?: string;
 	mapState?: IGrokBuildMapState;
 	turnAssistantMarkdown?: string;
@@ -128,6 +161,20 @@ interface IConnection {
 	readonly store: DisposableStore;
 }
 
+interface IGrokAdvertisedCapabilities {
+	readonly loadSession: boolean;
+	readonly list: boolean;
+	readonly resume: boolean;
+	readonly close: boolean;
+}
+
+const noGrokCapabilities: IGrokAdvertisedCapabilities = {
+	loadSession: false,
+	list: false,
+	resume: false,
+	close: false,
+};
+
 function chatKey(chat: URI): string {
 	return chat.toString();
 }
@@ -137,6 +184,17 @@ function isGrokAuthError(error: unknown): boolean {
 		return false;
 	}
 	return error.code === -32000 && /authentication required/i.test(error.message);
+}
+
+function readGrokCapabilities(capabilities: AcpAgentCapabilities | undefined): IGrokAdvertisedCapabilities {
+	const session = capabilities?.sessionCapabilities ?? undefined;
+	const advertised = (value: unknown): boolean => value !== undefined && value !== null;
+	return {
+		loadSession: capabilities?.loadSession === true,
+		list: advertised(session?.list),
+		resume: advertised(session?.resume),
+		close: advertised(session?.close),
+	};
 }
 
 /**
@@ -167,7 +225,7 @@ function rethrowAcpFailure(error: unknown): never {
 	throw formatAcpError(error);
 }
 
-function toAgentModelInfo(model: AcpModelInfo, provider: AgentProvider): IAgentModelInfo {
+function toAgentModelInfo(model: { modelId: string; name?: string }, provider: AgentProvider): IAgentModelInfo {
 	return {
 		provider,
 		id: model.modelId,
@@ -219,9 +277,13 @@ function textFromSessionUpdate(params: AcpSessionUpdateParams): string | undefin
 }
 
 function turnRecordToTurn(record: IGrokBuildTurnRecord): Turn {
-	const responseParts = record.assistantMarkdown
-		? [{ kind: ResponsePartKind.Markdown as const, id: generateUuid(), content: record.assistantMarkdown }]
-		: [];
+	const responseParts = [];
+	if (record.assistantMarkdown) {
+		responseParts.push({ kind: ResponsePartKind.Markdown as const, id: generateUuid(), content: record.assistantMarkdown });
+	}
+	if (record.errorMessage) {
+		responseParts.push(createErrorResponsePart({ errorType: 'GrokProcessExited', message: record.errorMessage }));
+	}
 	return {
 		id: record.id,
 		message: { text: record.userText, origin: { kind: MessageKind.User } },
@@ -231,9 +293,18 @@ function turnRecordToTurn(record: IGrokBuildTurnRecord): Turn {
 	};
 }
 
+function spawnGrokBuildProcess(launch: IGrokBuildLaunchConfig): GrokBuildTestSpawnResult {
+	const child = spawn(launch.binaryPath, [...launch.args], {
+		stdio: ['pipe', 'pipe', 'pipe'],
+		env: launch.env,
+	});
+	return { child, transport: transportFromChildProcess(child) };
+}
+
 export class GrokBuildAgent extends Disposable implements IAgent {
 	readonly id: AgentProvider = GROK_BUILD_AGENT_PROVIDER_ID;
-	readonly agentHostCapabilities = { workspaceConversion: false } as const;
+	/** Session folder changes go through {@link setWorkingDirectory} (host worktree path as ACP `cwd`). */
+	readonly agentHostCapabilities = { workspaceConversion: true } as const;
 
 	private readonly _onDidChatProgress = this._register(new Emitter<AgentSignal>());
 	readonly onDidChatProgress = this._onDidChatProgress.event;
@@ -257,11 +328,21 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 	private readonly _sessionToChat = new Map<string, URI>();
 	private readonly _pendingPermissions = new Map<string, IPendingPermission>();
 	private readonly _activeClients = new Map<string, Map<string, IActiveClient>>();
+	private readonly _restoreInFlight = new Map<string, Promise<void>>();
+	private readonly _tornDown = new WeakSet<IAcpClient>();
 
 	private _connection: IConnection | undefined;
 	private _connectionInFlight: Promise<IAcpClient> | undefined;
+	private _connectionGeneration = 0;
+	private _capabilities: IGrokAdvertisedCapabilities = noGrokCapabilities;
+	private _stderrTail = '';
+	/** In-flight `session/load` replays, keyed by ACP session id so concurrent restores do not share one buffer. */
+	private readonly _historyReplays = new Map<string, IGrokHistoryReplay>();
+	private _discoveryPromise: Promise<void> | undefined;
 	private _testClient: IAcpClient | undefined;
-	private _testSpawn: GrokBuildTestSpawn | undefined;
+	private _spawn: GrokBuildTestSpawn = spawnGrokBuildProcess;
+	private _resolveBinary: (configuredPath: string | undefined) => Promise<IGrokBuildResolvedBinary> = configuredPath => resolveGrokBinary(configuredPath);
+	private _binaryResolverOverridden = false;
 
 	constructor(
 		@ILogService private readonly _logService: ILogService,
@@ -280,29 +361,42 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 
 	/**
 	 * @internal Test seam: inject a pre-authenticated ACP client without spawning `grok`.
+	 * `capabilities` is what a live `initialize` result would have advertised.
 	 */
-	bindTestClient(client: IAcpClient): void {
+	bindTestClient(client: IAcpClient, capabilities?: AcpAgentCapabilities): void {
 		this._disposeConnection();
 		this._testClient = client;
 		const store = new DisposableStore();
 		store.add(client);
 		this._connection = { client, child: undefined, store };
+		this._connectionGeneration++;
+		this._capabilities = capabilities ? readGrokCapabilities(capabilities) : noGrokCapabilities;
 		this._wireClient(client, store);
 	}
 
 	/**
-	 * @internal Test seam: replace `spawn(grok …)` with a fake transport so
-	 * handshake order (`initialize` → `authenticate` → `session/new`) and the
-	 * publish-after-handshake race can be asserted.
+	 * @internal Test seam: replace process spawn. `_connect` always calls the
+	 * injected function; it does not branch on a test flag.
 	 */
 	bindTestSpawn(spawnFn: GrokBuildTestSpawn): void {
-		this._testSpawn = spawnFn;
+		this._spawn = spawnFn;
+		if (!this._binaryResolverOverridden) {
+			this._resolveBinary = async () => ({ path: 'grok', version: GROK_BUILD_MIN_VERSION });
+		}
+	}
+
+	/**
+	 * @internal Test seam: replace binary resolution (missing CLI, unreadable version).
+	 */
+	bindTestBinaryResolver(resolveBinary: (configuredPath: string | undefined) => Promise<IGrokBuildResolvedBinary>): void {
+		this._binaryResolverOverridden = true;
+		this._resolveBinary = resolveBinary;
 	}
 
 	readonly chats: IAgentChats = {
 		createChat: (chat, context, options) => this._createChat(chat, context, options),
-		disposeChat: (chat, _context) => this._disposeChat(chat, true),
-		releaseChat: (chat, _context) => this._disposeChat(chat, false),
+		disposeChat: (chat, _context) => this._disposeChat(chat),
+		releaseChat: (chat, _context) => this._disposeChat(chat),
 		sendMessage: (chat, prompt, workingDirectoriesOrDirectory, _attachments, turnId, _senderClientId, clientTypeOrContext, context) => {
 			const operationContext = context ?? (typeof clientTypeOrContext === 'string' ? undefined : clientTypeOrContext);
 			return this._sendMessage(chat, prompt, workingDirectoriesOrDirectory, turnId, operationContext);
@@ -323,11 +417,21 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		if (!decoded) {
 			return;
 		}
-		// Stage 2 TODO: call `session/load` or resume when Grok exposes durable reload.
-		this._storeBacking(chat, decoded, undefined);
-		const encoded = encodeGrokBuildChat(decoded);
-		this._onDidMaterializeChat.fire({ chat, result: { providerData: encoded }, workingDirectories: undefined, project: undefined });
-		return { providerData: encoded };
+		const workingDirectories = decoded.cwd ? [URI.file(decoded.cwd)] : undefined;
+		const backing = this._storeBacking(chat, decoded, workingDirectories);
+		await this._ensureSessionAttached(backing);
+		const encoded = this._persistProviderData(backing);
+		const result: IAgentCreateChatResult = {
+			providerData: encoded,
+			resolvedWorkingDirectory: backing.workingDirectories?.[0],
+		};
+		this._onDidMaterializeChat.fire({
+			chat,
+			result,
+			workingDirectories: backing.workingDirectories,
+			project: undefined,
+		});
+		return result;
 	}
 
 	getOrCreateActiveClient(
@@ -365,7 +469,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 	}
 
 	onClientToolCallComplete(_chat: URI, _toolCallId: string, _result: ToolCallResult, _context?: IAgentChatContext): void {
-		// MVP: client tools are not wired through Grok ACP yet.
+		// Client tools are not wired through Grok ACP yet.
 	}
 
 	respondToPermissionRequest(requestId: string, approved: boolean, _context?: IAgentPermissionResponseContext): void {
@@ -383,11 +487,27 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 	}
 
 	respondToUserInputRequest(_requestId: string, _response: ChatInputResponseKind, _answers?: Record<string, ChatInputAnswer>): void {
-		// MVP: no ask_user bridge.
+		// No ask_user bridge.
 	}
 
-	async setWorkingDirectory(_chat: URI, _context: URI | IAgentChatContext, _workingDirectory: URI): Promise<void> {
-		throw new Error(localize('grokBuild.unsupportedWorkingDirectory', "Grok Build does not support changing the working directory after a chat is created."));
+	async setWorkingDirectory(chat: URI, context: URI | IAgentChatContext, workingDirectory: URI): Promise<void> {
+		resolveAgentChatContext(context, chat);
+		const backing = this._requireBacking(chat);
+		if (workingDirectory.scheme !== Schemas.file || !!workingDirectory.query || !!workingDirectory.fragment || !isAbsolute(workingDirectory.fsPath)) {
+			throw grokWorkingDirectoryRejectedError();
+		}
+		if (backing.activeTurnId) {
+			throw grokWorkingDirectoryBusyError();
+		}
+		const current = backing.workingDirectories?.[0];
+		if (current && extUri.isEqual(current, workingDirectory)) {
+			return;
+		}
+		backing.workingDirectories = [workingDirectory];
+		backing.modifiedTime = Date.now();
+		backing.loadedGeneration = undefined;
+		this._emitProviderDataChange(chat, backing);
+		await this._ensureSessionAttached(backing);
 	}
 
 	resolveChatConfig(params: IAgentResolveChatConfigParams): Promise<ResolveSessionConfigResult> {
@@ -417,22 +537,61 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		return false;
 	}
 
-	async getChatMetadata(chat: URI, _context: URI | IAgentChatContext, providerData?: string, _options?: IAgentChatMetadataOptions): Promise<IAgentChatMetadata | undefined> {
-		const backing = this._backings.get(chatKey(chat)) ?? (providerData ? this._backingFromProviderData(chat, providerData) : undefined);
+	async getChatMetadata(chat: URI, context: URI | IAgentChatContext, providerData?: string, options?: IAgentChatMetadataOptions): Promise<IAgentChatMetadata | undefined> {
+		resolveAgentChatContext(context, chat);
+		let backing = this._backings.get(chatKey(chat));
+		if (!backing && providerData) {
+			const decoded = decodeGrokBuildChat(providerData);
+			if (!decoded) {
+				return undefined;
+			}
+			if (options?.activation === 'restore') {
+				backing = this._storeBacking(chat, decoded, decoded.cwd ? [URI.file(decoded.cwd)] : undefined);
+				await this._ensureSessionAttached(backing);
+			} else {
+				const now = Date.now();
+				return {
+					chat,
+					startTime: now,
+					modifiedTime: now,
+					model: decoded.model,
+					workingDirectories: decoded.cwd ? [URI.file(decoded.cwd)] : undefined,
+				};
+			}
+		}
 		if (!backing) {
 			return undefined;
+		}
+		if (options?.activation === 'restore') {
+			await this._ensureSessionAttached(backing);
 		}
 		return {
 			chat,
 			startTime: backing.startTime,
 			modifiedTime: backing.modifiedTime,
+			summary: backing.summary,
 			model: backing.model,
 			workingDirectories: backing.workingDirectories,
 		};
 	}
 
-	listChatsToMigrate(): Promise<AgentChatMigrationResult> {
-		return Promise.resolve([]);
+	async listChatsToMigrate(): Promise<AgentChatMigrationResult> {
+		try {
+			const sessions = await this._discoverSessions();
+			return sessions.map(session => this._toListedChat(session));
+		} catch (err) {
+			this._logService.warn(`[GrokBuild] session/list failed: ${err instanceof Error ? err.message : String(err)}`);
+			return undefined;
+		}
+	}
+
+	startChatDiscovery(): Promise<void> {
+		if (!this._discoveryPromise) {
+			this._discoveryPromise = this._emitDiscoveredChats().catch(err => {
+				this._logService.warn(`[GrokBuild] chat discovery failed: ${err instanceof Error ? err.message : String(err)}`);
+			});
+		}
+		return this._discoveryPromise;
 	}
 
 	async shutdown(): Promise<void> {
@@ -448,31 +607,23 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		super.dispose();
 	}
 
-	private _backingFromProviderData(chat: URI, providerData: string): IGrokBuildChatBacking | undefined {
-		const decoded = decodeGrokBuildChat(providerData);
-		if (!decoded) {
-			return undefined;
-		}
-		return {
-			chat,
-			sessionId: decoded.sessionId,
-			model: decoded.model,
-			startTime: Date.now(),
-			modifiedTime: Date.now(),
-			turns: [],
-		};
-	}
-
 	private _storeBacking(chat: URI, persisted: IGrokBuildPersistedChat, workingDirectories: readonly URI[] | undefined): IGrokBuildChatBacking {
 		const now = Date.now();
+		const existing = this._backings.get(chatKey(chat));
+		const sameSession = existing?.sessionId === persisted.sessionId;
+		const directories = workingDirectories
+			?? (sameSession ? existing?.workingDirectories : undefined)
+			?? (persisted.cwd ? [URI.file(persisted.cwd)] : undefined);
 		const backing: IGrokBuildChatBacking = {
 			chat,
 			sessionId: persisted.sessionId,
-			model: persisted.model,
-			startTime: now,
+			model: persisted.model ?? (sameSession ? existing?.model : undefined),
+			summary: sameSession ? existing?.summary : undefined,
+			startTime: sameSession && existing ? existing.startTime : now,
 			modifiedTime: now,
-			workingDirectories,
-			turns: [],
+			workingDirectories: directories,
+			turns: sameSession && existing ? existing.turns : [],
+			loadedGeneration: sameSession ? existing?.loadedGeneration : undefined,
 		};
 		this._backings.set(chatKey(chat), backing);
 		this._sessionToChat.set(persisted.sessionId, chat);
@@ -480,7 +631,11 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 	}
 
 	private _persistProviderData(backing: IGrokBuildChatBacking): string {
-		return encodeGrokBuildChat({ sessionId: backing.sessionId, model: backing.model });
+		return encodeGrokBuildChat({
+			sessionId: backing.sessionId,
+			model: backing.model,
+			cwd: backing.workingDirectories?.[0]?.fsPath,
+		});
 	}
 
 	private _emitProviderDataChange(chat: URI, backing: IGrokBuildChatBacking): void {
@@ -488,11 +643,29 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		this._onDidChangeChatData.fire({ chat, providerData });
 	}
 
+	private _toListedChat(session: AcpSessionInfo): IAgentListedChat {
+		const sessionUri = AgentSession.uri(this.id, session.sessionId);
+		const chat = URI.parse(deriveLegacyDefaultChat(sessionUri));
+		const parsed = session.updatedAt ? Date.parse(session.updatedAt) : Number.NaN;
+		const modifiedTime = Number.isFinite(parsed) ? parsed : Date.now();
+		const cwd = typeof session.cwd === 'string' && session.cwd.length > 0 ? URI.file(session.cwd) : undefined;
+		const summary = typeof session.title === 'string' && session.title.trim().length > 0 ? session.title : undefined;
+		return {
+			chat,
+			session: sessionUri,
+			startTime: modifiedTime,
+			modifiedTime,
+			summary,
+			workingDirectories: cwd ? [cwd] : undefined,
+		};
+	}
+
 	private async _createChat(chat: URI, context: URI | IAgentChatContext, options?: IAgentCreateChatOptions): Promise<IAgentCreateChatResult | void> {
 		resolveAgentChatContext(context, chat);
 		const client = await this._ensureConnection();
-		const workingDirectories = options?.workingDirectories;
-		const cwd = workingDirectories?.[0]?.fsPath ?? process.cwd();
+		const requestedDirectories = options?.workingDirectories;
+		const cwd = requestedDirectories?.[0]?.fsPath ?? process.cwd();
+		const workingDirectories = requestedDirectories && requestedDirectories.length > 0 ? requestedDirectories : [URI.file(cwd)];
 
 		let sessionNew;
 		try {
@@ -503,6 +676,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 
 		applyModelState(models => this._models.set(models, undefined), this.id, sessionNew.models);
 
+		let model = options?.model;
 		if (options?.model?.id) {
 			try {
 				await client.request('session/set_model', {
@@ -510,20 +684,20 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 					modelId: options.model.id,
 				});
 			} catch (err) {
-				rethrowAcpFailure(err);
+				const formatted = formatAcpError(err);
+				this._logService.warn(`[GrokBuild] session/set_model failed; keeping the CLI default model: ${formatted.message}`);
+				const current = sessionNew.models?.currentModelId;
+				model = current ? { id: current } : undefined;
 			}
 		}
 
-		const persisted: IGrokBuildPersistedChat = {
-			sessionId: sessionNew.sessionId,
-			model: options?.model,
-		};
-		const backing = this._storeBacking(chat, persisted, workingDirectories);
+		const backing = this._storeBacking(chat, { sessionId: sessionNew.sessionId, model }, workingDirectories);
+		backing.loadedGeneration = this._connectionGeneration;
 		const providerData = this._persistProviderData(backing);
 		const result: IAgentCreateChatResult = {
 			providerData,
 			project: options?.project,
-			resolvedWorkingDirectory: workingDirectories?.[0],
+			resolvedWorkingDirectory: workingDirectories[0],
 		};
 
 		this._onDidMaterializeChat.fire({
@@ -547,12 +721,23 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			resolveAgentChatContext(context, chat);
 		}
 		const backing = this._requireBacking(chat);
-		const client = await this._ensureConnection();
-		const turn = turnId ?? generateUuid();
 		const workingDirectories = this._resolveWorkingDirectories(workingDirectoriesOrDirectory);
-		if (workingDirectories) {
+		if (workingDirectories && workingDirectories.length > 0) {
+			const next = workingDirectories[0];
+			const previous = backing.workingDirectories?.[0];
+			const changed = !previous || !extUri.isEqual(previous, next);
 			backing.workingDirectories = workingDirectories;
+			if (changed) {
+				backing.loadedGeneration = undefined;
+				this._emitProviderDataChange(chat, backing);
+			}
 		}
+		await this._ensureSessionAttached(backing);
+		const client = this._connection?.client;
+		if (!client) {
+			throw grokCliMissingError();
+		}
+		const turn = turnId ?? generateUuid();
 
 		backing.activeTurnId = turn;
 		backing.mapState = createGrokBuildMapState(turn);
@@ -577,7 +762,15 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			}
 			this._finalizeTurn(backing, turn, result.stopReason === 'cancelled' ? TurnState.Cancelled : TurnState.Complete, usage);
 		} catch (err) {
+			// A dead grok process records the turn before this rejection is delivered.
 			// agentSideEffects maps a rejected sendMessage; do not also fire ChatError.
+			if (isGrokAuthError(err)) {
+				throw grokNotLoggedInError();
+			}
+			const recorded = backing.turns.find(record => record.id === turn)?.errorMessage;
+			if (recorded) {
+				throw new Error(recorded);
+			}
 			rethrowAcpFailure(err);
 		} finally {
 			backing.activeTurnId = undefined;
@@ -594,7 +787,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		}
 		this._cancelPendingPermissionsForChat(chat);
 		const client = this._connection?.client;
-		if (!client) {
+		if (!client || backing.loadedGeneration !== this._connectionGeneration) {
 			return;
 		}
 		try {
@@ -606,7 +799,11 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 
 	private async _changeModel(chat: URI, model: ModelSelection): Promise<void> {
 		const backing = this._requireBacking(chat);
-		const client = await this._ensureConnection();
+		await this._ensureSessionAttached(backing);
+		const client = this._connection?.client;
+		if (!client) {
+			throw grokCliMissingError();
+		}
 		try {
 			await client.request('session/set_model', {
 				sessionId: backing.sessionId,
@@ -620,26 +817,40 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		this._emitProviderDataChange(chat, backing);
 	}
 
-	private async _disposeChat(chat: URI, closeSession: boolean): Promise<void> {
+	/**
+	 * Drop the in-memory chat. When `sessionCapabilities.close` was advertised,
+	 * also `session/close`. The durable session id stays in host providerData;
+	 * this does not delete the grok-side transcript.
+	 */
+	private async _disposeChat(chat: URI): Promise<void> {
 		const key = chatKey(chat);
 		const backing = this._backings.get(key);
 		if (!backing) {
 			return;
 		}
 		this._cancelPendingPermissionsForChat(chat);
-		if (closeSession) {
-			const client = this._connection?.client;
-			if (client) {
-				try {
-					await client.request('session/close', { sessionId: backing.sessionId });
-				} catch (err) {
-					this._logService.trace(`[GrokBuild] session/close failed: ${err instanceof Error ? err.message : String(err)}`);
-				}
-			}
-		}
+		await this._closeSessionIfAdvertised(backing);
 		this._sessionToChat.delete(backing.sessionId);
 		this._backings.delete(key);
 		this._activeClients.delete(key);
+	}
+
+	private async _closeSessionIfAdvertised(backing: IGrokBuildChatBacking): Promise<void> {
+		if (!this._capabilities.close) {
+			return;
+		}
+		const client = this._connection?.client;
+		if (!client || backing.loadedGeneration !== this._connectionGeneration) {
+			return;
+		}
+		try {
+			await client.request('session/close', { sessionId: backing.sessionId });
+		} catch (err) {
+			if (err instanceof AcpJsonRpcResponseError && err.code === ACP_UNKNOWN_SESSION) {
+				return;
+			}
+			this._logService.trace(`[GrokBuild] session/close failed: ${err instanceof Error ? err.message : String(err)}`);
+		}
 	}
 
 	private _requireBacking(chat: URI): IGrokBuildChatBacking {
@@ -660,10 +871,10 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		return workingDirectoriesOrDirectory;
 	}
 
-	private _finalizeTurn(backing: IGrokBuildChatBacking, turnId: string, state: TurnState, usage: Turn['usage']): void {
+	private _finalizeTurn(backing: IGrokBuildChatBacking, turnId: string, state: TurnState, usage: Turn['usage'], errorMessage?: string): void {
 		const userText = backing.turnUserText ?? '';
 		const assistantMarkdown = backing.turnAssistantMarkdown ?? '';
-		backing.turns.push({ id: turnId, userText, assistantMarkdown, state, usage });
+		backing.turns.push({ id: turnId, userText, assistantMarkdown, state, usage, errorMessage });
 		backing.modifiedTime = Date.now();
 	}
 
@@ -688,10 +899,190 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		}
 	}
 
-	private async _ensureConnection(): Promise<IAcpClient> {
-		if (this._testClient && this._connection?.client === this._testClient) {
-			return this._testClient;
+	private _failActiveTurns(error: Error): void {
+		for (const backing of this._backings.values()) {
+			const turnId = backing.activeTurnId;
+			if (!turnId || backing.turns.some(record => record.id === turnId)) {
+				continue;
+			}
+			this._finalizeTurn(backing, turnId, TurnState.Error, undefined, error.message);
+			backing.activeTurnId = undefined;
+			backing.mapState = undefined;
+			backing.turnAssistantMarkdown = undefined;
+			backing.turnUserText = undefined;
 		}
+	}
+
+	private _invalidateLoadedSessions(): void {
+		for (const backing of this._backings.values()) {
+			backing.loadedGeneration = undefined;
+		}
+	}
+
+	private _ensureSessionAttached(backing: IGrokBuildChatBacking): Promise<void> {
+		if (backing.loadedGeneration === this._connectionGeneration && this._connection?.client) {
+			return Promise.resolve();
+		}
+		const key = chatKey(backing.chat);
+		const inFlight = this._restoreInFlight.get(key);
+		if (inFlight) {
+			return inFlight;
+		}
+		const promise = this._restoreSessionAfterConnect(backing).finally(() => {
+			if (this._restoreInFlight.get(key) === promise) {
+				this._restoreInFlight.delete(key);
+			}
+		});
+		this._restoreInFlight.set(key, promise);
+		return promise;
+	}
+
+	private async _restoreSessionAfterConnect(backing: IGrokBuildChatBacking): Promise<void> {
+		await this._ensureConnection();
+		if (backing.loadedGeneration === this._connectionGeneration) {
+			return;
+		}
+		await this._restoreSession(backing);
+	}
+
+	/**
+	 * Re-attach a persisted session id on the current grok process.
+	 * Prefer `session/load` (replays history into `Turn[]`) when
+	 * `agentCapabilities.loadSession` is set. Otherwise `session/resume`
+	 * when `sessionCapabilities.resume` is advertised (no replay). A session
+	 * id from a dead process is never used for `session/prompt` until one of
+	 * those succeeds.
+	 */
+	private async _restoreSession(backing: IGrokBuildChatBacking): Promise<void> {
+		const client = this._connection?.client;
+		if (!client) {
+			throw grokCannotRestoreSessionError();
+		}
+		const cwd = backing.workingDirectories?.[0]?.fsPath ?? process.cwd();
+		if (!backing.workingDirectories?.length) {
+			backing.workingDirectories = [URI.file(cwd)];
+		}
+		if (this._capabilities.loadSession) {
+			const replay = createGrokHistoryReplay(backing.sessionId);
+			this._historyReplays.set(backing.sessionId, replay);
+			try {
+				const result = await client.request('session/load', {
+					sessionId: backing.sessionId,
+					cwd,
+					mcpServers: [],
+				});
+				applyModelState(models => this._models.set(models, undefined), this.id, result.models);
+				const history = finishGrokHistoryReplay(replay);
+				backing.turns = history.turns.map(turn => ({
+					id: turn.id,
+					userText: turn.userText,
+					assistantMarkdown: turn.assistantMarkdown,
+					state: TurnState.Complete,
+				}));
+				if (history.title) {
+					backing.summary = history.title;
+				}
+				backing.modifiedTime = Date.now();
+			} catch (err) {
+				rethrowAcpFailure(err);
+			} finally {
+				if (this._historyReplays.get(backing.sessionId) === replay) {
+					this._historyReplays.delete(backing.sessionId);
+				}
+			}
+		} else if (this._capabilities.resume) {
+			try {
+				const result = await client.request('session/resume', {
+					sessionId: backing.sessionId,
+					cwd,
+					mcpServers: [],
+				});
+				applyModelState(models => this._models.set(models, undefined), this.id, result.models);
+			} catch (err) {
+				rethrowAcpFailure(err);
+			}
+		} else {
+			throw grokCannotRestoreSessionError();
+		}
+		backing.loadedGeneration = this._connectionGeneration;
+	}
+
+	private async _discoverSessions(): Promise<readonly AcpSessionInfo[]> {
+		await this._ensureConnection();
+		if (!this._capabilities.list) {
+			return [];
+		}
+		const cwds = new Set<string>();
+		for (const backing of this._backings.values()) {
+			const cwd = backing.workingDirectories?.[0]?.fsPath;
+			if (cwd) {
+				cwds.add(cwd);
+			}
+		}
+		if (cwds.size === 0) {
+			return this._listSessionPages(undefined);
+		}
+		const merged = new Map<string, AcpSessionInfo>();
+		for (const cwd of cwds) {
+			for (const session of await this._listSessionPages(cwd)) {
+				merged.set(session.sessionId, session);
+			}
+		}
+		return [...merged.values()];
+	}
+
+	private async _listSessionPages(cwd: string | undefined): Promise<readonly AcpSessionInfo[]> {
+		const client = this._connection?.client;
+		if (!client || !this._capabilities.list) {
+			return [];
+		}
+		const sessions: AcpSessionInfo[] = [];
+		const seenCursors = new Set<string>();
+		let cursor: string | undefined;
+		for (let page = 0; page < GROK_SESSION_LIST_MAX_PAGES; page++) {
+			const params: AcpSessionListParams = {
+				...(cwd !== undefined ? { cwd } : {}),
+				...(cursor !== undefined ? { cursor } : {}),
+			};
+			let result: AcpSessionListResult;
+			try {
+				result = await client.request('session/list', params);
+			} catch (err) {
+				rethrowAcpFailure(err);
+			}
+			if (result.sessions) {
+				sessions.push(...result.sessions);
+			}
+			const next = result.nextCursor;
+			if (next === undefined || next === null) {
+				return sessions;
+			}
+			if (seenCursors.has(next)) {
+				this._logService.warn('[GrokBuild] session/list returned a repeated cursor; stopping pagination');
+				return sessions;
+			}
+			seenCursors.add(next);
+			cursor = next;
+		}
+		this._logService.warn(`[GrokBuild] session/list stopped after ${GROK_SESSION_LIST_MAX_PAGES} pages`);
+		return sessions;
+	}
+
+	private async _emitDiscoveredChats(): Promise<void> {
+		const sessions = await this._discoverSessions();
+		const discovered: IAgentDiscoveredChat[] = [];
+		for (const session of sessions) {
+			if (this._sessionToChat.has(session.sessionId)) {
+				continue;
+			}
+			discovered.push({ ...this._toListedChat(session), external: true });
+		}
+		if (discovered.length > 0) {
+			this._onDidDiscoverChats.fire(discovered);
+		}
+	}
+
+	private async _ensureConnection(): Promise<IAcpClient> {
 		if (this._connection?.client) {
 			return this._connection.client;
 		}
@@ -705,36 +1096,20 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 
 	private async _connect(): Promise<IAcpClient> {
 		const configuredPath = process.env[AgentHostGrokBuildBinaryPathEnvVar];
-		const resolved = this._testSpawn
-			? { path: configuredPath?.trim() || 'grok', version: undefined as string | undefined }
-			: await resolveGrokBinary(configuredPath);
+		const resolved = await this._resolveBinary(configuredPath);
+		if (resolved.versionUnreadable) {
+			this._logService.warn(grokUnreadableVersionWarning(resolved.versionOutput));
+		}
 		const clientName = this._productService.nameShort || 'Code - OSS';
 		const clientVersion = this._productService.version || '0.0.0';
 		const launch = buildGrokBuildLaunchConfig(resolved.path, process.env, clientName, clientVersion);
 
 		this._logService.info(`[GrokBuild] spawning ACP from ${launch.binaryPath}`);
+		this._stderrTail = '';
 
-		let child: ChildProcessWithoutNullStreams | undefined;
-		let transport: IAcpTransport;
-		let onSpawnDispose: (() => void) | undefined;
-
-		if (this._testSpawn) {
-			const spawned = this._testSpawn(launch);
-			transport = spawned.transport;
-			child = spawned.child;
-			onSpawnDispose = spawned.onDispose;
-		} else {
-			child = spawn(launch.binaryPath, [...launch.args], {
-				stdio: ['pipe', 'pipe', 'pipe'],
-				env: launch.env,
-			});
-			child.stderr.setEncoding('utf8');
-			child.stderr.on('data', chunk => {
-				this._logService.trace(`[GrokBuild stderr] ${String(chunk).trimEnd()}`);
-			});
-			transport = transportFromChildProcess(child);
-		}
-
+		const spawned = this._spawn(launch);
+		const child = spawned.child;
+		const transport = spawned.transport;
 		const client = new AcpClient(transport, (level, message) => {
 			if (level === 'error') {
 				this._logService.error(`[GrokBuild ACP] ${message}`);
@@ -745,38 +1120,18 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 
 		const store = new DisposableStore();
 		store.add(client);
-		if (onSpawnDispose) {
-			store.add(toDisposable(onSpawnDispose));
+		if (spawned.onDispose) {
+			store.add(toDisposable(spawned.onDispose));
 		}
 		this._wireClient(client, store);
+		this._attachChildStreams(child);
 
-		const failConnection = (err: Error) => {
-			this._logService.error(`[GrokBuild] process/transport error: ${err.message}`);
-			client.rejectAllPending(err);
-			this._cancelAllPendingPermissions();
-			if (this._connection?.client === client || !this._connection) {
-				// During handshake `_connection` is still unset; dispose the local store.
-				if (this._connection?.client === client) {
-					this._disposeConnection();
-				} else {
-					store.dispose();
-					if (child && child.exitCode === null && child.signalCode === null) {
-						try {
-							child.kill('SIGTERM');
-						} catch {
-							// already dead
-						}
-					}
-				}
-			}
+		const failConnection = (err: unknown) => {
+			this._teardownFailedConnection(client, store, child, this._enrichError(err));
 		};
 
 		store.add(client.onExit(e => {
-			this._logService.warn(`[GrokBuild] ACP exited code=${e.code} signal=${e.signal}`);
-			this._cancelAllPendingPermissions();
-			if (this._connection?.client === client) {
-				this._disposeConnection();
-			}
+			this._teardownFailedConnection(client, store, child, grokProcessExitedError(e.code, e.signal, this._stderrTail));
 		}));
 		store.add(client.onTransportError(err => {
 			failConnection(err);
@@ -791,6 +1146,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			});
 		}
 
+		let capabilities = noGrokCapabilities;
 		try {
 			const init = await raceTimeout(
 				client.request('initialize', {
@@ -806,6 +1162,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			if (init === undefined) {
 				throw grokHandshakeTimeoutError('initialize');
 			}
+			capabilities = readGrokCapabilities(init.agentCapabilities);
 			applyModelState(models => this._models.set(models, undefined), this.id, init._meta?.modelState);
 
 			// Do not log the authenticate result — `_meta` includes email / team / tier.
@@ -817,21 +1174,72 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 				throw grokHandshakeTimeoutError('authenticate');
 			}
 		} catch (err) {
-			store.dispose();
-			if (child && child.exitCode === null && child.signalCode === null) {
-				try {
-					child.kill('SIGTERM');
-				} catch {
-					// already dead
-				}
-			}
-			rethrowAcpFailure(err);
+			const error = isGrokAuthError(err)
+				? new Error(withStderrTail(grokNotLoggedInError().message, this._stderrTail))
+				: this._enrichError(err);
+			this._teardownFailedConnection(client, store, child, error);
+			throw error;
 		}
 
 		// Publish only after a successful handshake so concurrent createChat
 		// callers await `_connectionInFlight` instead of an un-handshaked client.
+		this._capabilities = capabilities;
+		this._connectionGeneration++;
 		this._connection = { client, child, store };
 		return client;
+	}
+
+	private _attachChildStreams(child: ChildProcessWithoutNullStreams | undefined): void {
+		if (!child?.stderr) {
+			return;
+		}
+		child.stderr.setEncoding('utf8');
+		child.stderr.on('data', chunk => {
+			const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+			this._stderrTail = appendStderrTail(this._stderrTail, text);
+			const line = text.trimEnd();
+			if (line.length > 0) {
+				this._logService.trace(`[GrokBuild stderr] ${line}`);
+			}
+		});
+	}
+
+	private _enrichError(err: unknown): Error {
+		const base = formatAcpError(err);
+		const message = withStderrTail(base.message, this._stderrTail);
+		if (message === base.message) {
+			return base;
+		}
+		const enriched = new Error(message);
+		enriched.name = base.name;
+		return enriched;
+	}
+
+	/**
+	 * Shared teardown for handshake failure, transport failure, and process exit.
+	 * Idempotent: the exit path and the in-flight request rejection both land here.
+	 */
+	private _teardownFailedConnection(
+		client: IAcpClient,
+		store: DisposableStore,
+		child: ChildProcessWithoutNullStreams | undefined,
+		error: Error,
+	): void {
+		if (this._tornDown.has(client)) {
+			return;
+		}
+		this._tornDown.add(client);
+		this._logService.error(`[GrokBuild] ${error.message}`);
+		this._failActiveTurns(error);
+		this._cancelAllPendingPermissions();
+		client.rejectAllPending(error);
+		this._invalidateLoadedSessions();
+		if (this._connection?.client === client) {
+			this._disposeConnection();
+			return;
+		}
+		store.dispose();
+		this._killChild(child);
 	}
 
 	private _wireClient(client: IAcpClient, store: DisposableStore): void {
@@ -847,12 +1255,25 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 	}
 
 	private _handleSessionUpdate(params: AcpSessionUpdateParams): void {
+		const replay = this._historyReplays.get(params.sessionId);
+		if (replay) {
+			applyGrokHistoryUpdate(replay, params.update);
+			return;
+		}
 		const chat = this._sessionToChat.get(params.sessionId);
 		if (!chat) {
 			return;
 		}
 		const backing = this._backings.get(chatKey(chat));
-		if (!backing?.activeTurnId || !backing.mapState) {
+		if (!backing) {
+			return;
+		}
+		const title = readGrokSessionTitle(params.update);
+		if (title) {
+			backing.summary = title;
+			backing.modifiedTime = Date.now();
+		}
+		if (!backing.activeTurnId || !backing.mapState) {
 			return;
 		}
 		const chunkText = textFromSessionUpdate(params);
@@ -892,20 +1313,25 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		});
 	}
 
-	private _disposeConnection(): void {
-		const connection = this._connection;
-		this._connection = undefined;
-		if (!connection) {
-			return;
-		}
-		connection.store.dispose();
-		if (connection.child && connection.child.exitCode === null && connection.child.signalCode === null) {
+	private _killChild(child: ChildProcessWithoutNullStreams | undefined): void {
+		if (child && child.exitCode === null && child.signalCode === null) {
 			try {
-				connection.child.kill('SIGTERM');
+				child.kill('SIGTERM');
 			} catch {
 				// already dead
 			}
 		}
+	}
+
+	private _disposeConnection(): void {
+		const connection = this._connection;
+		this._connection = undefined;
+		this._invalidateLoadedSessions();
+		if (!connection) {
+			return;
+		}
+		connection.store.dispose();
+		this._killChild(connection.child);
 		if (this._testClient === connection.client) {
 			this._testClient = undefined;
 		}

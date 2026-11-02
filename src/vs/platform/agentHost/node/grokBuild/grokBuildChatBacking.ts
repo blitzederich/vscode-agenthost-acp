@@ -8,12 +8,15 @@ import type { ModelSelection } from '../../common/state/sessionState.js';
 /**
  * Opaque per-chat backing persisted by the orchestrator and returned on restore.
  *
- * `sessionId` is the ACP session id from `session/new`. Stage 1 keeps history
- * in memory only; Stage 2 will use `session/load` / `session/resume`.
+ * `sessionId` is the ACP session id from `session/new`. `cwd` is the absolute
+ * working directory (host worktree or folder) last given to `session/new`,
+ * `session/load`, or `session/resume`. History itself is not stored here —
+ * `session/load` replays it into `Turn[]`.
  */
 export interface IGrokBuildPersistedChat {
 	readonly sessionId: string;
 	readonly model?: ModelSelection;
+	readonly cwd?: string;
 }
 
 export function encodeGrokBuildChat(chat: IGrokBuildPersistedChat): string {
@@ -27,7 +30,12 @@ export function decodeGrokBuildChat(data: string | undefined): IGrokBuildPersist
 	try {
 		const parsed = JSON.parse(data);
 		if (parsed && typeof parsed.sessionId === 'string') {
-			return parsed as IGrokBuildPersistedChat;
+			const cwd = typeof parsed.cwd === 'string' && parsed.cwd.length > 0 ? parsed.cwd : undefined;
+			return {
+				sessionId: parsed.sessionId,
+				model: parsed.model,
+				cwd,
+			};
 		}
 	} catch {
 		// fall through
