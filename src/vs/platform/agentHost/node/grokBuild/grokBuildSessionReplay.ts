@@ -9,17 +9,17 @@ import type { AcpSessionUpdate } from './protocol/acpTypes.js';
 /**
  * One durable turn reconstructed from an ACP `session/load` replay.
  *
- * Live `getMessages` only stores the user prompt plus assistant markdown
- * (thoughts and tool calls are streamed as actions, not kept on the turn
- * record). Replay matches that shape. Turn boundaries follow ACP v1:
- * `user_message_chunk` starts a user message, `agent_message_chunk` appends
- * the reply. **To verify live** — grok 1.0.70's `session/load` body and
- * replay chunking are not in the attached logs.
+ * grok 1.0.70 replays each user and assistant message as one chunk with no
+ * `messageId`. Turn identity is `update._meta.promptIndex`. A `tool_call`
+ * between two assistant messages joins those messages with a blank line.
+ * Thoughts and tool calls are not stored on the turn.
  */
 export interface IGrokReplayedTurn {
 	readonly id: string;
 	readonly userText: string;
 	readonly assistantMarkdown: string;
+	/** `user_message_chunk._meta.promptIndex` when grok sent one. */
+	readonly promptIndex?: number;
 }
 
 export interface IGrokHistoryReplay {
@@ -31,7 +31,9 @@ export interface IGrokHistoryReplay {
 		userText: string;
 		assistantMarkdown: string;
 		userMessageId?: string;
+		promptIndex?: number;
 		sawAgent: boolean;
+		pendingAssistantSeparator: boolean;
 	};
 }
 
@@ -55,22 +57,34 @@ export function applyGrokHistoryUpdate(replay: IGrokHistoryReplay, update: AcpSe
 		}
 		return;
 	}
+	if (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') {
+		if (replay.current && replay.current.assistantMarkdown.length > 0) {
+			replay.current.pendingAssistantSeparator = true;
+		}
+		return;
+	}
 	if (update.sessionUpdate === 'user_message_chunk') {
 		const text = textFromContent((update as { content?: unknown }).content);
 		const messageId = messageIdOf(update);
+		const promptIndex = promptIndexOf(update);
 		const current = replay.current;
+		if (promptIndex !== undefined) {
+			if (!current || current.promptIndex !== promptIndex) {
+				flushGrokHistoryTurn(replay);
+				replay.current = newReplayTurn(messageId, promptIndex);
+			}
+			replay.current!.userText += text;
+			if (messageId) {
+				replay.current!.userMessageId = messageId;
+			}
+			return;
+		}
 		const sameUser = !!current && !current.sawAgent && (messageId === undefined || messageId === current.userMessageId);
 		if (current && !sameUser) {
 			flushGrokHistoryTurn(replay);
 		}
 		if (!replay.current) {
-			replay.current = {
-				id: messageId ?? generateUuid(),
-				userText: '',
-				assistantMarkdown: '',
-				userMessageId: messageId,
-				sawAgent: false,
-			};
+			replay.current = newReplayTurn(messageId, undefined);
 		}
 		replay.current.userText += text;
 		if (messageId) {
@@ -80,16 +94,21 @@ export function applyGrokHistoryUpdate(replay: IGrokHistoryReplay, update: AcpSe
 	}
 	if (update.sessionUpdate === 'agent_message_chunk') {
 		const text = textFromContent((update as { content?: unknown }).content);
-		if (!replay.current) {
-			replay.current = {
-				id: messageIdOf(update) ?? generateUuid(),
-				userText: '',
-				assistantMarkdown: '',
-				sawAgent: true,
-			};
+		const promptIndex = promptIndexOf(update);
+		const current = replay.current;
+		if (!current || (promptIndex !== undefined && current.promptIndex !== promptIndex)) {
+			if (current) {
+				flushGrokHistoryTurn(replay);
+			}
+			replay.current = newReplayTurn(messageIdOf(update), promptIndex);
 		}
-		replay.current.assistantMarkdown += text;
-		replay.current.sawAgent = true;
+		const turn = replay.current!;
+		if (turn.pendingAssistantSeparator && turn.assistantMarkdown.length > 0 && text.length > 0) {
+			turn.assistantMarkdown += '\n\n';
+		}
+		turn.pendingAssistantSeparator = false;
+		turn.assistantMarkdown += text;
+		turn.sawAgent = true;
 	}
 }
 
@@ -109,6 +128,18 @@ export function readGrokSessionTitle(update: AcpSessionUpdate | undefined): stri
 	return typeof title === 'string' && title.trim().length > 0 ? title : undefined;
 }
 
+function newReplayTurn(messageId: string | undefined, promptIndex: number | undefined): NonNullable<IGrokHistoryReplay['current']> {
+	return {
+		id: messageId ?? generateUuid(),
+		userText: '',
+		assistantMarkdown: '',
+		userMessageId: messageId,
+		promptIndex,
+		sawAgent: false,
+		pendingAssistantSeparator: false,
+	};
+}
+
 function flushGrokHistoryTurn(replay: IGrokHistoryReplay): void {
 	const current = replay.current;
 	replay.current = undefined;
@@ -122,7 +153,13 @@ function flushGrokHistoryTurn(replay: IGrokHistoryReplay): void {
 		id: current.id,
 		userText: current.userText,
 		assistantMarkdown: current.assistantMarkdown,
+		promptIndex: current.promptIndex,
 	});
+}
+
+function promptIndexOf(update: AcpSessionUpdate): number | undefined {
+	const value = update._meta?.promptIndex;
+	return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
 function messageIdOf(update: AcpSessionUpdate): string | undefined {

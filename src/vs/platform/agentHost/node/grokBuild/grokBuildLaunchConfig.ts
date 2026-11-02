@@ -116,15 +116,15 @@ export function grokCannotRestoreSessionError(): Error {
 
 export function grokWorkingDirectoryRejectedError(): Error {
 	return new Error(nls.localize(
-		'grokBuild.workingDirectoryNotLocal',
-		"Grok Build can only use a local absolute folder as the working directory.",
+		'grokBuild.workingDirectoryFixed',
+		"Grok Build cannot change the working directory of an existing session. The session can only be reloaded in the folder where it was created.",
 	));
 }
 
-export function grokWorkingDirectoryBusyError(): Error {
+export function grokSessionMissingError(): Error {
 	return new Error(nls.localize(
-		'grokBuild.workingDirectoryBusy',
-		"Cannot change the Grok Build working directory while a turn is in progress.",
+		'grokBuild.sessionMissing',
+		"This Grok session no longer exists on this machine.",
 	));
 }
 
@@ -296,84 +296,36 @@ export async function resolveGrokBinary(
 }
 
 /**
- * Build argv + env for the Grok ACP stdio process.
+ * Environment passed to `grok`. The shell tool inherits this process, so the
+ * host copies the parent environment and drops only the keys that retarget
+ * the CLI or leak the editor: `VSCODE_*`, `ELECTRON_*`, and `NODE_OPTIONS`.
+ * `ELECTRON_RUN_AS_NODE` is never set. The host owns `GROK_CLIENT_NAME` and
+ * `GROK_CLIENT_VERSION`. User values such as `SSH_AUTH_SOCK`,
+ * `NODE_EXTRA_CA_CERTS`, `KUBECONFIG`, `XAI_API_KEY`, and other `GROK_*`
+ * keys are kept. Never read `~/.grok/auth.json`.
  *
- * Interactive `--permission-mode default` is forced so ACP
+ * Argv stays interactive `--permission-mode default` so ACP
  * `session/request_permission` reaches VS Code even when the user's
  * `~/.grok/config.toml` sets always-approve. Never pass
  * `--always-approve` / `bypassPermissions` / `dontAsk`.
  */
-/**
- * Environment grok actually needs. Codex copies the full host environment
- * (it has no strip policy). Claude strips `VSCODE_*` / `ELECTRON_*` but sets
- * `ELECTRON_RUN_AS_NODE=1` because its SDK is Node. Grok is a native binary,
- * so the host passes this allowlist only and never sets `ELECTRON_RUN_AS_NODE`.
- * `GROK_*` values the user already set are kept (telemetry stays in the user's
- * config; we do not invent overrides) except the client identity vars, which
- * the host owns. `XAI_API_KEY` is the documented auth fallback. Never read
- * `~/.grok/auth.json`.
- */
-const GROK_SUBPROCESS_ENV_KEYS = [
-	'PATH',
-	'HOME',
-	'USERPROFILE',
-	'HOMEDRIVE',
-	'HOMEPATH',
-	'USER',
-	'USERNAME',
-	'LOGNAME',
-	'SHELL',
-	'COMSPEC',
-	'PATHEXT',
-	'SystemRoot',
-	'SYSTEMROOT',
-	'WINDIR',
-	'TMPDIR',
-	'TMP',
-	'TEMP',
-	'LANG',
-	'LC_ALL',
-	'LC_CTYPE',
-	'LC_MESSAGES',
-	'XAI_API_KEY',
-	'GROK_SANDBOX',
-	'XDG_CONFIG_HOME',
-	'XDG_DATA_HOME',
-	'XDG_CACHE_HOME',
-	'HTTP_PROXY',
-	'HTTPS_PROXY',
-	'NO_PROXY',
-	'ALL_PROXY',
-	'http_proxy',
-	'https_proxy',
-	'no_proxy',
-	'all_proxy',
-	'SSL_CERT_FILE',
-	'SSL_CERT_DIR',
-	'CURL_CA_BUNDLE',
-	'REQUESTS_CA_BUNDLE',
-] as const;
-
 export function buildGrokSubprocessEnv(
 	inheritedEnv: NodeJS.ProcessEnv,
 	clientName: string,
 	clientVersion: string,
 ): NodeJS.ProcessEnv {
 	const env: NodeJS.ProcessEnv = {};
-	for (const key of GROK_SUBPROCESS_ENV_KEYS) {
-		const value = inheritedEnv[key];
-		if (typeof value === 'string') {
-			env[key] = value;
-		}
-	}
-	for (const key of Object.keys(inheritedEnv)) {
-		if (!key.startsWith('GROK_') || key === GROK_CLIENT_NAME_ENV || key === GROK_CLIENT_VERSION_ENV) {
+	for (const [key, value] of Object.entries(inheritedEnv)) {
+		if (typeof value !== 'string') {
 			continue;
 		}
-		const value = inheritedEnv[key];
-		if (typeof value === 'string') {
-			env[key] = value;
+		if (key.startsWith('VSCODE_') || key.startsWith('ELECTRON_') || key === 'NODE_OPTIONS') {
+			continue;
 		}
+		if (key === GROK_CLIENT_NAME_ENV || key === GROK_CLIENT_VERSION_ENV) {
+			continue;
+		}
+		env[key] = value;
 	}
 	env[GROK_CLIENT_NAME_ENV] = clientName;
 	env[GROK_CLIENT_VERSION_ENV] = clientVersion;

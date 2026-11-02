@@ -7,9 +7,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
 import { raceTimeout } from '../../../../base/common/async.js';
 import { Emitter } from '../../../../base/common/event.js';
 import { Disposable, DisposableStore, toDisposable } from '../../../../base/common/lifecycle.js';
-import { Schemas } from '../../../../base/common/network.js';
 import { type IObservable, observableValue } from '../../../../base/common/observable.js';
-import { isAbsolute } from '../../../../base/common/path.js';
 import { extUri } from '../../../../base/common/resources.js';
 import { URI } from '../../../../base/common/uri.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
@@ -70,8 +68,8 @@ import {
 	grokHandshakeTimeoutError,
 	grokNotLoggedInError,
 	grokProcessExitedError,
+	grokSessionMissingError,
 	grokUnreadableVersionWarning,
-	grokWorkingDirectoryBusyError,
 	grokWorkingDirectoryRejectedError,
 	resolveGrokBinary,
 	withStderrTail,
@@ -94,6 +92,7 @@ import {
 	finishGrokHistoryReplay,
 	readGrokSessionTitle,
 	type IGrokHistoryReplay,
+	type IGrokReplayedTurn,
 } from './grokBuildSessionReplay.js';
 import {
 	type AcpAgentCapabilities,
@@ -111,8 +110,6 @@ import {
 const emptySessionSchema = createSchema({});
 const HANDSHAKE_TIMEOUT_MS = 30_000;
 const GROK_SESSION_LIST_MAX_PAGES = 20;
-/** ACP v1: `session/close` of an unknown session is success. */
-const ACP_UNKNOWN_SESSION = -32002;
 
 export type GrokBuildTestSpawnResult = {
 	readonly transport: IAcpTransport;
@@ -129,6 +126,8 @@ interface IGrokBuildTurnRecord {
 	readonly state: TurnState;
 	readonly usage?: Turn['usage'];
 	readonly errorMessage?: string;
+	/** ACP `user_message_chunk._meta.promptIndex` for this turn, when known. */
+	readonly promptIndex?: number;
 }
 
 interface IGrokBuildChatBacking {
@@ -146,6 +145,13 @@ interface IGrokBuildChatBacking {
 	mapState?: IGrokBuildMapState;
 	turnAssistantMarkdown?: string;
 	turnUserText?: string;
+	/** Prompt index of the in-flight turn. Stored on the turn record when it finishes. */
+	turnPromptIndex?: number;
+	/**
+	 * Cwd to try on the next `session/load` when the backing has none yet.
+	 * Not copied into providerData until that load succeeds.
+	 */
+	pendingLoadCwd?: string;
 }
 
 interface IPendingPermission {
@@ -184,6 +190,61 @@ function isGrokAuthError(error: unknown): boolean {
 		return false;
 	}
 	return error.code === -32000 && /authentication required/i.test(error.message);
+}
+
+/** grok 1.0.70: `session/load` of an unknown id or a missing folder is -32603 / `FS_NOT_FOUND`. */
+function isGrokFsNotFound(error: unknown): boolean {
+	if (!(error instanceof AcpJsonRpcResponseError) || error.code !== AcpJsonRpcErrorCode.InternalError) {
+		return false;
+	}
+	const data = error.data;
+	return !!data && typeof data === 'object' && (data as { code?: unknown }).code === 'FS_NOT_FOUND';
+}
+
+/**
+ * Replay replaces in-memory turns, but a turn killed mid-reply comes back as
+ * a user message only. Keep a local `TurnState.Error` (and its message) when
+ * `promptIndex` matches, and never mark a user-only replayed turn complete.
+ */
+function mergeRestoredTurns(local: readonly IGrokBuildTurnRecord[], replayed: readonly IGrokReplayedTurn[]): IGrokBuildTurnRecord[] {
+	const byPrompt = new Map<number, IGrokBuildTurnRecord>();
+	for (const turn of local) {
+		if (typeof turn.promptIndex === 'number') {
+			byPrompt.set(turn.promptIndex, turn);
+		}
+	}
+	return replayed.map(turn => {
+		const previous = typeof turn.promptIndex === 'number' ? byPrompt.get(turn.promptIndex) : undefined;
+		const promptIndex = turn.promptIndex ?? previous?.promptIndex;
+		if (previous?.state === TurnState.Error) {
+			return {
+				id: previous.id,
+				userText: turn.userText || previous.userText,
+				assistantMarkdown: turn.assistantMarkdown || previous.assistantMarkdown,
+				state: TurnState.Error,
+				usage: previous.usage,
+				errorMessage: previous.errorMessage,
+				promptIndex,
+			};
+		}
+		if (turn.userText.length > 0 && turn.assistantMarkdown.length === 0) {
+			return {
+				id: previous?.id ?? turn.id,
+				userText: turn.userText,
+				assistantMarkdown: '',
+				state: TurnState.Cancelled,
+				promptIndex,
+			};
+		}
+		return {
+			id: previous?.id ?? turn.id,
+			userText: turn.userText,
+			assistantMarkdown: turn.assistantMarkdown,
+			state: TurnState.Complete,
+			usage: previous?.usage,
+			promptIndex,
+		};
+	});
 }
 
 function readGrokCapabilities(capabilities: AcpAgentCapabilities | undefined): IGrokAdvertisedCapabilities {
@@ -303,8 +364,11 @@ function spawnGrokBuildProcess(launch: IGrokBuildLaunchConfig): GrokBuildTestSpa
 
 export class GrokBuildAgent extends Disposable implements IAgent {
 	readonly id: AgentProvider = GROK_BUILD_AGENT_PROVIDER_ID;
-	/** Session folder changes go through {@link setWorkingDirectory} (host worktree path as ACP `cwd`). */
-	readonly agentHostCapabilities = { workspaceConversion: true } as const;
+	/**
+	 * grok 1.0.70 cannot `session/load` a session outside the directory it was
+	 * created in (`FS_NOT_FOUND`). The host must not offer a worktree conversion.
+	 */
+	readonly agentHostCapabilities = { workspaceConversion: false } as const;
 
 	private readonly _onDidChatProgress = this._register(new Emitter<AgentSignal>());
 	readonly onDidChatProgress = this._onDidChatProgress.event;
@@ -338,6 +402,8 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 	private _stderrTail = '';
 	/** In-flight `session/load` replays, keyed by ACP session id so concurrent restores do not share one buffer. */
 	private readonly _historyReplays = new Map<string, IGrokHistoryReplay>();
+	/** `session/list` rows, keyed by ACP session id. Discovery fills this; recovery reads cwd and title from it. */
+	private readonly _listedSessions = new Map<string, AcpSessionInfo>();
 	private _discoveryPromise: Promise<void> | undefined;
 	private _testClient: IAcpClient | undefined;
 	private _spawn: GrokBuildTestSpawn = spawnGrokBuildProcess;
@@ -413,13 +479,23 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 
 	async materializeChat(chat: URI, context: URI | IAgentChatContext, providerData: string | undefined): Promise<IAgentCreateChatResult | void> {
 		resolveAgentChatContext(context, chat);
+		if (providerData === undefined) {
+			return this._recoverDiscoveredChat(chat, context);
+		}
 		const decoded = decodeGrokBuildChat(providerData);
 		if (!decoded) {
 			return;
 		}
 		const workingDirectories = decoded.cwd ? [URI.file(decoded.cwd)] : undefined;
 		const backing = this._storeBacking(chat, decoded, workingDirectories);
-		await this._ensureSessionAttached(backing);
+		try {
+			await this._ensureSessionAttached(backing);
+		} catch (err) {
+			if (err instanceof Error && err.message === grokSessionMissingError().message) {
+				this._dropBacking(chat, decoded.sessionId);
+			}
+			throw err;
+		}
 		const encoded = this._persistProviderData(backing);
 		const result: IAgentCreateChatResult = {
 			providerData: encoded,
@@ -432,6 +508,15 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			project: undefined,
 		});
 		return result;
+	}
+
+	/**
+	 * A discovered default chat has no persisted blob. The session id is the
+	 * owner URI; cwd and title come from `session/list`. `session/load` runs
+	 * at that original cwd and only then is canonical providerData returned.
+	 */
+	async recoverLegacyChat(chat: URI, context: URI | IAgentChatContext): Promise<IAgentCreateChatResult> {
+		return this._recoverDiscoveredChat(chat, context);
 	}
 
 	getOrCreateActiveClient(
@@ -492,22 +577,8 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 
 	async setWorkingDirectory(chat: URI, context: URI | IAgentChatContext, workingDirectory: URI): Promise<void> {
 		resolveAgentChatContext(context, chat);
-		const backing = this._requireBacking(chat);
-		if (workingDirectory.scheme !== Schemas.file || !!workingDirectory.query || !!workingDirectory.fragment || !isAbsolute(workingDirectory.fsPath)) {
-			throw grokWorkingDirectoryRejectedError();
-		}
-		if (backing.activeTurnId) {
-			throw grokWorkingDirectoryBusyError();
-		}
-		const current = backing.workingDirectories?.[0];
-		if (current && extUri.isEqual(current, workingDirectory)) {
-			return;
-		}
-		backing.workingDirectories = [workingDirectory];
-		backing.modifiedTime = Date.now();
-		backing.loadedGeneration = undefined;
-		this._emitProviderDataChange(chat, backing);
-		await this._ensureSessionAttached(backing);
+		this._logService.trace(`[GrokBuild] rejected working directory change to ${workingDirectory.toString()}`);
+		throw grokWorkingDirectoryRejectedError();
 	}
 
 	resolveChatConfig(params: IAgentResolveChatConfigParams): Promise<ResolveSessionConfigResult> {
@@ -725,14 +796,12 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		if (workingDirectories && workingDirectories.length > 0) {
 			const next = workingDirectories[0];
 			const previous = backing.workingDirectories?.[0];
-			const changed = !previous || !extUri.isEqual(previous, next);
-			backing.workingDirectories = workingDirectories;
-			if (changed) {
-				backing.loadedGeneration = undefined;
-				this._emitProviderDataChange(chat, backing);
+			if (previous && !extUri.isEqual(previous, next)) {
+				this._logService.trace(`[GrokBuild] ignoring working directory ${next.fsPath}; keeping session cwd ${previous.fsPath}`);
 			}
 		}
 		await this._ensureSessionAttached(backing);
+		backing.turnPromptIndex = this._nextPromptIndex(backing);
 		const client = this._connection?.client;
 		if (!client) {
 			throw grokCliMissingError();
@@ -777,6 +846,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			backing.mapState = undefined;
 			backing.turnAssistantMarkdown = undefined;
 			backing.turnUserText = undefined;
+			backing.turnPromptIndex = undefined;
 		}
 	}
 
@@ -844,11 +914,10 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			return;
 		}
 		try {
+			// grok 1.0.70 returns success for a resident session (`x.ai/closeOutcome: closed`)
+			// and for an unknown or already-closed session (`notResident`). It does not use -32002.
 			await client.request('session/close', { sessionId: backing.sessionId });
 		} catch (err) {
-			if (err instanceof AcpJsonRpcResponseError && err.code === ACP_UNKNOWN_SESSION) {
-				return;
-			}
 			this._logService.trace(`[GrokBuild] session/close failed: ${err instanceof Error ? err.message : String(err)}`);
 		}
 	}
@@ -874,8 +943,26 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 	private _finalizeTurn(backing: IGrokBuildChatBacking, turnId: string, state: TurnState, usage: Turn['usage'], errorMessage?: string): void {
 		const userText = backing.turnUserText ?? '';
 		const assistantMarkdown = backing.turnAssistantMarkdown ?? '';
-		backing.turns.push({ id: turnId, userText, assistantMarkdown, state, usage, errorMessage });
+		backing.turns.push({
+			id: turnId,
+			userText,
+			assistantMarkdown,
+			state,
+			usage,
+			errorMessage,
+			promptIndex: backing.turnPromptIndex,
+		});
 		backing.modifiedTime = Date.now();
+	}
+
+	private _nextPromptIndex(backing: IGrokBuildChatBacking): number {
+		let max = -1;
+		for (const turn of backing.turns) {
+			if (typeof turn.promptIndex === 'number' && turn.promptIndex > max) {
+				max = turn.promptIndex;
+			}
+		}
+		return max >= 0 ? max + 1 : backing.turns.length;
 	}
 
 	private _fireAction(chat: URI, action: SessionAction | ChatAction): void {
@@ -910,6 +997,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			backing.mapState = undefined;
 			backing.turnAssistantMarkdown = undefined;
 			backing.turnUserText = undefined;
+			backing.turnPromptIndex = undefined;
 		}
 	}
 
@@ -958,10 +1046,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		if (!client) {
 			throw grokCannotRestoreSessionError();
 		}
-		const cwd = backing.workingDirectories?.[0]?.fsPath ?? process.cwd();
-		if (!backing.workingDirectories?.length) {
-			backing.workingDirectories = [URI.file(cwd)];
-		}
+		const cwd = await this._cwdForLoad(backing);
 		if (this._capabilities.loadSession) {
 			const replay = createGrokHistoryReplay(backing.sessionId);
 			this._historyReplays.set(backing.sessionId, replay);
@@ -973,17 +1058,19 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 				});
 				applyModelState(models => this._models.set(models, undefined), this.id, result.models);
 				const history = finishGrokHistoryReplay(replay);
-				backing.turns = history.turns.map(turn => ({
-					id: turn.id,
-					userText: turn.userText,
-					assistantMarkdown: turn.assistantMarkdown,
-					state: TurnState.Complete,
-				}));
-				if (history.title) {
+				backing.turns = mergeRestoredTurns(backing.turns, history.turns);
+				const listedTitle = this._listedTitle(backing.sessionId);
+				if (listedTitle) {
+					backing.summary = listedTitle;
+				} else if (history.title) {
 					backing.summary = history.title;
 				}
 				backing.modifiedTime = Date.now();
 			} catch (err) {
+				if (isGrokFsNotFound(err)) {
+					this._dropBacking(backing.chat, backing.sessionId);
+					throw grokSessionMissingError();
+				}
 				rethrowAcpFailure(err);
 			} finally {
 				if (this._historyReplays.get(backing.sessionId) === replay) {
@@ -1004,31 +1091,104 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		} else {
 			throw grokCannotRestoreSessionError();
 		}
+		if (!backing.workingDirectories?.length) {
+			backing.workingDirectories = [URI.file(cwd)];
+		}
+		backing.pendingLoadCwd = undefined;
 		backing.loadedGeneration = this._connectionGeneration;
 	}
 
+	/**
+	 * Cwd already stored on the backing wins. A discovered session supplies
+	 * one via {@link IGrokBuildChatBacking.pendingLoadCwd} or `session/list`.
+	 * Nothing is written onto the backing here: a failed load must not persist
+	 * a directory the session was not created with.
+	 */
+	private async _cwdForLoad(backing: IGrokBuildChatBacking): Promise<string> {
+		const existing = backing.workingDirectories?.[0]?.fsPath;
+		if (existing) {
+			return existing;
+		}
+		if (backing.pendingLoadCwd) {
+			return backing.pendingLoadCwd;
+		}
+		const listed = await this._lookupListedSession(backing.sessionId);
+		const listedCwd = listed?.cwd;
+		if (typeof listedCwd === 'string' && listedCwd.length > 0) {
+			return listedCwd;
+		}
+		throw grokSessionMissingError();
+	}
+
+	private async _recoverDiscoveredChat(chat: URI, context: URI | IAgentChatContext): Promise<IAgentCreateChatResult> {
+		const sessionId = AgentSession.id(resolveAgentChatContext(context, chat).owner.get());
+		if (!sessionId) {
+			throw grokSessionMissingError();
+		}
+		const listed = await this._lookupListedSession(sessionId);
+		const cwd = typeof listed?.cwd === 'string' && listed.cwd.length > 0 ? listed.cwd : undefined;
+		if (!cwd) {
+			throw grokSessionMissingError();
+		}
+		const backing = this._storeBacking(chat, { sessionId }, undefined);
+		backing.pendingLoadCwd = cwd;
+		try {
+			await this._ensureSessionAttached(backing);
+		} catch (err) {
+			this._dropBacking(chat, sessionId);
+			throw err;
+		}
+		backing.pendingLoadCwd = undefined;
+		const encoded = this._persistProviderData(backing);
+		const result: IAgentCreateChatResult = {
+			providerData: encoded,
+			resolvedWorkingDirectory: backing.workingDirectories?.[0],
+		};
+		this._onDidMaterializeChat.fire({
+			chat,
+			result,
+			workingDirectories: backing.workingDirectories,
+			project: undefined,
+		});
+		return result;
+	}
+
+	private async _lookupListedSession(sessionId: string): Promise<AcpSessionInfo | undefined> {
+		const cached = this._listedSessions.get(sessionId);
+		if (cached) {
+			return cached;
+		}
+		if (!this._capabilities.list) {
+			return undefined;
+		}
+		await this._ensureConnection();
+		if (!this._capabilities.list) {
+			return undefined;
+		}
+		await this._listSessionPages(undefined);
+		return this._listedSessions.get(sessionId);
+	}
+
+	private _listedTitle(sessionId: string): string | undefined {
+		const title = this._listedSessions.get(sessionId)?.title;
+		return typeof title === 'string' && title.trim().length > 0 ? title : undefined;
+	}
+
+	private _dropBacking(chat: URI, sessionId: string): void {
+		const key = chatKey(chat);
+		this._backings.delete(key);
+		if (this._sessionToChat.get(sessionId)?.toString() === chat.toString()) {
+			this._sessionToChat.delete(sessionId);
+		}
+	}
+
+	/** One unfiltered `session/list`. grok's cwd filter is an exact match and would hide other folders. */
 	private async _discoverSessions(): Promise<readonly AcpSessionInfo[]> {
 		await this._ensureConnection();
 		if (!this._capabilities.list) {
 			return [];
 		}
-		const cwds = new Set<string>();
-		for (const backing of this._backings.values()) {
-			const cwd = backing.workingDirectories?.[0]?.fsPath;
-			if (cwd) {
-				cwds.add(cwd);
-			}
-		}
-		if (cwds.size === 0) {
-			return this._listSessionPages(undefined);
-		}
-		const merged = new Map<string, AcpSessionInfo>();
-		for (const cwd of cwds) {
-			for (const session of await this._listSessionPages(cwd)) {
-				merged.set(session.sessionId, session);
-			}
-		}
-		return [...merged.values()];
+		return this._listSessionPages(undefined);
 	}
 
 	private async _listSessionPages(cwd: string | undefined): Promise<readonly AcpSessionInfo[]> {
@@ -1037,6 +1197,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			return [];
 		}
 		const sessions: AcpSessionInfo[] = [];
+		const seenIds = new Set<string>();
 		const seenCursors = new Set<string>();
 		let cursor: string | undefined;
 		for (let page = 0; page < GROK_SESSION_LIST_MAX_PAGES; page++) {
@@ -1051,7 +1212,17 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 				rethrowAcpFailure(err);
 			}
 			if (result.sessions) {
-				sessions.push(...result.sessions);
+				for (const session of result.sessions) {
+					if (!session?.sessionId) {
+						continue;
+					}
+					this._listedSessions.set(session.sessionId, session);
+					if (seenIds.has(session.sessionId)) {
+						continue;
+					}
+					seenIds.add(session.sessionId);
+					sessions.push(session);
+				}
 			}
 			const next = result.nextCursor;
 			if (next === undefined || next === null) {

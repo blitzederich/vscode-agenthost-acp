@@ -10,16 +10,16 @@ import { Emitter } from '../../../../../base/common/event.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../../log/common/log.js';
-import { fixedChatOwnerRef, GROK_BUILD_AGENT_PROVIDER_ID, type AgentSignal, type IAgentChatContext, type IAgentDiscoveredChat } from '../../../common/agent.js';
+import { AgentSession, fixedChatOwnerRef, GROK_BUILD_AGENT_PROVIDER_ID, type AgentSignal, type IAgentChatContext, type IAgentDiscoveredChat } from '../../../common/agent.js';
 import { ActionType } from '../../../common/state/sessionActions.js';
 import { ResponsePartKind, TurnState, type Turn } from '../../../common/state/sessionState.js';
 import {
 	AcpClient,
 	type IAcpTransport,
 } from '../../../node/grokBuild/acpClient.js';
-import { encodeGrokBuildChat } from '../../../node/grokBuild/grokBuildChatBacking.js';
+import { decodeGrokBuildChat, encodeGrokBuildChat } from '../../../node/grokBuild/grokBuildChatBacking.js';
 import { GrokBuildAgent } from '../../../node/grokBuild/grokBuildAgent.js';
-import { GROK_BUILD_ACP_ARGV, grokCannotRestoreSessionError, grokNotLoggedInError, grokUnreadableVersionWarning, grokWorkingDirectoryBusyError, grokWorkingDirectoryRejectedError } from '../../../node/grokBuild/grokBuildLaunchConfig.js';
+import { GROK_BUILD_ACP_ARGV, grokCannotRestoreSessionError, grokNotLoggedInError, grokSessionMissingError, grokUnreadableVersionWarning, grokWorkingDirectoryRejectedError } from '../../../node/grokBuild/grokBuildLaunchConfig.js';
 import type { AcpAgentCapabilities } from '../../../node/grokBuild/protocol/acpTypes.js';
 
 class TestProductService {
@@ -141,11 +141,15 @@ function makeFakePeer(): IFakePeer {
 class CapturingLogService extends NullLogService {
 	readonly warnings: string[] = [];
 	readonly errors: string[] = [];
+	readonly traces: string[] = [];
 	override warn(message: string): void {
 		this.warnings.push(message);
 	}
 	override error(message: string | Error): void {
 		this.errors.push(message instanceof Error ? message.message : message);
+	}
+	override trace(message: string): void {
+		this.traces.push(message);
 	}
 }
 
@@ -249,6 +253,16 @@ function chatContext(chat: URI): IAgentChatContext {
 	};
 }
 
+function chatContextForSession(chat: URI, sessionId: string): IAgentChatContext {
+	return {
+		resource: chat,
+		owner: fixedChatOwnerRef(AgentSession.uri(GROK_BUILD_AGENT_PROVIDER_ID, sessionId)),
+		sessionSettings: undefined,
+		launchWorkingDirectories: undefined,
+		workspaceless: false,
+	};
+}
+
 const LIVE_PERMISSION_OPTIONS = [
 	{ optionId: 'allow-edits-session', name: 'Yes, allow all edits during this session', kind: 'allow_always' },
 	{ optionId: 'allow-once', name: 'Yes', kind: 'allow_once' },
@@ -269,6 +283,7 @@ suite('GrokBuildAgent', () => {
 		const descriptor = agent.getDescriptor();
 		assert.strictEqual(descriptor.provider, GROK_BUILD_AGENT_PROVIDER_ID);
 		assert.strictEqual(descriptor.displayName, 'Grok Build');
+		assert.strictEqual(agent.agentHostCapabilities.workspaceConversion, false);
 		assert.deepStrictEqual(agent.getProtectedResources(), []);
 	});
 
@@ -526,8 +541,12 @@ suite('GrokBuildAgent', () => {
 	test('spawn seam: initialize then authenticate then session/new; concurrent createChat shares handshake', async () => {
 		const previousElectron = process.env.ELECTRON_RUN_AS_NODE;
 		const previousVscode = process.env.VSCODE_FOO;
+		const previousSsh = process.env.SSH_AUTH_SOCK;
+		const previousNodeOptions = process.env.NODE_OPTIONS;
 		process.env.ELECTRON_RUN_AS_NODE = '1';
 		process.env.VSCODE_FOO = 'secret';
+		process.env.SSH_AUTH_SOCK = '/tmp/ssh-agent.sock';
+		process.env.NODE_OPTIONS = '--inspect';
 		try {
 			const peer = store.add(makeFakePeer());
 			const agent = createAgent();
@@ -583,11 +602,15 @@ suite('GrokBuildAgent', () => {
 			assert.ok(launchEnv);
 			assert.strictEqual(launchEnv.GROK_CLIENT_NAME, 'Code - OSS');
 			assert.strictEqual(launchEnv.GROK_CLIENT_VERSION, '1.145.0');
+			assert.strictEqual(launchEnv.SSH_AUTH_SOCK, '/tmp/ssh-agent.sock');
 			assert.ok(!('ELECTRON_RUN_AS_NODE' in launchEnv));
 			assert.ok(!('VSCODE_FOO' in launchEnv));
+			assert.ok(!('NODE_OPTIONS' in launchEnv));
 		} finally {
-				restoreEnv('ELECTRON_RUN_AS_NODE', previousElectron);
-				restoreEnv('VSCODE_FOO', previousVscode);
+			restoreEnv('ELECTRON_RUN_AS_NODE', previousElectron);
+			restoreEnv('VSCODE_FOO', previousVscode);
+			restoreEnv('SSH_AUTH_SOCK', previousSsh);
+			restoreEnv('NODE_OPTIONS', previousNodeOptions);
 		}
 	});
 
@@ -701,7 +724,7 @@ suite('GrokBuildAgent', () => {
 		assert.strictEqual(await readIfAny(peer.outbound), undefined);
 	});
 
-	test('session/list paginates by cwd and discovery skips in-process sessions', async () => {
+	test('session/list is one unfiltered page walk and discovery skips in-process sessions', async () => {
 		const peer = store.add(makeFakePeer());
 		const client = store.add(new AcpClient(peer.transport));
 		const agent = createAgent();
@@ -716,7 +739,7 @@ suite('GrokBuildAgent', () => {
 		const listed = agent.listChatsToMigrate();
 		const page1 = await readNextMessage(peer.outbound);
 		assert.strictEqual(page1.method, 'session/list');
-		assert.deepStrictEqual(page1.params, { cwd: '/tmp/proj' });
+		assert.deepStrictEqual(page1.params, {});
 		peer.push({
 			jsonrpc: '2.0',
 			id: page1.id,
@@ -726,7 +749,7 @@ suite('GrokBuildAgent', () => {
 			},
 		});
 		const page2 = await readNextMessage(peer.outbound);
-		assert.deepStrictEqual(page2.params, { cwd: '/tmp/proj', cursor: 'c1' });
+		assert.deepStrictEqual(page2.params, { cursor: 'c1' });
 		peer.push({
 			jsonrpc: '2.0',
 			id: page2.id,
@@ -747,13 +770,14 @@ suite('GrokBuildAgent', () => {
 		store.add(agent.onDidDiscoverChats(entries => discovered.push(...entries)));
 		const discovery = agent.startChatDiscovery();
 		const again1 = await readNextMessage(peer.outbound);
+		assert.deepStrictEqual(again1.params, {});
 		peer.push({ jsonrpc: '2.0', id: again1.id, result: { sessions: [{ sessionId: 'sess-a', cwd: '/tmp/proj', title: 'Alpha' }, { sessionId: 'sess-live', cwd: '/tmp/proj', title: 'Live' }], nextCursor: null } });
 		await discovery;
 		assert.deepStrictEqual(discovered.map(entry => entry.summary), ['Alpha']);
 		assert.strictEqual(discovered[0].external, true);
 	});
 
-	test('session/list stops on a repeated cursor and lists without a cwd filter when no chat is loaded', async () => {
+	test('session/list stops on a repeated cursor', async () => {
 		const log = new CapturingLogService();
 		const peer = store.add(makeFakePeer());
 		const client = store.add(new AcpClient(peer.transport));
@@ -828,7 +852,18 @@ suite('GrokBuildAgent', () => {
 		peerPushSession(crashed, sessionNew.id, 'sess-crash');
 		await create;
 
-		const send = agent.chats.sendMessage(chat, 'in flight', [URI.file('/tmp/proj')], undefined, 'turn-crash', undefined, context);
+		const completePrompt = async (text: string, turnId: string) => {
+			const sent = agent.chats.sendMessage(chat, text, [URI.file('/tmp/proj')], undefined, turnId, undefined, context);
+			const prompt = await readNextMessage(crashed.outbound);
+			assert.strictEqual(prompt.method, 'session/prompt');
+			crashed.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
+			await sent;
+		};
+		await completePrompt('Reply with exactly: PONG-1', 'turn-0');
+		await completePrompt('Show the environment', 'turn-1');
+
+		const killed = 'Write the numbers from 1 to 300';
+		const send = agent.chats.sendMessage(chat, killed, [URI.file('/tmp/proj')], undefined, 'turn-crash', undefined, context);
 		const prompt = await readNextMessage(crashed.outbound);
 		assert.strictEqual(prompt.method, 'session/prompt');
 		crashed.push({
@@ -855,23 +890,22 @@ suite('GrokBuildAgent', () => {
 		assert.strictEqual(await readIfAny(crashed.outbound), undefined);
 
 		const messages = await agent.chats.getMessages(chat, context);
-		assert.strictEqual(messages.length, 1);
-		assert.strictEqual(messages[0].state, TurnState.Error);
-		assert.strictEqual(messages[0].message.text, 'in flight');
-		const errorPart = messages[0].responseParts.find(part => part.kind === ResponsePartKind.Error);
+		assert.strictEqual(messages.length, 3);
+		assert.strictEqual(messages[2].state, TurnState.Error);
+		assert.strictEqual(messages[2].message.text, killed);
+		const errorPart = messages[2].responseParts.find(part => part.kind === ResponsePartKind.Error);
 		assert.ok(errorPart && errorPart.kind === ResponsePartKind.Error);
 		assert.strictEqual(errorPart.error.errorType, 'GrokProcessExited');
 		assert.match(errorPart.error.message, /TAILMARK/);
 
-		const sendAgain = agent.chats.sendMessage(chat, 'after crash', [URI.file('/tmp/proj')], undefined, 'turn-after', undefined, context);
+		const sendAgain = agent.chats.sendMessage(chat, 'after crash', [URI.file('/tmp/other')], undefined, 'turn-after', undefined, context);
 		const respawned = await nextPeer(peers, 1);
 		await completeHandshake(respawned);
 		const load = await readNextMessage(respawned.outbound);
 		assert.strictEqual(load.method, 'session/load');
 		assert.deepStrictEqual(load.params, { sessionId: 'sess-crash', cwd: '/tmp/proj', mcpServers: [] });
-		pushUpdate(respawned, 'sess-crash', { sessionUpdate: 'user_message_chunk', messageId: 'u1', content: { type: 'text', text: 'in flight' } });
-		pushUpdate(respawned, 'sess-crash', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'partial' } });
-		respawned.push({ jsonrpc: '2.0', id: load.id, result: {} });
+		pushLiveHistory(respawned, 'sess-crash', killed);
+		respawned.push({ jsonrpc: '2.0', id: load.id, result: { models: { currentModelId: 'grok-4.7', availableModels: [{ modelId: 'grok-4.7', name: 'Grok 4.7' }] }, configOptions: [] } });
 		const promptAgain = await readNextMessage(respawned.outbound);
 		assert.strictEqual(promptAgain.method, 'session/prompt');
 		assert.strictEqual(promptAgain.params.prompt[0].text, 'after crash');
@@ -879,11 +913,24 @@ suite('GrokBuildAgent', () => {
 		await sendAgain;
 
 		const restored = await agent.chats.getMessages(chat, context);
-		assert.strictEqual(restored.length, 2);
-		assert.strictEqual(restored[0].message.text, 'in flight');
-		assert.strictEqual(markdownOf(restored[0]), 'partial');
+		assert.strictEqual(restored.length, 4);
+		assert.strictEqual(restored[0].message.text, 'Reply with exactly: PONG-1');
+		assert.strictEqual(markdownOf(restored[0]), 'PONG-1');
 		assert.strictEqual(restored[0].state, TurnState.Complete);
-		assert.strictEqual(restored[1].message.text, 'after crash');
+		assert.strictEqual(restored[1].message.text, 'Show the environment');
+		assert.strictEqual(markdownOf(restored[1]), 'I\'ll run that command and show the raw output.\n\nANDROID_HOME=/opt/android');
+		assert.strictEqual(restored[1].state, TurnState.Complete);
+		assert.strictEqual(restored[2].message.text, killed);
+		assert.strictEqual(restored[2].state, TurnState.Error);
+		assert.notStrictEqual(restored[2].state, TurnState.Complete);
+		assert.strictEqual(markdownOf(restored[2]), '');
+		const restoredError = restored[2].responseParts.find(part => part.kind === ResponsePartKind.Error);
+		assert.ok(restoredError && restoredError.kind === ResponsePartKind.Error);
+		assert.match(restoredError.error.message, /TAILMARK/);
+		assert.strictEqual(restored[3].message.text, 'after crash');
+		assert.strictEqual(restored[3].state, TurnState.Complete);
+		const metadata = await agent.getChatMetadata(chat, context);
+		assert.strictEqual(metadata?.workingDirectories?.[0].fsPath, '/tmp/proj');
 		assert.strictEqual(spawnCount, 2);
 	});
 
@@ -924,7 +971,7 @@ suite('GrokBuildAgent', () => {
 		assert.strictEqual(spawnCount, 2);
 	});
 
-	test('session/close is sent on dispose and release when advertised, including unknown-session success', async () => {
+	test('session/close is sent on dispose and release when advertised', async () => {
 		const peer = store.add(makeFakePeer());
 		const client = store.add(new AcpClient(peer.transport));
 		const agent = createAgent();
@@ -940,7 +987,7 @@ suite('GrokBuildAgent', () => {
 		const close = await readNextMessage(peer.outbound);
 		assert.strictEqual(close.method, 'session/close');
 		assert.deepStrictEqual(close.params, { sessionId: 'sess-close' });
-		peer.push({ jsonrpc: '2.0', id: close.id, error: { code: -32002, message: 'unknown session' } });
+		peer.push({ jsonrpc: '2.0', id: close.id, result: { _meta: { 'x.ai/closeOutcome': 'notResident' } } });
 		await disposed;
 
 		const chat2 = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/release' });
@@ -953,7 +1000,7 @@ suite('GrokBuildAgent', () => {
 		const close2 = await readNextMessage(peer.outbound);
 		assert.strictEqual(close2.method, 'session/close');
 		assert.strictEqual(close2.params.sessionId, 'sess-release');
-		peer.push({ jsonrpc: '2.0', id: close2.id, result: {} });
+		peer.push({ jsonrpc: '2.0', id: close2.id, result: { _meta: { 'x.ai/closeOutcome': 'closed' } } });
 		await released;
 	});
 
@@ -972,10 +1019,11 @@ suite('GrokBuildAgent', () => {
 		assert.strictEqual(await readIfAny(peer.outbound), undefined);
 	});
 
-	test('setWorkingDirectory reloads the session at the new cwd', async () => {
+	test('setWorkingDirectory rejects and sendMessage keeps the session cwd', async () => {
+		const log = new CapturingLogService();
 		const peer = store.add(makeFakePeer());
 		const client = store.add(new AcpClient(peer.transport));
-		const agent = createAgent();
+		const agent = createAgent(log);
 		agent.bindTestClient(client, LIVE_CAPABILITIES);
 		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/cwd' });
 		const context = chatContext(chat);
@@ -990,42 +1038,149 @@ suite('GrokBuildAgent', () => {
 		assert.strictEqual(sessionNew.params.cwd, '/tmp/a');
 		peerPushSession(peer, sessionNew.id, 'sess-cwd');
 		await create;
+		const persisted = changes.slice();
 
-		const sameDirectory = agent.setWorkingDirectory(chat, context, URI.file('/tmp/a'));
+		await assert.rejects(
+			agent.setWorkingDirectory(chat, context, URI.file('/tmp/b')),
+			(err: unknown) => err instanceof Error && err.message === grokWorkingDirectoryRejectedError().message,
+		);
 		assert.strictEqual(await readIfAny(peer.outbound), undefined);
-		await sameDirectory;
-
-		const moved = agent.setWorkingDirectory(chat, context, URI.file('/tmp/b'));
-		const load = await readNextMessage(peer.outbound);
-		assert.strictEqual(load.method, 'session/load');
-		assert.deepStrictEqual(load.params, { sessionId: 'sess-cwd', cwd: '/tmp/b', mcpServers: [] });
-		peer.push({ jsonrpc: '2.0', id: load.id, result: {} });
-		await moved;
+		assert.deepStrictEqual(changes, persisted);
 		const metadata = await agent.getChatMetadata(chat, context);
-		assert.strictEqual(metadata?.workingDirectories?.[0].fsPath, '/tmp/b');
-		assert.ok(changes.some(data => data.includes('/tmp/b')));
+		assert.strictEqual(metadata?.workingDirectories?.[0].fsPath, '/tmp/a');
 
-		await assert.rejects(
-			agent.setWorkingDirectory(chat, context, URI.from({ scheme: 'vscode-remote', path: '/tmp/c' })),
-			(err: unknown) => err instanceof Error && err.message === grokWorkingDirectoryRejectedError().message,
-		);
-		await assert.rejects(
-			agent.setWorkingDirectory(chat, context, URI.file('/tmp/b').with({ query: 'x' })),
-			(err: unknown) => err instanceof Error && err.message === grokWorkingDirectoryRejectedError().message,
-		);
-		await assert.rejects(
-			agent.setWorkingDirectory(chat, context, URI.file('/tmp/b').with({ fragment: 'x' })),
-			(err: unknown) => err instanceof Error && err.message === grokWorkingDirectoryRejectedError().message,
-		);
-
-		const send = agent.chats.sendMessage(chat, 'busy', [URI.file('/tmp/b')], undefined, 'turn-busy', undefined, context);
+		const send = agent.chats.sendMessage(chat, 'stay', [URI.file('/tmp/b')], undefined, 'turn-stay', undefined, context);
 		const prompt = await readNextMessage(peer.outbound);
-		await assert.rejects(
-			agent.setWorkingDirectory(chat, context, URI.file('/tmp/c')),
-			(err: unknown) => err instanceof Error && err.message === grokWorkingDirectoryBusyError().message,
-		);
+		assert.strictEqual(prompt.method, 'session/prompt');
+		assert.strictEqual(prompt.params.sessionId, 'sess-cwd');
 		peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
 		await send;
+		assert.deepStrictEqual(changes, persisted);
+		assert.ok(log.traces.some(message => /ignoring working directory/.test(message) && message.includes('/tmp/b') && message.includes('/tmp/a')));
+		const after = await agent.getChatMetadata(chat, context);
+		assert.strictEqual(after?.workingDirectories?.[0].fsPath, '/tmp/a');
+		assert.strictEqual(await readIfAny(peer.outbound), undefined);
+	});
+
+	test('session/load replay uses live whole-message chunks and does not complete a user-only turn', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client, LIVE_CAPABILITIES);
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/replay' });
+		const context = chatContext(chat);
+		const trailing = 'Write the numbers from 1 to 300';
+		const materialized = agent.materializeChat(chat, context, encodeGrokBuildChat({ sessionId: 'sess-replay', cwd: '/tmp/proj' }));
+		const load = await readNextMessage(peer.outbound);
+		assert.strictEqual(load.method, 'session/load');
+		pushLiveHistory(peer, 'sess-replay', trailing);
+		peer.push({ jsonrpc: '2.0', id: load.id, result: {} });
+		await materialized;
+
+		const messages = await agent.chats.getMessages(chat, context);
+		assert.strictEqual(messages.length, 3);
+		assert.strictEqual(messages[0].state, TurnState.Complete);
+		assert.strictEqual(markdownOf(messages[0]), 'PONG-1');
+		assert.strictEqual(messages[1].state, TurnState.Complete);
+		assert.strictEqual(markdownOf(messages[1]), 'I\'ll run that command and show the raw output.\n\nANDROID_HOME=/opt/android');
+		assert.strictEqual(messages[2].message.text, trailing);
+		assert.strictEqual(messages[2].state, TurnState.Cancelled);
+		assert.strictEqual(markdownOf(messages[2]), '');
+	});
+
+	test('recoverLegacyChat and materializeChat(undefined) load the listed cwd and title', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client, LIVE_CAPABILITIES);
+		const sessionId = 'sess-discovered';
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/discovered' });
+		const context = chatContextForSession(chat, sessionId);
+		const changes: string[] = [];
+		store.add(agent.onDidChangeChatData(change => {
+			if (change.providerData) {
+				changes.push(change.providerData);
+			}
+		}));
+
+		const recovered = agent.recoverLegacyChat(chat, context);
+		const list = await readNextMessage(peer.outbound);
+		assert.strictEqual(list.method, 'session/list');
+		assert.deepStrictEqual(list.params, {});
+		peer.push({
+			jsonrpc: '2.0',
+			id: list.id,
+			result: {
+				sessions: [{ sessionId, cwd: '/tmp/proj', title: 'Exact PONG-1 Reply Request', updatedAt: '2026-01-01T00:00:00.000Z' }],
+			},
+		});
+		const load = await readNextMessage(peer.outbound);
+		assert.strictEqual(load.method, 'session/load');
+		assert.deepStrictEqual(load.params, { sessionId, cwd: '/tmp/proj', mcpServers: [] });
+		peer.push({ jsonrpc: '2.0', id: load.id, result: { models: { currentModelId: 'grok-4.7', availableModels: [{ modelId: 'grok-4.7', name: 'Grok 4.7' }] }, configOptions: [] } });
+		const result = await recovered;
+		const decoded = decodeGrokBuildChat(result.providerData);
+		assert.strictEqual(decoded?.sessionId, sessionId);
+		assert.strictEqual(decoded?.cwd, '/tmp/proj');
+		const metadata = await agent.getChatMetadata(chat, context);
+		assert.strictEqual(metadata?.summary, 'Exact PONG-1 Reply Request');
+		assert.deepStrictEqual(changes, []);
+
+		const session2 = 'sess-discovered-2';
+		const chat2 = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/discovered-2' });
+		const context2 = chatContextForSession(chat2, session2);
+		const materialized = agent.materializeChat(chat2, context2, undefined);
+		const list2 = await readNextMessage(peer.outbound);
+		assert.strictEqual(list2.method, 'session/list');
+		assert.deepStrictEqual(list2.params, {});
+		peer.push({
+			jsonrpc: '2.0',
+			id: list2.id,
+			result: { sessions: [{ sessionId: session2, cwd: '/tmp/other', title: 'Second title' }] },
+		});
+		const load2 = await readNextMessage(peer.outbound);
+		assert.deepStrictEqual(load2.params, { sessionId: session2, cwd: '/tmp/other', mcpServers: [] });
+		peer.push({ jsonrpc: '2.0', id: load2.id, result: {} });
+		const result2 = await materialized;
+		assert.ok(result2);
+		const decoded2 = decodeGrokBuildChat(result2.providerData);
+		assert.strictEqual(decoded2?.sessionId, session2);
+		assert.strictEqual(decoded2?.cwd, '/tmp/other');
+		const metadata2 = await agent.getChatMetadata(chat2, context2);
+		assert.strictEqual(metadata2?.summary, 'Second title');
+		assert.deepStrictEqual(changes, []);
+	});
+
+	test('session/load FS_NOT_FOUND reports that the session is gone and persists nothing', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client, LIVE_CAPABILITIES);
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/missing' });
+		const context = chatContext(chat);
+		const changes: string[] = [];
+		store.add(agent.onDidChangeChatData(change => {
+			if (change.providerData) {
+				changes.push(change.providerData);
+			}
+		}));
+		const materialized = agent.materializeChat(chat, context, encodeGrokBuildChat({ sessionId: '00000000-0000-0000-0000-000000000000', cwd: '/tmp/proj' }));
+		const load = await readNextMessage(peer.outbound);
+		assert.strictEqual(load.method, 'session/load');
+		assert.deepStrictEqual(load.params, { sessionId: '00000000-0000-0000-0000-000000000000', cwd: '/tmp/proj', mcpServers: [] });
+		peer.push({
+			jsonrpc: '2.0',
+			id: load.id,
+			error: { code: -32603, message: 'Path not found.', data: { detail: 'No such file or directory (os error 2)', code: 'FS_NOT_FOUND' } },
+		});
+		await assert.rejects(materialized, (err: unknown) => {
+			assert.ok(err instanceof Error);
+			assert.strictEqual(err.message, grokSessionMissingError().message);
+			return true;
+		});
+		assert.deepStrictEqual(changes, []);
+		assert.strictEqual(await agent.getChatMetadata(chat, context), undefined);
+		assert.strictEqual(await readIfAny(peer.outbound), undefined);
 	});
 
 	test('session/set_model failure on create keeps the CLI default model', async () => {
@@ -1070,6 +1225,35 @@ suite('GrokBuildAgent', () => {
 		assert.ok(log.warnings.some(message => message === grokUnreadableVersionWarning('garbage')));
 	});
 });
+
+function pushLiveHistory(peer: IFakePeer, sessionId: string, trailingUser: string): void {
+	const user = (promptIndex: number, text: string) => pushUpdate(peer, sessionId, {
+		sessionUpdate: 'user_message_chunk',
+		content: { type: 'text', text },
+		_meta: { modelId: 'grok-4.7', promptIndex },
+	});
+	const agentText = (promptIndex: number, text: string) => pushUpdate(peer, sessionId, {
+		sessionUpdate: 'agent_message_chunk',
+		content: { type: 'text', text },
+		_meta: { modelId: 'grok-4.7', promptIndex },
+	});
+	user(0, 'Reply with exactly: PONG-1');
+	agentText(0, 'PONG-1');
+	user(1, 'Show the environment');
+	agentText(1, 'I\'ll run that command and show the raw output.');
+	pushUpdate(peer, sessionId, {
+		sessionUpdate: 'tool_call',
+		toolCallId: 'call-1',
+		title: 'run_terminal_command',
+		kind: 'execute',
+		status: 'completed',
+		rawInput: { command: 'env' },
+		rawOutput: 'ANDROID_HOME=/opt/android',
+		_meta: { 'x.ai/tool': { name: 'run_terminal_command', kind: 'execute', label: 'Run Command' } },
+	});
+	agentText(1, 'ANDROID_HOME=/opt/android');
+	user(2, trailingUser);
+}
 
 function peerPushSession(peer: IFakePeer, id: number, sessionId: string): void {
 	peer.push({

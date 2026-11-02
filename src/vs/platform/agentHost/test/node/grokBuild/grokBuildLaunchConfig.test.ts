@@ -66,7 +66,7 @@ suite('GrokBuild launch config', () => {
 		assert.strictEqual(grokCliMissingError().message.length > 0, true);
 	});
 
-	test('subprocess env is an allowlist and never sets ELECTRON_RUN_AS_NODE', () => {
+	test('subprocess env copies the host environment except editor and node overrides', () => {
 		const env = buildGrokSubprocessEnv({
 			PATH: '/usr/bin',
 			HOME: '/home/tester',
@@ -77,23 +77,32 @@ suite('GrokBuild launch config', () => {
 			GROK_CLIENT_NAME: 'inherited-name',
 			GROK_CLIENT_VERSION: 'inherited-version',
 			ELECTRON_RUN_AS_NODE: '1',
+			ELECTRON_FOO: '1',
 			VSCODE_FOO: 'secret',
 			NODE_OPTIONS: '--inspect',
-			SECRET: 'nope',
+			SSH_AUTH_SOCK: '/tmp/ssh-agent.sock',
+			NODE_EXTRA_CA_CERTS: '/tmp/ca.pem',
+			KUBECONFIG: '/tmp/kubeconfig',
+			SECRET: 'kept-too',
 		}, 'Code - OSS', '1.145.0');
 		assert.strictEqual(env.PATH, '/usr/bin');
 		assert.strictEqual(env.HOME, '/home/tester');
 		assert.strictEqual(env.XAI_API_KEY, 'test-key');
 		assert.strictEqual(env.GROK_SANDBOX, '1');
 		assert.strictEqual(env.GROK_FOO, 'kept');
+		assert.strictEqual(env.SSH_AUTH_SOCK, '/tmp/ssh-agent.sock');
+		assert.strictEqual(env.NODE_EXTRA_CA_CERTS, '/tmp/ca.pem');
+		assert.strictEqual(env.KUBECONFIG, '/tmp/kubeconfig');
+		assert.strictEqual(env.SECRET, 'kept-too');
 		assert.strictEqual(env[GROK_CLIENT_NAME_ENV], 'Code - OSS');
 		assert.strictEqual(env[GROK_CLIENT_VERSION_ENV], '1.145.0');
 		assert.ok(!('ELECTRON_RUN_AS_NODE' in env));
+		assert.ok(!('ELECTRON_FOO' in env));
 		assert.ok(!('VSCODE_FOO' in env));
 		assert.ok(!('NODE_OPTIONS' in env));
-		assert.ok(!('SECRET' in env));
-		const launch = buildGrokBuildLaunchConfig('/bin/grok', { ELECTRON_RUN_AS_NODE: '1', VSCODE_AGENT_HOST: '1' }, 'Code - OSS', '1.145.0');
+		const launch = buildGrokBuildLaunchConfig('/bin/grok', { ELECTRON_RUN_AS_NODE: '1', VSCODE_AGENT_HOST: '1', SSH_AUTH_SOCK: '/tmp/ssh-agent.sock' }, 'Code - OSS', '1.145.0');
 		assert.deepStrictEqual([...launch.args], [...GROK_BUILD_ACP_ARGV]);
+		assert.strictEqual(launch.env.SSH_AUTH_SOCK, '/tmp/ssh-agent.sock');
 		assert.ok(!('ELECTRON_RUN_AS_NODE' in launch.env));
 		assert.ok(!Object.keys(launch.env).some(key => key.startsWith('VSCODE_')));
 	});

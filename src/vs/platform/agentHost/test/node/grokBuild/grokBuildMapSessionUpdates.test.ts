@@ -88,6 +88,35 @@ suite('GrokBuild mapSessionUpdates', () => {
 		assert.strictEqual(cancelled[0].type, ActionType.ChatTurnCancelled);
 	});
 
+	test('first tool_call classifies shell from x.ai/tool when top-level kind is absent', () => {
+		const state = createGrokBuildMapState('turn-1');
+		const actions = mapSessionUpdate(state, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'tool_call',
+				toolCallId: 'call-live-0',
+				title: 'run_terminal_command',
+				rawInput: { command: 'env' },
+				_meta: {
+					'x.ai/tool': {
+						version: 1,
+						name: 'run_terminal_command',
+						kind: 'execute',
+						namespace: 'grok_build',
+						label: 'Run Command',
+						read_only: false,
+					},
+				},
+			},
+		});
+		const start = actions.find(action => action.type === ActionType.ChatToolCallStart);
+		assert.ok(start);
+		assert.strictEqual(start.type, ActionType.ChatToolCallStart);
+		if (start.type === ActionType.ChatToolCallStart) {
+			assert.strictEqual(start.toolName, 'shell');
+		}
+	});
+
 	test('maps edit tool_call and resets markdownPartId for post-tool text', () => {
 		const state = createGrokBuildMapState('turn-1');
 		mapSessionUpdate(state, {

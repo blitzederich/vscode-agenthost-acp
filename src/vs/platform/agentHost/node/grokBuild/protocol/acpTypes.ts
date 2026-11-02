@@ -64,9 +64,8 @@ export interface AcpInitializeParams {
  * Advertised on `initialize`. Empty objects mean the method is supported.
  * Omitted and `null` both mean "not advertised" (ACP v1).
  *
- * `session/load` and `session/list` response bodies are **to verify live** —
- * grok 1.0.70 advertises the capabilities but the attached logs do not include
- * those results. Shapes below follow the ACP v1 schema.
+ * grok 1.0.70 advertises `loadSession: true` and `sessionCapabilities` of
+ * `list`, `resume`, and `close` (each `{}`).
  */
 export interface AcpAgentCapabilities {
 	readonly loadSession?: boolean;
@@ -161,16 +160,25 @@ export interface AcpSessionCancelParams {
 	readonly sessionId: string;
 }
 
+/**
+ * ACP v1 `session/close`. grok 1.0.70 returns success. `_meta["x.ai/closeOutcome"]`
+ * is `"closed"` when the session was resident and `"notResident"` for an
+ * unknown or already-closed session. It does not fail with -32002.
+ */
 export interface AcpSessionCloseParams {
 	readonly sessionId: string;
 	readonly _meta?: Record<string, unknown>;
 }
 
 /**
- * ACP v1 `session/load`. The agent replays history as `session/update`
- * notifications before this request resolves. Response fields other than
- * the documented mode/config bag are **to verify live** (grok may also
- * return `models`, matching `session/new`).
+ * ACP v1 `session/load`. grok 1.0.70 replays history as `session/update`
+ * notifications before the result and does not emit `session_info_update`.
+ * Replay chunks are whole messages with no `messageId`; turn identity is
+ * `update._meta.promptIndex` (`{ modelId, promptIndex }`). The result is
+ * `{ models, configOptions, _meta }`. `cwd` must be the directory the
+ * session was created with. A different directory, or an unknown session
+ * id, fails with JSON-RPC -32603 `Path not found.` and
+ * `data.code: "FS_NOT_FOUND"`.
  */
 export interface AcpSessionLoadParams {
 	readonly sessionId: string;
@@ -187,8 +195,8 @@ export interface AcpSessionLoadResult {
 }
 
 /**
- * ACP v1 `session/resume`. Unlike `session/load`, the agent must not replay
- * history. Response shape is **to verify live**.
+ * ACP v1 `session/resume`. grok 1.0.70 returns `{ models, configOptions, _meta }`
+ * and does not replay history. Params are `{ sessionId, cwd, mcpServers }`.
  */
 export interface AcpSessionResumeParams {
 	readonly sessionId: string;
@@ -205,9 +213,12 @@ export interface AcpSessionResumeResult {
 }
 
 /**
- * ACP v1 `session/list`. `cursor` / `nextCursor` are opaque. Omitted or
- * `null` `nextCursor` ends the list; an empty string is a valid cursor.
- * **To verify live** against grok 1.0.70 (not present in the attached logs).
+ * ACP v1 `session/list`. grok 1.0.70 returns
+ * `{ sessions: [{ sessionId, cwd, title, updatedAt, _meta }], nextCursor? }`.
+ * Pages hold 30 sessions. `nextCursor` is present when another page exists
+ * and absent on the last page. `cwd` is an exact-match filter. A cursor grok
+ * does not recognize restarts at page 1, so callers must stop on a repeated
+ * cursor. An empty string is a valid cursor; `null` ends the list.
  */
 export interface AcpSessionListParams {
 	readonly cwd?: string;
