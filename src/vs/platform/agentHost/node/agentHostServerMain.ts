@@ -43,6 +43,7 @@ import { ClaudeSdkPackage } from './claude/claudeAgentSdkService.js';
 import { CodexAgent } from './codex/codexAgent.js';
 import { CodexSdkPackage } from './codex/codexSdk.js';
 import { createCodexProviderConfiguration } from './codex/codexProviderConfiguration.js';
+import { registerGrokBuildProviderIfEnabled } from './grokBuild/registerGrokBuildProvider.js';
 import { IAgentSdkDownloader, type IAgentSdkDownloadProgress } from './agentSdkDownloader.js';
 import { IAgentHostProviderService } from './agentHostProviderService.js';
 import { AgentHostCodexEnabledConfigKey, platformRootSchema } from '../common/agentHostSchema.js';
@@ -279,6 +280,13 @@ async function main(): Promise<void> {
 			registerCodexIfEnabled();
 			disposables.add(agentConfigurationService.onDidRootConfigChange(() => registerCodexIfEnabled()));
 		}
+		registerGrokBuildProviderIfEnabled({
+			agentConfigurationService,
+			providerService,
+			instantiationService,
+			disposables,
+			onRegistered: () => log('GrokBuildAgent registered'),
+		});
 	}
 
 	// Surface agent-SDK download progress to clients as generic `progress`
