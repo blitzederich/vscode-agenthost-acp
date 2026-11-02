@@ -134,7 +134,7 @@ export class AcpClient extends Disposable implements IAcpClient {
 
 	constructor(
 		private readonly _transport: IAcpTransport,
-		private readonly _onLog?: (level: 'info' | 'warn' | 'error', message: string) => void,
+		private readonly _onLog?: (level: 'info' | 'warn' | 'error' | 'trace', message: string) => void,
 		private readonly _graceKillMs = GRACE_KILL_MS,
 	) {
 		super();
@@ -159,7 +159,9 @@ export class AcpClient extends Disposable implements IAcpClient {
 				try {
 					parsed = JSON.parse(trimmed) as IWireMessage;
 				} catch {
-					this._log('error', `parse error on line: ${trimmed.slice(0, 200)}`);
+					// The line can be an authenticate result. Keep the payload off the error log.
+					this._log('error', 'parse error on ACP line');
+					this._log('trace', `parse error on ACP line: ${trimmed.slice(0, 200)}`);
 					continue;
 				}
 				this._dispatch(parsed);
@@ -177,7 +179,7 @@ export class AcpClient extends Disposable implements IAcpClient {
 
 		if (hasId && !hasMethod && (hasResult || hasError)) {
 			if (typeof msg.id !== 'number') {
-				this._log('warn', `unsolicited response id=${String(msg.id)}`);
+				this._log('trace', `unsolicited response id=${String(msg.id)}`);
 				return;
 			}
 			const pending = this._pending.get(msg.id);
@@ -204,7 +206,8 @@ export class AcpClient extends Disposable implements IAcpClient {
 			return;
 		}
 
-		this._log('warn', `unrecognized message: ${JSON.stringify(msg).slice(0, 200)}`);
+		this._log('warn', 'unrecognized ACP message');
+		this._log('trace', `unrecognized ACP message: ${JSON.stringify(msg).slice(0, 200)}`);
 	}
 
 	private async _handleServerRequest(method: string, id: AcpJsonRpcId, params: unknown): Promise<void> {
@@ -387,7 +390,7 @@ export class AcpClient extends Disposable implements IAcpClient {
 		super.dispose();
 	}
 
-	private _log(level: 'info' | 'warn' | 'error', message: string): void {
+	private _log(level: 'info' | 'warn' | 'error' | 'trace', message: string): void {
 		this._onLog?.(level, message);
 	}
 }

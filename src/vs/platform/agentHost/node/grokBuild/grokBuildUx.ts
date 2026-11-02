@@ -200,22 +200,62 @@ export function grokSlashCommandRejectedError(name: string): Error {
 }
 
 /**
- * Grok honours a slash command only as the first token. Forward it only when
- * that command is in the latest advertised list and not denied. Before grok
- * has sent the list, every slash-prefixed prompt is rejected.
+ * grok 1.0.70 sends `available_commands_update` only after the first prompt.
+ * A slash command before that list arrives is rejected.
+ */
+export function grokSlashCommandsUnavailableError(): Error {
+	return new Error(localize(
+		'grokBuild.slashCommandsUnavailable',
+		"Slash commands become available after the first message.",
+	));
+}
+
+/** A leading token that contains a second `/` is a path, not a command. Default-deny. */
+export function grokPathPrefixRejectedError(): Error {
+	return new Error(localize(
+		'grokBuild.messageStartsWithPath',
+		"A message must not start with a path.",
+	));
+}
+
+/** Deny-list key is the command name before the first `:`. */
+function grokSlashDenyKey(name: string): string {
+	const head = name.split(':', 1)[0];
+	return head.toLowerCase();
+}
+
+/**
+ * Grok honours a slash command only as the first token.
+ * The full token up to the first whitespace (without the leading `/`) must
+ * exactly match an advertised command, case-insensitively. `/bundled:imagine`
+ * is that full name; splitting on `:` would leave `bundled` and reject it.
+ * The deny-list is the part before `:`, so `/yolo:on` and `/always-approve:on`
+ * stay rejected even when that full token is advertised.
+ * A token with a second `/` is an absolute path and is rejected.
+ * Before grok has sent `available_commands_update`, every other slash token
+ * is rejected.
  */
 export function rejectedGrokSlashCommand(prompt: string, commands: readonly IGrokAvailableCommand[] | undefined): Error | undefined {
 	const token = prompt.trim().split(/\s+/, 1)[0];
 	if (!token?.startsWith('/')) {
 		return undefined;
 	}
-	const name = token.slice(1).split(':', 1)[0];
-	const key = name.toLowerCase();
-	const advertised = !!commands?.some(command => command.name.toLowerCase() === key);
-	if (advertised && !GROK_DENIED_SLASH_COMMANDS.has(key)) {
+	if (token.indexOf('/', 1) !== -1) {
+		return grokPathPrefixRejectedError();
+	}
+	const fullName = token.slice(1);
+	const denyName = fullName.split(':', 1)[0];
+	if (GROK_DENIED_SLASH_COMMANDS.has(grokSlashDenyKey(fullName))) {
+		return grokSlashCommandRejectedError(denyName);
+	}
+	if (!commands) {
+		return grokSlashCommandsUnavailableError();
+	}
+	const key = fullName.toLowerCase();
+	if (commands.some(command => command.name.toLowerCase() === key)) {
 		return undefined;
 	}
-	return grokSlashCommandRejectedError(name);
+	return grokSlashCommandRejectedError(fullName);
 }
 
 export function grokPlanModeFailedError(): Error {
@@ -231,7 +271,7 @@ export function grokPlanModeFailedError(): Error {
  * are omitted.
  */
 export function buildGrokCommandCustomizations(commands: readonly IGrokAvailableCommand[]): DirectoryCustomization | undefined {
-	const visible = commands.filter(command => !GROK_DENIED_SLASH_COMMANDS.has(command.name.toLowerCase()));
+	const visible = commands.filter(command => !GROK_DENIED_SLASH_COMMANDS.has(grokSlashDenyKey(command.name)));
 	if (visible.length === 0) {
 		return undefined;
 	}
