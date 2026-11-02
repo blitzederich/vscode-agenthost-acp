@@ -16,8 +16,8 @@ import { generateUuid } from '../../../base/common/uuid.js';
 import * as os from 'os';
 import { writeSync } from 'fs';
 import * as inspector from 'inspector';
-import { AgentHostClaudeAgentEnabledEnvVar, AgentHostCodexAgentCodexHomeEnvVar, AgentHostCodexAgentEnabledEnvVar, AgentHostIpcChannels, IAgentHostInspectInfo, IAgentHostSocketInfo, IConnectionTrackerService, isAgentEnabled } from '../common/agentService.js';
-import { AgentHostCodexEnabledConfigKey, platformRootSchema } from '../common/agentHostSchema.js';
+import { AgentHostClaudeAgentEnabledEnvVar, AgentHostCodexAgentCodexHomeEnvVar, AgentHostCodexAgentEnabledEnvVar, AgentHostGrokBuildAgentEnabledEnvVar, AgentHostGrokBuildBinaryPathEnvVar, AgentHostIpcChannels, IAgentHostInspectInfo, IAgentHostSocketInfo, IConnectionTrackerService, isAgentEnabled } from '../common/agentService.js';
+import { AgentHostCodexEnabledConfigKey, AgentHostGrokBuildEnabledConfigKey, platformRootSchema } from '../common/agentHostSchema.js';
 import { AgentModelRefreshScheduler, MODEL_REFRESH_INTERVAL_MS } from './agentModelRefreshScheduler.js';
 import { AgentService } from './agentService.js';
 import { AgentHostStateManager, IAgentHostStateManager } from './agentHostStateManager.js';
@@ -29,6 +29,8 @@ import { ClaudeSdkPackage } from './claude/claudeAgentSdkService.js';
 import { CodexAgent } from './codex/codexAgent.js';
 import { CodexSdkPackage } from './codex/codexSdk.js';
 import { createCodexProviderConfiguration } from './codex/codexProviderConfiguration.js';
+import { GrokBuildAgent } from './grokBuild/grokBuildAgent.js';
+import { isGrokBinaryAvailable } from './grokBuild/grokBuildLaunchConfig.js';
 import { ByokLmBridgeRegistry } from './byokLmBridgeRegistry.js';
 import { IAgentHostProxyResolver } from './agentHostProxyResolver.js';
 import { IAgentSdkDownloader, type IAgentSdkDownloadProgress } from './agentSdkDownloader.js';
@@ -227,6 +229,30 @@ async function startAgentHost(): Promise<void> {
 			};
 			registerCodexIfEnabled();
 			disposables.add(agentConfigurationService.onDidRootConfigChange(registerCodexIfEnabled));
+		}
+		// Grok Build registration is one-way (register-on-enable) and also requires a
+		// resolvable `grok` binary. Disabling requires an agent host restart.
+		{
+			let grokBuildRegistered = false;
+			const registerGrokBuildIfEnabled = () => {
+				if (grokBuildRegistered) {
+					return;
+				}
+				const enabledByEnv = isAgentEnabled(process.env[AgentHostGrokBuildAgentEnabledEnvVar], false);
+				const enabledByRootConfig = agentConfigurationService.getRootValue(platformRootSchema, AgentHostGrokBuildEnabledConfigKey) === true;
+				if (!(enabledByEnv || enabledByRootConfig)) {
+					return;
+				}
+				void isGrokBinaryAvailable(process.env[AgentHostGrokBuildBinaryPathEnvVar]).then(available => {
+					if (grokBuildRegistered || !available) {
+						return;
+					}
+					grokBuildRegistered = true;
+					providerService.registerProvider(instantiationService.createInstance(GrokBuildAgent));
+				});
+			};
+			registerGrokBuildIfEnabled();
+			disposables.add(agentConfigurationService.onDidRootConfigChange(registerGrokBuildIfEnabled));
 		}
 		completionTriggerCharacters = runtimeServices.completions.triggerCharacters;
 	} catch (err) {

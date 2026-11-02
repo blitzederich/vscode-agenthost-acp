@@ -507,6 +507,14 @@ export type AgentHostByokUtilityModelDefault = typeof AgentHostByokUtilityModelD
  */
 export const AgentHostCodexEnabledConfigKey = 'codexAgentEnabled';
 
+/**
+ * Root config key forwarded from the renderer carrying the value of
+ * `chat.agentHost.grokBuildAgent.enabled`. The host registers the Grok Build
+ * provider when this is `true` and a `grok` binary is resolvable; disabling
+ * requires an agent host restart.
+ */
+export const AgentHostGrokBuildEnabledConfigKey = 'grokBuildAgentEnabled';
+
 /** Root config key carrying the effective edit auto-approve patterns. */
 export const AgentHostEditAutoApprovePatternsConfigKey = 'editAutoApprovePatterns';
 
@@ -862,6 +870,12 @@ export const platformRootSchema = createSchema({
 		type: 'boolean',
 		title: localize('agentHost.config.codexAgentEnabled.title', "Codex Agent"),
 		description: localize('agentHost.config.codexAgentEnabled.description', "Whether the Codex provider is enabled."),
+		default: false,
+	}),
+	[AgentHostGrokBuildEnabledConfigKey]: schemaProperty<boolean>({
+		type: 'boolean',
+		title: localize('agentHost.config.grokBuildAgentEnabled.title', "Grok Build Agent"),
+		description: localize('agentHost.config.grokBuildAgentEnabled.description', "Whether the Grok Build ACP provider is enabled."),
 		default: false,
 	}),
 	[AgentHostTerminalAutoApproveEnabledConfigKey]: schemaProperty<boolean>({

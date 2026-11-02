@@ -38,7 +38,7 @@ import type { FetchAutomationRunsParams, FetchAutomationRunsResult, ListAutomati
 import type { ActionEnvelope, ClientAutomationAction, ClientAutomationRunAction, INotification, IRootConfigChangedAction, SessionAction, ChatAction, TerminalAction, ClientAnnotationsAction, ClientChangesetAction } from './state/sessionActions.js';
 import type { ContentEncoding, ResourceCopyParams, ResourceCopyResult, ResourceDeleteParams, ResourceDeleteResult, ResourceListResult, ResourceMkdirParams, ResourceMkdirResult, ResourceMoveParams, ResourceMoveResult, ResourceReadResult, ResourceResolveParams, ResourceResolveResult, ResourceWatchState, ResourceWriteParams, ResourceWriteResult, CreateResourceWatchParams, CreateResourceWatchResult, IStateSnapshot } from './state/sessionProtocol.js';
 import { ComponentToState, StateComponents, type RootState } from './state/sessionState.js';
-import { type AgentCanvasDefinitionSnapshot, type AgentProvider, CLAUDE_AGENT_PROVIDER_ID, CODEX_AGENT_PROVIDER_ID, type AuthenticateParams, type AuthenticateResult, type IAgentCanvasCloseRequest, type IAgentCanvasOpenRequest, type IAgentCreateChatRequestOptions, type IAgentCreateChatWorkspace, type IAgentCreateSessionConfig, type IAgentCustomizationInstallation, type IAgentCustomizationInstallationApplyResult, type IAgentCustomizationInstallationRequest, type IAgentCustomizationInstallationReview, type IAgentCustomizationMarketplaceSearchRequest, type IAgentCustomizationMarketplaceSearchResult, type IAgentExtensionInventory, type IAgentHostManagedSettingsSnapshot, type IAgentHostNetworkEndpoint, type IAgentManagedPluginRetryEntry, type IAgentModelInfo, type IAgentPluginInstallation, type IAgentPluginInstallRequest, type IAgentPluginMarketplace, type IAgentPluginMarketplaceItem, type IAgentPluginMarketplaceRefreshResult, type IAgentPluginMarketplaceRemoveResult, type IAgentPluginUninstallRequest, type IAgentResolveSessionConfigParams, type IAgentSessionConfigCompletionsParams, type IAgentSessionMetadata, type IMcpNotification } from './agent.js';
+import { type AgentCanvasDefinitionSnapshot, type AgentProvider, CLAUDE_AGENT_PROVIDER_ID, CODEX_AGENT_PROVIDER_ID, GROK_BUILD_AGENT_PROVIDER_ID, type AuthenticateParams, type AuthenticateResult, type IAgentCanvasCloseRequest, type IAgentCanvasOpenRequest, type IAgentCreateChatRequestOptions, type IAgentCreateChatWorkspace, type IAgentCreateSessionConfig, type IAgentCustomizationInstallation, type IAgentCustomizationInstallationApplyResult, type IAgentCustomizationInstallationRequest, type IAgentCustomizationInstallationReview, type IAgentCustomizationMarketplaceSearchRequest, type IAgentCustomizationMarketplaceSearchResult, type IAgentExtensionInventory, type IAgentHostManagedSettingsSnapshot, type IAgentHostNetworkEndpoint, type IAgentManagedPluginRetryEntry, type IAgentModelInfo, type IAgentPluginInstallation, type IAgentPluginInstallRequest, type IAgentPluginMarketplace, type IAgentPluginMarketplaceItem, type IAgentPluginMarketplaceRefreshResult, type IAgentPluginMarketplaceRemoveResult, type IAgentPluginUninstallRequest, type IAgentResolveSessionConfigParams, type IAgentSessionConfigCompletionsParams, type IAgentSessionMetadata, type IMcpNotification } from './agent.js';
 
 // ---- Provider-model re-exports (compatibility) ------------------------------
 // New provider code imports these from agent.ts.
@@ -61,7 +61,7 @@ export type {
 	IAgentCustomizationMarketplaceSearchResult, IAgentPluginInstallRequest, IAgentManagedPluginRetryEntry,
 } from './agent.js';
 export {
-	AgentSession, CLAUDE_AGENT_PROVIDER_ID, CODEX_AGENT_PROVIDER_ID, COPILOT_CLI_AGENT_PROVIDER_ID, GITHUB_COPILOT_PROTECTED_RESOURCE,
+	AgentSession, CLAUDE_AGENT_PROVIDER_ID, CODEX_AGENT_PROVIDER_ID, COPILOT_CLI_AGENT_PROVIDER_ID, GROK_BUILD_AGENT_PROVIDER_ID, GITHUB_COPILOT_PROTECTED_RESOURCE,
 	GITHUB_REPO_PROTECTED_RESOURCE, protectedResourcesRequireGitHubCopilotSignIn, resolveAgentChatContext,
 	resolveAgentChatOrigin, resolveSubagentChatParent, resolveAgentHostCustomizations, subagentChatTitle,
 	SubagentChatSignal,
@@ -208,6 +208,21 @@ export const AgentHostClaudeAgentEnabledSettingId = 'chat.agentHost.claudeAgent.
 export const AgentHostCodexAgentEnabledSettingId = 'chat.agentHost.codexAgent.enabled';
 
 /**
+ * Configuration key controlling whether the Grok Build ACP provider is
+ * registered in the agent host process. When `false` (the default), the host
+ * skips registration even if a `grok` binary is on PATH. Enabling takes effect
+ * without restarting the agent host when the binary is already resolvable;
+ * disabling a registered provider requires an agent host restart.
+ */
+export const AgentHostGrokBuildAgentEnabledSettingId = 'chat.agentHost.grokBuildAgent.enabled';
+
+/**
+ * Optional absolute path to the `grok` binary. When empty, the host searches
+ * PATH, then `~/.grok/bin/grok`, then `~/.local/bin/grok`.
+ */
+export const AgentHostGrokBuildBinaryPathSettingId = 'chat.agentHost.grokBuildAgent.binaryPath';
+
+/**
  * Configuration key controlling whether extension-provided BYOK ("bring your
  * own key") models are published and included in new agent-host sessions.
  * Changes are synchronized to the running agent host.
@@ -249,6 +264,19 @@ export const AgentHostMultipleChatProvidersEnabledEnvVar = 'VSCODE_AGENT_HOST_MU
  * the resolved setting explicitly.
  */
 export const AgentHostCodexAgentEnabledEnvVar = 'VSCODE_AGENT_HOST_CODEX_AGENT_ENABLED';
+
+/**
+ * Environment variable form of {@link AgentHostGrokBuildAgentEnabledSettingId}.
+ * Set by the agent host starters from the setting. Accepts `'true'` /
+ * `'false'`; absent uses the host-level fallback (`false`).
+ */
+export const AgentHostGrokBuildAgentEnabledEnvVar = 'VSCODE_AGENT_HOST_GROK_BUILD_AGENT_ENABLED';
+
+/**
+ * Environment variable form of {@link AgentHostGrokBuildBinaryPathSettingId}.
+ * Absolute path to the `grok` binary when the setting is non-empty.
+ */
+export const AgentHostGrokBuildBinaryPathEnvVar = 'VSCODE_AGENT_HOST_GROK_BUILD_BINARY_PATH';
 
 /** Overrides the soft cap on resident session roots. Primarily used by integration tests. */
 export const AgentHostSessionResidencyLimitEnvVar = 'VSCODE_AGENT_HOST_SESSION_RESIDENCY_LIMIT';
@@ -292,6 +320,7 @@ export const CodexPreferAgentHostEditorSettingId = 'chat.editor.codex.preferAgen
 export function affectsAgentHostProviderPreference(event: IConfigurationChangeEvent, isSessionsWindow: boolean): boolean {
 	return event.affectsConfiguration(AgentHostClaudeAgentEnabledSettingId)
 		|| event.affectsConfiguration(AgentHostCodexAgentEnabledSettingId)
+		|| event.affectsConfiguration(AgentHostGrokBuildAgentEnabledSettingId)
 		|| (!isSessionsWindow && event.affectsConfiguration(CodexPreferAgentHostEditorSettingId));
 }
 
@@ -302,6 +331,8 @@ export function shouldSurfaceLocalAgentHostProvider(provider: AgentProvider, con
 		case CODEX_AGENT_PROVIDER_ID:
 			return configurationService.getValue<boolean>(AgentHostCodexAgentEnabledSettingId) === true
 				&& (isSessionsWindow || configurationService.getValue<boolean>(CodexPreferAgentHostEditorSettingId) === true);
+		case GROK_BUILD_AGENT_PROVIDER_ID:
+			return configurationService.getValue<boolean>(AgentHostGrokBuildAgentEnabledSettingId) === true;
 		default:
 			return true;
 	}
@@ -310,12 +341,14 @@ export function shouldSurfaceLocalAgentHostProvider(provider: AgentProvider, con
 /** Policy disablement keeps saved history available without enabling the provider. */
 export function isLocalAgentHostProviderDisabledByPolicy(provider: AgentProvider, configurationService: IConfigurationService): boolean {
 	const setting = provider === CLAUDE_AGENT_PROVIDER_ID ? AgentHostClaudeAgentEnabledSettingId
-		: provider === CODEX_AGENT_PROVIDER_ID ? AgentHostCodexAgentEnabledSettingId : undefined;
+		: provider === CODEX_AGENT_PROVIDER_ID ? AgentHostCodexAgentEnabledSettingId
+			: provider === GROK_BUILD_AGENT_PROVIDER_ID ? AgentHostGrokBuildAgentEnabledSettingId
+				: undefined;
 	return setting !== undefined && configurationService.inspect<boolean>(setting).policyValue === false;
 }
 
 export function getPolicyUnavailableLocalAgentHostProviders(configurationService: IConfigurationService, isSessionsWindow: boolean): readonly AgentProvider[] {
-	return [CLAUDE_AGENT_PROVIDER_ID, CODEX_AGENT_PROVIDER_ID].filter(provider =>
+	return [CLAUDE_AGENT_PROVIDER_ID, CODEX_AGENT_PROVIDER_ID, GROK_BUILD_AGENT_PROVIDER_ID].filter(provider =>
 		isLocalAgentHostProviderDisabledByPolicy(provider, configurationService)
 		&& (provider !== CODEX_AGENT_PROVIDER_ID || isSessionsWindow || configurationService.getValue<boolean>(CodexPreferAgentHostEditorSettingId) === true));
 }
@@ -723,6 +756,8 @@ export interface IAgentSdkStarterSettings {
 	readonly codexBinaryArgs?: readonly string[];
 	readonly claudeAgentEnabled?: boolean;
 	readonly codexAgentEnabled?: boolean;
+	readonly grokBuildAgentEnabled?: boolean;
+	readonly grokBuildBinaryPath?: string;
 	/** `chat.agentHost.multipleChatProviders.enabled`; forwarded only when on, so with it off the env is unchanged. */
 	readonly multipleChatProvidersEnabled?: boolean;
 }
@@ -749,6 +784,10 @@ export function buildAgentSdkEnv(
 	if (settings.codexAgentEnabled !== undefined) {
 		setIfMissing(AgentHostCodexAgentEnabledEnvVar, settings.codexAgentEnabled ? 'true' : 'false');
 	}
+	if (settings.grokBuildAgentEnabled !== undefined) {
+		setIfMissing(AgentHostGrokBuildAgentEnabledEnvVar, settings.grokBuildAgentEnabled ? 'true' : 'false');
+	}
+	setIfMissing(AgentHostGrokBuildBinaryPathEnvVar, settings.grokBuildBinaryPath);
 	if (settings.multipleChatProvidersEnabled === true) {
 		setIfMissing(AgentHostMultipleChatProvidersEnabledEnvVar, 'true');
 	}

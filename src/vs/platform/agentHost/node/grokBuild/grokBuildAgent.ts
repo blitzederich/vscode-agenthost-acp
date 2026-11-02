@@ -25,6 +25,7 @@ import {
 	type IAgentChatMetadata,
 	type IAgentChatMetadataOptions,
 	type IAgentCreateChatOptions,
+	type IAgentChats,
 	type IAgentCreateChatResult,
 	type IAgentDescriptor,
 	type IAgentDiscoveredChat,
@@ -37,10 +38,10 @@ import {
 	AgentSignal,
 	resolveAgentChatContext,
 } from '../../common/agent.js';
-import { AgentHostClientType } from '../../common/agentHostClientInfo.js';
-import type { ChatInputAnswer, ChatInputResponseKind, ClientPluginCustomization, Customization, MessageAttachment, ModelSelection, ToolCallResult, Turn } from '../../common/state/sessionState.js';
+import { AgentHostGrokBuildBinaryPathEnvVar } from '../../common/agentService.js';
+import type { ChatInputAnswer, ChatInputResponseKind, ClientPluginCustomization, Customization, ModelSelection, ToolCallResult, Turn, UsageInfo } from '../../common/state/sessionState.js';
 import { MessageKind, ResponsePartKind, TurnState } from '../../common/state/sessionState.js';
-import type { AgentSelection, ProtectedResourceMetadata, ToolDefinition } from '../../common/state/protocol/state.js';
+import type { ProtectedResourceMetadata, ToolDefinition } from '../../common/state/protocol/state.js';
 import type { ResolveSessionConfigResult, SessionConfigCompletionsResult } from '../../common/state/protocol/commands.js';
 import type { SessionAction, ChatAction } from '../../common/state/sessionActions.js';
 import {
@@ -53,7 +54,6 @@ import {
 } from './acpClient.js';
 import { decodeGrokBuildChat, encodeGrokBuildChat, type IGrokBuildPersistedChat } from './grokBuildChatBacking.js';
 import {
-	AgentHostGrokBuildBinaryPathEnvVar,
 	buildGrokBuildLaunchConfig,
 	grokCliMissingError,
 	grokNotLoggedInError,
@@ -77,6 +77,7 @@ import {
 	type AcpRequestPermissionParams,
 	type AcpRequestPermissionResult,
 	type AcpSessionUpdateParams,
+	type AcpUsage,
 } from './protocol/acpTypes.js';
 
 const emptySessionSchema = createSchema({});
@@ -139,12 +140,31 @@ function toAgentModelInfo(model: AcpModelInfo, provider: AgentProvider): IAgentM
 	};
 }
 
-function applyModelState(models: IObservable<readonly IAgentModelInfo[]>, provider: AgentProvider, state: AcpModelState | undefined): void {
+function toUsageInfo(usage: AcpUsage | undefined): UsageInfo | undefined {
+	if (!usage) {
+		return undefined;
+	}
+	const info: UsageInfo = {
+		inputTokens: typeof usage.inputTokens === 'number' ? usage.inputTokens : undefined,
+		outputTokens: typeof usage.outputTokens === 'number' ? usage.outputTokens : undefined,
+		cacheReadTokens: typeof usage.cachedTokens === 'number' ? usage.cachedTokens : undefined,
+	};
+	if (info.inputTokens === undefined && info.outputTokens === undefined && info.cacheReadTokens === undefined) {
+		return undefined;
+	}
+	return info;
+}
+
+function applyModelState(
+	setModels: (models: readonly IAgentModelInfo[]) => void,
+	provider: AgentProvider,
+	state: AcpModelState | undefined,
+): void {
 	const available = state?.availableModels;
 	if (!available?.length) {
 		return;
 	}
-	models.set(available.map(m => toAgentModelInfo(m, provider)), undefined);
+	setModels(available.map(m => toAgentModelInfo(m, provider)));
 }
 
 function textFromSessionUpdate(params: AcpSessionUpdateParams): string | undefined {
@@ -232,45 +252,22 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		this._wireClient(client, store);
 	}
 
-	readonly chats = {
-		createChat: (chat: URI, context: URI | IAgentChatContext, options?: IAgentCreateChatOptions): Promise<IAgentCreateChatResult | void> => {
-			return this._createChat(chat, context, options);
-		},
-		disposeChat: (chat: URI, _context: URI | IAgentChatContext): Promise<void> => {
-			return this._disposeChat(chat, true);
-		},
-		releaseChat: (chat: URI, _context: URI | IAgentChatContext): Promise<void> => {
-			return this._disposeChat(chat, false);
-		},
-		sendMessage: (
-			chat: URI,
-			prompt: string,
-			workingDirectoriesOrDirectory: readonly URI[] | URI | undefined,
-			_attachments?: readonly MessageAttachment[],
-			turnId?: string,
-			_senderClientId?: string,
-			clientTypeOrContext?: AgentHostClientType | URI | IAgentChatContext,
-			context?: URI | IAgentChatContext,
-		): Promise<void> => {
+	readonly chats: IAgentChats = {
+		createChat: (chat, context, options) => this._createChat(chat, context, options),
+		disposeChat: (chat, _context) => this._disposeChat(chat, true),
+		releaseChat: (chat, _context) => this._disposeChat(chat, false),
+		sendMessage: (chat, prompt, workingDirectoriesOrDirectory, _attachments, turnId, _senderClientId, clientTypeOrContext, context) => {
 			const operationContext = context ?? (typeof clientTypeOrContext === 'string' ? undefined : clientTypeOrContext);
 			return this._sendMessage(chat, prompt, workingDirectoriesOrDirectory, turnId, operationContext);
 		},
-		abort: (chat: URI, _context: URI | IAgentChatContext): Promise<void> => {
-			return this._abort(chat);
-		},
-		getMessages: (chat: URI, _context: URI | IAgentChatContext): Promise<readonly Turn[]> => {
+		abort: (chat, _context) => this._abort(chat),
+		getMessages: (chat, _context) => {
 			const backing = this._backings.get(chatKey(chat));
 			return Promise.resolve(backing?.turns.map(turnRecordToTurn) ?? []);
 		},
-		changeModel: (chat: URI, model: ModelSelection, _context: URI | IAgentChatContext): Promise<void> => {
-			return this._changeModel(chat, model);
-		},
-		getModel: (chat: URI, _context: URI | IAgentChatContext): ModelSelection | undefined => {
-			return this._backings.get(chatKey(chat))?.model;
-		},
-		changeAgent: (_chat: URI, _agent: AgentSelection | undefined, _context: URI | IAgentChatContext): Promise<void> => {
-			return Promise.resolve();
-		},
+		changeModel: (chat, model, _context) => this._changeModel(chat, model),
+		getModel: (chat, _context) => this._backings.get(chatKey(chat))?.model,
+		changeAgent: (_chat, _agent, _context) => Promise.resolve(),
 	};
 
 	async materializeChat(chat: URI, context: URI | IAgentChatContext, providerData: string | undefined): Promise<IAgentCreateChatResult | void> {
@@ -331,9 +328,9 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		}
 		const optionId = selectPermissionOptionId(pending.options, approved);
 		if (optionId) {
-			pending.resolve({ result: { outcome: 'selected', optionId } });
+			pending.resolve({ result: { outcome: { outcome: 'selected', optionId } } });
 		} else {
-			pending.resolve({ result: { outcome: 'cancelled' } });
+			pending.resolve({ result: { outcome: { outcome: 'cancelled' } } });
 		}
 		this._pendingPermissions.delete(requestId);
 	}
@@ -460,7 +457,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			throw err;
 		}
 
-		applyModelState(this._models, this.id, sessionNew.models);
+		applyModelState(models => this._models.set(models, undefined), this.id, sessionNew.models);
 
 		const persisted: IGrokBuildPersistedChat = {
 			sessionId: sessionNew.sessionId,
@@ -491,7 +488,9 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		turnId: string | undefined,
 		context: URI | IAgentChatContext | undefined,
 	): Promise<void> {
-		resolveAgentChatContext(context, chat);
+		if (context) {
+			resolveAgentChatContext(context, chat);
+		}
 		const backing = this._requireBacking(chat);
 		const client = await this._ensureConnection();
 		const turn = turnId ?? generateUuid();
@@ -514,13 +513,14 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 				sessionId: backing.sessionId,
 				prompt: [{ type: 'text', text: prompt }],
 			});
+			const usage = toUsageInfo(result._meta?.usage);
 			for (const action of mapUsage(turn, result._meta?.usage)) {
 				this._fireAction(chat, action);
 			}
 			for (const action of mapTurnCompleted(turn, result.stopReason)) {
 				this._fireAction(chat, action);
 			}
-			this._finalizeTurn(backing, turn, result.stopReason === 'cancelled' ? TurnState.Cancelled : TurnState.Complete, result._meta?.usage);
+			this._finalizeTurn(backing, turn, result.stopReason === 'cancelled' ? TurnState.Cancelled : TurnState.Complete, usage);
 		} catch (err) {
 			if (isGrokAuthError(err)) {
 				for (const action of mapAuthRequiredAsTurnError(turn, grokNotLoggedInError().message)) {
@@ -591,7 +591,10 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		if (workingDirectoriesOrDirectory === undefined) {
 			return undefined;
 		}
-		return Array.isArray(workingDirectoriesOrDirectory) ? workingDirectoriesOrDirectory : [workingDirectoriesOrDirectory];
+		if (URI.isUri(workingDirectoriesOrDirectory)) {
+			return [workingDirectoriesOrDirectory];
+		}
+		return workingDirectoriesOrDirectory;
 	}
 
 	private _finalizeTurn(backing: IGrokBuildChatBacking, turnId: string, state: TurnState, usage: Turn['usage']): void {
@@ -610,7 +613,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			if (!URI.isUri(pending.chat) || pending.chat.toString() !== chat.toString()) {
 				continue;
 			}
-			pending.resolve({ result: { outcome: 'cancelled' } });
+			pending.resolve({ result: { outcome: { outcome: 'cancelled' } } });
 			this._pendingPermissions.delete(toolCallId);
 		}
 	}
@@ -679,7 +682,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 				},
 				clientInfo: { name: clientName, version: clientVersion },
 			});
-			applyModelState(this._models, this.id, init._meta?.modelState);
+			applyModelState(models => this._models.set(models, undefined), this.id, init._meta?.modelState);
 			await client.request('authenticate', { methodId: 'grok.com' });
 		} catch (err) {
 			this._disposeConnection();

@@ -563,6 +563,9 @@ export const CODEX_AGENT_PROVIDER_ID = 'codex' as const;
 /** Well-known agent provider id for the Copilot CLI agent-host backend. */
 export const COPILOT_CLI_AGENT_PROVIDER_ID = 'copilotcli' as const;
 
+/** Well-known agent provider id for the Grok Build ACP agent-host backend. */
+export const GROK_BUILD_AGENT_PROVIDER_ID = 'grokBuild' as const;
+
 /**
  * Static capability facts an agent backend advertises about itself. Each flag
  * is opt-in (absent means unsupported) so single-chat agents (e.g. Codex) can omit

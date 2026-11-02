@@ -43,11 +43,13 @@ import { ClaudeSdkPackage } from './claude/claudeAgentSdkService.js';
 import { CodexAgent } from './codex/codexAgent.js';
 import { CodexSdkPackage } from './codex/codexSdk.js';
 import { createCodexProviderConfiguration } from './codex/codexProviderConfiguration.js';
+import { GrokBuildAgent } from './grokBuild/grokBuildAgent.js';
+import { isGrokBinaryAvailable } from './grokBuild/grokBuildLaunchConfig.js';
 import { IAgentSdkDownloader, type IAgentSdkDownloadProgress } from './agentSdkDownloader.js';
 import { IAgentHostProviderService } from './agentHostProviderService.js';
-import { AgentHostCodexEnabledConfigKey, platformRootSchema } from '../common/agentHostSchema.js';
+import { AgentHostCodexEnabledConfigKey, AgentHostGrokBuildEnabledConfigKey, platformRootSchema } from '../common/agentHostSchema.js';
 import { AgentModelRefreshScheduler, MODEL_REFRESH_INTERVAL_MS } from './agentModelRefreshScheduler.js';
-import { AgentHostClaudeAgentEnabledEnvVar, AgentHostClaudeSdkRootEnvVar, AgentHostCodexAgentCodexHomeEnvVar, AgentHostCodexAgentEnabledEnvVar, AgentHostCodexAgentSdkRootEnvVar, isAgentEnabled } from '../common/agentService.js';
+import { AgentHostClaudeAgentEnabledEnvVar, AgentHostClaudeSdkRootEnvVar, AgentHostCodexAgentCodexHomeEnvVar, AgentHostCodexAgentEnabledEnvVar, AgentHostCodexAgentSdkRootEnvVar, AgentHostGrokBuildAgentEnabledEnvVar, AgentHostGrokBuildBinaryPathEnvVar, isAgentEnabled } from '../common/agentService.js';
 import { WebSocketProtocolServer } from './webSocketTransport.js';
 import { ProtocolServerHandler } from './protocolServerHandler.js';
 import { AgentHostClientFileSystemProvider } from '../common/agentHostClientFileSystemProvider.js';
@@ -278,6 +280,29 @@ async function main(): Promise<void> {
 			};
 			registerCodexIfEnabled();
 			disposables.add(agentConfigurationService.onDidRootConfigChange(() => registerCodexIfEnabled()));
+		}
+		{
+			let grokBuildRegistered = false;
+			const registerGrokBuildIfEnabled = () => {
+				if (grokBuildRegistered) {
+					return;
+				}
+				const enabledByEnv = isAgentEnabled(process.env[AgentHostGrokBuildAgentEnabledEnvVar], false);
+				const enabledByRootConfig = agentConfigurationService.getRootValue(platformRootSchema, AgentHostGrokBuildEnabledConfigKey) === true;
+				if (!(enabledByEnv || enabledByRootConfig)) {
+					return;
+				}
+				void isGrokBinaryAvailable(process.env[AgentHostGrokBuildBinaryPathEnvVar]).then(available => {
+					if (grokBuildRegistered || !available) {
+						return;
+					}
+					grokBuildRegistered = true;
+					providerService.registerProvider(instantiationService.createInstance(GrokBuildAgent));
+					log('GrokBuildAgent registered');
+				});
+			};
+			registerGrokBuildIfEnabled();
+			disposables.add(agentConfigurationService.onDidRootConfigChange(() => registerGrokBuildIfEnabled()));
 		}
 	}
 
