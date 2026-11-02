@@ -179,7 +179,7 @@ export class AcpClient extends Disposable implements IAcpClient {
 
 		if (hasId && !hasMethod && (hasResult || hasError)) {
 			if (typeof msg.id !== 'number') {
-				this._log('warn', `unsolicited response id=${String(msg.id)}`);
+				this._log('trace', `unsolicited response id=${String(msg.id)}`);
 				return;
 			}
 			const pending = this._pending.get(msg.id);

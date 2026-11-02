@@ -6,22 +6,19 @@
 /**
  * CI-safe Grok Build end-to-end.
  *
- * The live `grok --xai-api-base-url` replay is skipped when `grok` is not on
- * PATH. It was not possible to confirm a credential-free replay: upstream
- * docs describe that flag as a model-API override that still expects
- * `grok login` or `XAI_API_KEY`, and this environment has no `grok` binary.
- * The test that always runs spawns a fake ACP process (recorded assistant
- * text) through the real stdio spawn path and a temporary HOME. It does not
- * read or write `~/.grok/auth.json`.
+ * grok 1.0.70 cannot replay a turn through `--xai-api-base-url` without a
+ * real login. Without credentials, `initialize` works and
+ * `authenticate { methodId: "grok.com" }` hangs; `session/new` then fails
+ * with "Authentication required" and grok does not call that URL. A dummy
+ * `XAI_API_KEY` makes grok request `GET /models` and `/api-key` there, but
+ * authenticate still hangs. This file therefore spawns a fake ACP process
+ * through the real stdio path and a temporary HOME. It never stats the real home.
  */
 
 import assert from 'assert';
-import { spawn } from 'child_process';
-import { createServer, type Server } from 'http';
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'fs/promises';
-import { tmpdir, homedir } from 'os';
+import { chmod, mkdtemp, readFile, rm, stat, writeFile } from 'fs/promises';
+import { tmpdir } from 'os';
 import { join } from '../../../../../base/common/path.js';
-import { findExecutable } from '../../../../../base/node/processes.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../../log/common/log.js';
@@ -130,51 +127,6 @@ function markdownOf(turn: Turn): string {
 		.join('');
 }
 
-interface IAuthSnapshot {
-	readonly path: string;
-	readonly exists: boolean;
-	readonly mtimeMs?: number;
-	readonly size?: number;
-}
-
-async function snapshotAuth(home: string | undefined): Promise<IAuthSnapshot | undefined> {
-	if (!home) {
-		return undefined;
-	}
-	const path = join(home, '.grok', 'auth.json');
-	try {
-		const info = await stat(path);
-		return { path, exists: true, mtimeMs: info.mtimeMs, size: info.size };
-	} catch {
-		return { path, exists: false };
-	}
-}
-
-async function assertAuthUnchanged(before: IAuthSnapshot | undefined): Promise<void> {
-	if (!before) {
-		return;
-	}
-	const after = await snapshotAuth(before.path.slice(0, before.path.length - '/.grok/auth.json'.length));
-	assert.ok(after);
-	assert.strictEqual(after.exists, before.exists);
-	assert.strictEqual(after.mtimeMs, before.mtimeMs);
-	assert.strictEqual(after.size, before.size);
-}
-
-function listen(server: Server): Promise<number> {
-	return new Promise((resolve, reject) => {
-		server.once('error', reject);
-		server.listen(0, '127.0.0.1', () => {
-			const address = server.address();
-			if (!address || typeof address === 'string') {
-				reject(new Error('replay proxy did not bind'));
-				return;
-			}
-			resolve(address.port);
-		});
-	});
-}
-
 suite('Grok Build e2e', () => {
 
 	const store = ensureNoDisposablesAreLeakedInTestSuite();
@@ -190,9 +142,6 @@ suite('Grok Build e2e', () => {
 		const previousProfile = process.env.USERPROFILE;
 		const previousKey = process.env.XAI_API_KEY;
 		const previousReport = process.env.GROK_E2E_REPORT;
-		const userHome = homedir();
-		const authBefore = await snapshotAuth(userHome);
-		const envHomeBefore = previousHome && previousHome !== userHome ? await snapshotAuth(previousHome) : undefined;
 		process.env.HOME = home;
 		process.env.USERPROFILE = home;
 		process.env.GROK_E2E_REPORT = reportPath;
@@ -220,8 +169,6 @@ suite('Grok Build e2e', () => {
 			assert.ok(!report.argv.includes('--always-approve'));
 			assert.deepStrictEqual(report.argv, [...GROK_BUILD_ACP_ARGV]);
 			await assert.rejects(stat(join(home, '.grok', 'auth.json')));
-			await assertAuthUnchanged(authBefore);
-			await assertAuthUnchanged(envHomeBefore);
 		} finally {
 			agent.dispose();
 			if (previousHome === undefined) {
@@ -244,65 +191,6 @@ suite('Grok Build e2e', () => {
 			} else {
 				process.env.GROK_E2E_REPORT = previousReport;
 			}
-			await rm(root, { recursive: true, force: true });
-		}
-	});
-
-	test('live grok replay proxy skips when grok is not on PATH', async function () {
-		this.timeout(20_000);
-		const grokPath = await findExecutable('grok');
-		if (!grokPath) {
-			this.skip();
-		}
-
-		const root = await mkdtemp(join(tmpdir(), 'grok-build-replay-'));
-		const home = join(root, 'home');
-		await mkdir(home, { recursive: true });
-		const userHome = homedir();
-		const authBefore = await snapshotAuth(userHome);
-		const server = createServer((_request, response) => {
-			response.writeHead(401, { 'content-type': 'application/json' });
-			response.end(JSON.stringify({ error: 'unauthorized' }));
-		});
-		const port = await listen(server);
-		const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, USERPROFILE: home };
-		delete env.XAI_API_KEY;
-		const child = spawn(grokPath!, [
-			'--no-auto-update',
-			'--permission-mode', 'default',
-			'agent',
-			'--xai-api-base-url', `http://127.0.0.1:${port}`,
-			'--no-leader',
-			'stdio',
-		], {
-			cwd: root,
-			env,
-			stdio: ['pipe', 'pipe', 'pipe'],
-		});
-		// Drain the pipes so a chatty CLI cannot block. Do not assert on
-		// stdout: this environment has no grok binary, and upstream docs say
-		// --xai-api-base-url still expects login or XAI_API_KEY.
-		child.stdout?.resume();
-		child.stderr?.resume();
-		const exited = new Promise<number | null>(resolve => {
-			child.once('exit', code => resolve(code));
-		});
-		try {
-			child.stdin?.write(JSON.stringify({
-				jsonrpc: '2.0',
-				id: 1,
-				method: 'initialize',
-				params: { protocolVersion: 1, clientInfo: { name: 'e2e', version: '0' } },
-			}) + '\n');
-			await Promise.race([
-				exited,
-				new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), 6_000)),
-			]);
-			await assertAuthUnchanged(authBefore);
-		} finally {
-			child.kill('SIGKILL');
-			await Promise.race([exited, new Promise(resolve => setTimeout(resolve, 1_000))]);
-			await new Promise<void>(resolve => server.close(() => resolve()));
 			await rm(root, { recursive: true, force: true });
 		}
 	});

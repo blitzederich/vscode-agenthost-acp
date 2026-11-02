@@ -136,10 +136,6 @@ import {
 const HANDSHAKE_TIMEOUT_MS = 30_000;
 const GROK_SESSION_LIST_MAX_PAGES = 20;
 
-/**
- * Bound a promise without leaving a rejection unhandled when the timer wins.
- * `raceTimeout` settles on the timer and still rejects the original promise.
- */
 /** AcpClient rejects in-flight RPCs with this text before the agent sees the exit event. */
 const GROK_TRANSPORT_EXIT = /grok acp process exited \(code=(-?\d+|null), signal=([^;)]+)\)/;
 
@@ -154,6 +150,10 @@ function grokExitFromTransportError(err: unknown): { code: number | null; signal
 	return { code, signal };
 }
 
+/**
+ * Bound a promise without leaving a rejection unhandled when the timer wins.
+ * `raceTimeout` settles on the timer and still rejects the original promise.
+ */
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | undefined> {
 	let settled = false;
 	return new Promise((resolve, reject) => {
@@ -778,7 +778,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			const sessions = await this._discoverSessions();
 			return sessions.map(session => this._toListedChat(session));
 		} catch (err) {
-			this._logService.warn(`[GrokBuild] session/list failed: ${err instanceof Error ? err.message : String(err)}`);
+			this._logService.warn(`[GrokBuild] session/list failed: ${grokLogSummary(err instanceof Error ? err.message : String(err))}`);
 			return undefined;
 		}
 	}
@@ -786,7 +786,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 	startChatDiscovery(): Promise<void> {
 		if (!this._discoveryPromise) {
 			this._discoveryPromise = this._emitDiscoveredChats().catch(err => {
-				this._logService.warn(`[GrokBuild] chat discovery failed: ${err instanceof Error ? err.message : String(err)}`);
+				this._logService.warn(`[GrokBuild] chat discovery failed: ${grokLogSummary(err instanceof Error ? err.message : String(err))}`);
 			});
 		}
 		return this._discoveryPromise;
@@ -889,7 +889,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 				});
 			} catch (err) {
 				const formatted = formatAcpError(err);
-				this._logService.warn(`[GrokBuild] session/set_model failed; keeping the CLI default model: ${formatted.message}`);
+				this._logService.warn(`[GrokBuild] session/set_model failed; keeping the CLI default model: ${grokLogSummary(formatted.message)}`);
 				const current = sessionNew.models?.currentModelId;
 				model = current ? { id: current } : undefined;
 			}
@@ -906,7 +906,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 				});
 			} catch (err) {
 				const formatted = formatAcpError(err);
-				this._logService.warn(`[GrokBuild] session/set_config_option failed; keeping grok's reasoning effort: ${formatted.message}`);
+				this._logService.warn(`[GrokBuild] session/set_config_option failed; keeping grok's reasoning effort: ${grokLogSummary(formatted.message)}`);
 				reasoningEffort = this._reasoningOption?.currentValue;
 			}
 		}
@@ -1794,7 +1794,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 				});
 			} catch (err) {
 				const formatted = formatAcpError(err);
-				this._logService.warn(`[GrokBuild] session/set_config_option failed after load: ${formatted.message}`);
+				this._logService.warn(`[GrokBuild] session/set_config_option failed after load: ${grokLogSummary(formatted.message)}`);
 				return;
 			}
 		} else if (!wanted && current) {
@@ -1882,7 +1882,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			const formatted = formatAcpError(err);
 			const alreadyLocalized = formatted.message === grokPlanModeFailedError().message;
 			if (!alreadyLocalized) {
-				this._logService.warn(`[GrokBuild] session/set_mode ${modeId} failed: ${formatted.message}`);
+				this._logService.warn(`[GrokBuild] session/set_mode ${modeId} failed: ${grokLogSummary(formatted.message)}`);
 			}
 			if (fail) {
 				throw grokPlanModeFailedError();
