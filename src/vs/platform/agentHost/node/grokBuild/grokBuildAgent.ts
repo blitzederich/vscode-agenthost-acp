@@ -49,7 +49,7 @@ import { SessionConfigKey } from '../../common/sessionConfigKeys.js';
 import type { ConfigSchema } from '../../common/state/protocol/common/state.js';
 import { IAgentConfigurationService, type IAgentChatConfigurationChangeEvent } from '../agentConfigurationService.js';
 import { ActionType, type ChatAction, type SessionAction } from '../../common/state/sessionActions.js';
-import { ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, ChatInputResponseKind, createErrorResponsePart, MessageKind, ResponsePartKind, TurnState, type ChatInputAnswer, type ClientPluginCustomization, type Customization, type ModelSelection, type ToolCallResult, type Turn, type UsageInfo } from '../../common/state/sessionState.js';
+import { ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, ChatInputResponseKind, createErrorResponsePart, MessageKind, ResponsePartKind, TurnState, type ChatInputAnswer, type ChatInputQuestion, type ClientPluginCustomization, type Customization, type ModelSelection, type ToolCallResult, type Turn, type UsageInfo } from '../../common/state/sessionState.js';
 import type { ProtectedResourceMetadata, ToolDefinition } from '../../common/state/protocol/state.js';
 import type { ResolveSessionConfigResult, SessionConfigCompletionsResult } from '../../common/state/protocol/commands.js';
 import {
@@ -126,6 +126,10 @@ import {
 } from './grokBuildUx.js';
 import {
 	type AcpAgentCapabilities,
+	type AcpAskUserQuestion,
+	type AcpAskUserQuestionOption,
+	type AcpAskUserQuestionParams,
+	type AcpAskUserQuestionResult,
 	type AcpConfigOption,
 	type AcpExitPlanModeParams,
 	type AcpExitPlanModeResult,
@@ -144,6 +148,88 @@ import {
 const GROK_PLAN_REVIEW_APPROVE_ID = 'approve';
 /** Plan-review action: leave plan mode without executing. */
 const GROK_PLAN_REVIEW_ABANDON_ID = 'abandon';
+/** Chat-input question id for the optional skip-interview control. */
+const GROK_ASK_USER_SKIP_QUESTION_ID = 'grok-ask-user-skip';
+/** Option id that maps Accept → `{ outcome: 'skip_interview' }`. */
+const GROK_ASK_USER_SKIP_OPTION_ID = 'skip';
+
+function askUserQuestionId(index: number): string {
+	return `q-${index}`;
+}
+
+/**
+ * Flatten one chat-input answer into the grok wire value. Multi-select is a
+ * string array; single-select / free text is a string. Freeform text that does
+ * not match an option label is passed through as-is.
+ */
+function askUserAnswerFromChatInput(answer: ChatInputAnswer | undefined, multiSelect: boolean): string | string[] | undefined {
+	if (!answer || answer.state === ChatInputAnswerState.Skipped) {
+		return undefined;
+	}
+	const value = answer.value;
+	switch (value.kind) {
+		case ChatInputAnswerValueKind.Text: {
+			const text = value.value.trim();
+			if (!text) {
+				return undefined;
+			}
+			return multiSelect ? [text] : text;
+		}
+		case ChatInputAnswerValueKind.Selected: {
+			const freeform = value.freeformValues?.map(s => s.trim()).filter(s => s.length > 0) ?? [];
+			if (freeform.length > 0) {
+				return multiSelect ? freeform : freeform[0];
+			}
+			const selected = value.value.trim();
+			if (!selected) {
+				return undefined;
+			}
+			return multiSelect ? [selected] : selected;
+		}
+		case ChatInputAnswerValueKind.SelectedMany: {
+			const selected = value.value.map(s => s.trim()).filter(s => s.length > 0);
+			const freeform = value.freeformValues?.map(s => s.trim()).filter(s => s.length > 0) ?? [];
+			const all = [...selected, ...freeform];
+			if (all.length === 0) {
+				return undefined;
+			}
+			return multiSelect ? all : all[0];
+		}
+		default:
+			return undefined;
+	}
+}
+
+function buildAskUserChatInputQuestions(questions: readonly AcpAskUserQuestion[]): ChatInputQuestion[] {
+	return questions.map((question, index): ChatInputQuestion => {
+		const options = (question.options ?? []).map(option => ({
+			id: option.label,
+			label: option.label,
+			...(option.description ? { description: option.description } : {}),
+		}));
+		const multiSelect = question.multiSelect === true;
+		if (multiSelect) {
+			return {
+				kind: ChatInputQuestionKind.MultiSelect,
+				id: askUserQuestionId(index),
+				title: localize('grokBuild.askUser.questionTitle', "Question"),
+				message: question.question,
+				required: false,
+				options,
+				allowFreeformInput: true,
+			};
+		}
+		return {
+			kind: ChatInputQuestionKind.SingleSelect,
+			id: askUserQuestionId(index),
+			title: localize('grokBuild.askUser.questionTitle', "Question"),
+			message: question.question,
+			required: false,
+			options,
+			allowFreeformInput: true,
+		};
+	});
+}
 
 const HANDSHAKE_TIMEOUT_MS = 30_000;
 const GROK_SESSION_LIST_MAX_PAGES = 20;
@@ -259,6 +345,16 @@ interface IPendingPlanReview {
 	readonly toolCallId: string;
 	readonly questionId: string;
 	resolve(result: AcpServerRequestHandlerResult<AcpExitPlanModeResult>): void;
+}
+
+interface IPendingAskUserQuestion {
+	readonly chat: URI;
+	readonly sessionId: string;
+	readonly turnId: string;
+	readonly toolCallId: string;
+	/** Wire questions in order; chat-input ids are `q-${index}`. */
+	readonly questions: readonly AcpAskUserQuestion[];
+	resolve(result: AcpServerRequestHandlerResult<AcpAskUserQuestionResult>): void;
 }
 
 interface IConnection {
@@ -520,6 +616,8 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 	private readonly _pendingPermissions = new Map<string, IPendingPermission>();
 	/** Pending `_x.ai/exit_plan_mode` reviews, keyed by chat-input request id. */
 	private readonly _pendingPlanReviews = new Map<string, IPendingPlanReview>();
+	/** Pending `_x.ai/ask_user_question` prompts, keyed by chat-input request id. */
+	private readonly _pendingAskUserQuestions = new Map<string, IPendingAskUserQuestion>();
 	/**
 	 * ACP session ids that left plan via approve/abandon and are waiting for
 	 * `current_mode_update` `default` so chat config can move to interactive.
@@ -722,12 +820,18 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 	}
 
 	respondToUserInputRequest(requestId: string, response: ChatInputResponseKind, answers?: Record<string, ChatInputAnswer>): void {
-		const pending = this._pendingPlanReviews.get(requestId);
-		if (!pending) {
+		const planPending = this._pendingPlanReviews.get(requestId);
+		if (planPending) {
+			const result = this._resolveExitPlanMode(planPending, response, answers);
+			this._completePlanReview(requestId, { result });
 			return;
 		}
-		const result = this._resolveExitPlanMode(pending, response, answers);
-		this._completePlanReview(requestId, { result });
+		const askPending = this._pendingAskUserQuestions.get(requestId);
+		if (!askPending) {
+			return;
+		}
+		const result = this._resolveAskUserQuestion(askPending, response, answers);
+		this._completeAskUserQuestion(requestId, { result });
 	}
 
 	async setWorkingDirectory(chat: URI, context: URI | IAgentChatContext, workingDirectory: URI): Promise<void> {
@@ -835,6 +939,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		this._sessionToChat.clear();
 		this._pendingPermissions.clear();
 		this._pendingPlanReviews.clear();
+		this._pendingAskUserQuestions.clear();
 		this._sessionsExitingPlanMode.clear();
 		this._activeClients.clear();
 		super.dispose();
@@ -1214,6 +1319,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			this._pendingPermissions.delete(toolCallId);
 		}
 		this._cancelPendingPlanReviewsForChat(chat);
+		this._cancelPendingAskUserQuestionsForChat(chat);
 	}
 
 	private _cancelAllPendingPermissions(): void {
@@ -1222,6 +1328,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			this._pendingPermissions.delete(toolCallId);
 		}
 		this._cancelAllPendingPlanReviews();
+		this._cancelAllPendingAskUserQuestions();
 	}
 
 	private _cancelPendingPlanReviewsForChat(chat: URI): void {
@@ -1236,6 +1343,21 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 	private _cancelAllPendingPlanReviews(): void {
 		for (const [requestId, pending] of [...this._pendingPlanReviews]) {
 			this._dismissPlanReview(requestId, pending, { result: { outcome: 'revise' } });
+		}
+	}
+
+	private _cancelPendingAskUserQuestionsForChat(chat: URI): void {
+		for (const [requestId, pending] of [...this._pendingAskUserQuestions]) {
+			if (pending.chat.toString() !== chat.toString()) {
+				continue;
+			}
+			this._dismissAskUserQuestion(requestId, pending, { result: { outcome: 'cancelled' } });
+		}
+	}
+
+	private _cancelAllPendingAskUserQuestions(): void {
+		for (const [requestId, pending] of [...this._pendingAskUserQuestions]) {
+			this._dismissAskUserQuestion(requestId, pending, { result: { outcome: 'cancelled' } });
 		}
 	}
 
@@ -1280,6 +1402,80 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			this._sessionsExitingPlanMode.delete(pending.sessionId);
 		}
 		pending.resolve(result);
+	}
+
+	/**
+	 * Resolve a parked ask-user prompt without accepting, dismiss the input UI,
+	 * and mark the ask_user_question tool card cancelled (grok sends no update).
+	 */
+	private _dismissAskUserQuestion(
+		requestId: string,
+		pending: IPendingAskUserQuestion,
+		result: AcpServerRequestHandlerResult<AcpAskUserQuestionResult>,
+	): void {
+		if (!this._pendingAskUserQuestions.has(requestId)) {
+			return;
+		}
+		this._pendingAskUserQuestions.delete(requestId);
+		pending.resolve(result);
+		this._fireAction(pending.chat, {
+			type: ActionType.ChatInputCompleted,
+			requestId,
+			response: ChatInputResponseKind.Cancel,
+		});
+		const backing = this._backings.get(chatKey(pending.chat));
+		if (backing?.mapState) {
+			for (const action of mapExitPlanCancelled(backing.mapState, pending.toolCallId)) {
+				this._fireAction(pending.chat, action);
+			}
+		}
+	}
+
+	private _completeAskUserQuestion(requestId: string, result: AcpServerRequestHandlerResult<AcpAskUserQuestionResult>): void {
+		const pending = this._pendingAskUserQuestions.get(requestId);
+		if (!pending) {
+			return;
+		}
+		this._pendingAskUserQuestions.delete(requestId);
+		pending.resolve(result);
+	}
+
+	/**
+	 * Maps a chat-input response to `_x.ai/ask_user_question` outcome.
+	 * Decline / cancel → `cancelled`. Accept with the skip control →
+	 * `skip_interview`. Accept with answers → `accepted` keyed by question text.
+	 * Accept with no answers → `skip_interview`. Never emits `chat_about_this`.
+	 */
+	private _resolveAskUserQuestion(
+		pending: IPendingAskUserQuestion,
+		response: ChatInputResponseKind,
+		answers?: Record<string, ChatInputAnswer>,
+	): AcpAskUserQuestionResult {
+		if (response !== ChatInputResponseKind.Accept) {
+			return { outcome: 'cancelled' };
+		}
+		const skipAnswer = answers?.[GROK_ASK_USER_SKIP_QUESTION_ID];
+		if (skipAnswer && skipAnswer.state !== ChatInputAnswerState.Skipped) {
+			const skipValue = skipAnswer.value;
+			if (skipValue.kind === ChatInputAnswerValueKind.Selected && skipValue.value === GROK_ASK_USER_SKIP_OPTION_ID) {
+				return { outcome: 'skip_interview' };
+			}
+			if (skipValue.kind === ChatInputAnswerValueKind.Boolean && skipValue.value) {
+				return { outcome: 'skip_interview' };
+			}
+		}
+		const accepted: Record<string, string | string[]> = {};
+		for (let index = 0; index < pending.questions.length; index++) {
+			const question = pending.questions[index];
+			const mapped = askUserAnswerFromChatInput(answers?.[askUserQuestionId(index)], question.multiSelect === true);
+			if (mapped !== undefined) {
+				accepted[question.question] = mapped;
+			}
+		}
+		if (Object.keys(accepted).length === 0) {
+			return { outcome: 'skip_interview' };
+		}
+		return { outcome: 'accepted', answers: accepted };
 	}
 
 	/**
@@ -1800,6 +1996,9 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		store.add(client.onRequest('_x.ai/exit_plan_mode', params => {
 			return this._handleExitPlanModeRequest(params as AcpExitPlanModeParams);
 		}));
+		store.add(client.onRequest('_x.ai/ask_user_question', params => {
+			return this._handleAskUserQuestionRequest(params as AcpAskUserQuestionParams);
+		}));
 		store.add(client.onUnhandledNotification((method, _params) => {
 			this._logService.trace(`[GrokBuild] ignored notification ${method}`);
 		}));
@@ -1948,6 +2147,85 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 				turnId: backing.activeTurnId!,
 				toolCallId: params.toolCallId,
 				questionId,
+				resolve,
+			});
+			this._fireAction(chat, {
+				type: ActionType.ChatInputRequested,
+				request: inputRequest,
+			});
+		});
+	}
+
+	/**
+	 * grok 1.0.70 asks clarifying questions via `_x.ai/ask_user_question` (not
+	 * `session/request_permission`). Surfaces each question through
+	 * {@link ChatInputRequestPurpose.AskUser} with single/multi select plus
+	 * free-text, and an optional skip-interview control. Decline / cancel →
+	 * `cancelled`; unknown session / no active turn / malformed params fail
+	 * closed without hanging the tool.
+	 */
+	private _handleAskUserQuestionRequest(params: AcpAskUserQuestionParams): Promise<AcpServerRequestHandlerResult<AcpAskUserQuestionResult>> {
+		if (!params || typeof params.sessionId !== 'string' || typeof params.toolCallId !== 'string' || !Array.isArray(params.questions) || params.questions.length === 0) {
+			return Promise.resolve({
+				error: { code: AcpJsonRpcErrorCode.InvalidParams, message: 'Invalid ask_user_question params' },
+			});
+		}
+		const questions: AcpAskUserQuestion[] = [];
+		for (const raw of params.questions) {
+			if (!raw || typeof raw.question !== 'string' || !Array.isArray(raw.options)) {
+				return Promise.resolve({
+					error: { code: AcpJsonRpcErrorCode.InvalidParams, message: 'Invalid ask_user_question question' },
+				});
+			}
+			questions.push({
+				question: raw.question,
+				options: raw.options.map((option: AcpAskUserQuestionOption | undefined) => ({
+					label: typeof option?.label === 'string' ? option.label : '',
+					description: typeof option?.description === 'string' ? option.description : '',
+				})),
+				multiSelect: raw.multiSelect === true ? true : raw.multiSelect === false ? false : null,
+			});
+		}
+		const chat = this._sessionToChat.get(params.sessionId);
+		if (!chat) {
+			this._logService.trace('[GrokBuild] ask_user_question for unknown session → cancelled');
+			return Promise.resolve({ result: { outcome: 'cancelled' } });
+		}
+		const backing = this._backings.get(chatKey(chat));
+		if (!backing?.activeTurnId) {
+			this._logService.trace('[GrokBuild] ask_user_question without active turn → cancelled');
+			return Promise.resolve({ result: { outcome: 'cancelled' } });
+		}
+		this._notePromptAccepted(backing);
+		this._logService.trace(`[GrokBuild] ask_user_question toolCallId=${params.toolCallId} questions=${questions.length} mode=${params.mode}`);
+
+		const requestId = generateUuid();
+		const inputQuestions = buildAskUserChatInputQuestions(questions);
+		inputQuestions.push({
+			kind: ChatInputQuestionKind.SingleSelect,
+			id: GROK_ASK_USER_SKIP_QUESTION_ID,
+			title: localize('grokBuild.askUser.skip.title', "Skip interview"),
+			message: localize('grokBuild.askUser.skip.message', "Stop asking clarifying questions and continue with the answers so far."),
+			required: false,
+			options: [{
+				id: GROK_ASK_USER_SKIP_OPTION_ID,
+				label: localize('grokBuild.askUser.skip.label', "Skip interview"),
+				description: localize('grokBuild.askUser.skip.description', "I have provided enough answers."),
+			}],
+		});
+		const inputRequest = withChatInputRequestPurpose({
+			id: requestId,
+			message: localize('grokBuild.askUser.requestMessage', "Answer the agent's questions"),
+			questions: inputQuestions,
+		}, ChatInputRequestPurpose.AskUser);
+
+		return new Promise<AcpServerRequestHandlerResult<AcpAskUserQuestionResult>>(resolve => {
+			this._pendingAskUserQuestions.set(requestId, {
+				chat,
+				sessionId: params.sessionId,
+				turnId: backing.activeTurnId!,
+				toolCallId: params.toolCallId,
+				questions,
 				resolve,
 			});
 			this._fireAction(chat, {

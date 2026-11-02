@@ -17,7 +17,7 @@ import { AgentSession, fixedChatOwnerRef, GROK_BUILD_AGENT_PROVIDER_ID, type Age
 import type { ChatInputRequestWithPlanReview } from '../../../common/agentHostPlanReview.js';
 import { ChatInputRequestPurpose, readChatInputRequestPurpose } from '../../../common/meta/agentChatInputRequestMeta.js';
 import { ActionType } from '../../../common/state/sessionActions.js';
-import { ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputResponseKind, CustomizationType, ResponsePartKind, TurnState, type ChatInputAnswer, type Turn } from '../../../common/state/sessionState.js';
+import { ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, ChatInputResponseKind, CustomizationType, ResponsePartKind, TurnState, type ChatInputAnswer, type ChatInputRequest, type Turn } from '../../../common/state/sessionState.js';
 import {
 	AcpClient,
 	type IAcpTransport,
@@ -2360,6 +2360,314 @@ suite('GrokBuildAgent', () => {
 		assert.deepStrictEqual([...GROK_BUILD_ACP_ARGV], ['--no-auto-update', '--permission-mode', 'default', 'agent', '--no-leader', 'stdio']);
 
 		peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
+		await send;
+	});
+
+	test('ask_user_question accepted single / multi-select / free text map by question text', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client);
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/ask-user' });
+		const context = chatContext(chat);
+		const signals: AgentSignal[] = [];
+		store.add(agent.onDidChatProgress(signal => signals.push(signal)));
+
+		const create = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp/ask-cwd')] });
+		const sessionNew = await readNextMessage(peer.outbound);
+		peer.push({ jsonrpc: '2.0', id: sessionNew.id, result: { sessionId: 'sess-ask', models: { currentModelId: 'm', availableModels: [{ modelId: 'm', name: 'm' }] } } });
+		await create;
+
+		const send = agent.chats.sendMessage(chat, 'ask me', [URI.file('/tmp/ask-cwd')], undefined, 'turn-ask', undefined, context);
+		const prompt = await readNextMessage(peer.outbound);
+		assert.strictEqual(prompt.method, 'session/prompt');
+		pushUpdate(peer, 'sess-ask', {
+			sessionUpdate: 'tool_call',
+			toolCallId: 'call-ask-1',
+			title: 'ask_user_question',
+			rawInput: { questions: [] },
+			_meta: { 'x.ai/tool': { name: 'ask_user_question', kind: 'ask_user', label: 'Ask User', read_only: true } },
+		});
+
+		const qSingle = 'Which of the two options do you prefer?';
+		const qMulti = 'Pick any that apply';
+		const qFree = 'Anything else?';
+		peer.push({
+			jsonrpc: '2.0',
+			id: 90,
+			method: '_x.ai/ask_user_question',
+			params: {
+				sessionId: 'sess-ask',
+				toolCallId: 'call-ask-1',
+				mode: 'default',
+				questions: [
+					{
+						question: qSingle,
+						options: [{ label: 'A', description: 'Option A' }, { label: 'B', description: 'Option B' }],
+						multiSelect: null,
+					},
+					{
+						question: qMulti,
+						options: [{ label: 'X', description: 'ex' }, { label: 'Y', description: 'why' }],
+						multiSelect: true,
+					},
+					{
+						question: qFree,
+						options: [{ label: 'None', description: 'nothing' }],
+						multiSelect: false,
+					},
+				],
+			},
+		});
+		await new Promise(r => setTimeout(r, 30));
+
+		const requested = signals.find(signal => signal.kind === 'action' && signal.action.type === ActionType.ChatInputRequested);
+		assert.ok(requested && requested.kind === 'action' && requested.action.type === ActionType.ChatInputRequested);
+		const request = requested.action.request as ChatInputRequest;
+		assert.strictEqual(readChatInputRequestPurpose(request), ChatInputRequestPurpose.AskUser);
+		assert.strictEqual(request.questions?.length, 4);
+		assert.strictEqual(request.questions?.[0].kind, ChatInputQuestionKind.SingleSelect);
+		assert.strictEqual(request.questions?.[0].message, qSingle);
+		assert.ok(request.questions?.[0].kind === ChatInputQuestionKind.SingleSelect && request.questions[0].allowFreeformInput);
+		assert.strictEqual(request.questions?.[1].kind, ChatInputQuestionKind.MultiSelect);
+		assert.strictEqual(request.questions?.[2].kind, ChatInputQuestionKind.SingleSelect);
+		assert.strictEqual(request.questions?.[3].id, 'grok-ask-user-skip');
+
+		agent.respondToUserInputRequest(request.id, ChatInputResponseKind.Accept, {
+			'q-0': {
+				state: ChatInputAnswerState.Submitted,
+				value: { kind: ChatInputAnswerValueKind.Selected, value: 'B' },
+			},
+			'q-1': {
+				state: ChatInputAnswerState.Submitted,
+				value: { kind: ChatInputAnswerValueKind.SelectedMany, value: ['X', 'Y'] },
+			},
+			'q-2': {
+				state: ChatInputAnswerState.Submitted,
+				value: { kind: ChatInputAnswerValueKind.Selected, value: 'None', freeformValues: ['Ship it tomorrow'] },
+			},
+		});
+		const accepted = await readNextMessage(peer.outbound);
+		assert.strictEqual(accepted.id, 90);
+		assert.deepStrictEqual(accepted.result, {
+			outcome: 'accepted',
+			answers: {
+				[qSingle]: 'B',
+				[qMulti]: ['X', 'Y'],
+				[qFree]: 'Ship it tomorrow',
+			},
+		});
+
+		peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
+		await send;
+	});
+
+	test('ask_user_question skip_interview and decline/cancel map correctly', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client);
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/ask-user-skip' });
+		const context = chatContext(chat);
+		const signals: AgentSignal[] = [];
+		store.add(agent.onDidChatProgress(signal => signals.push(signal)));
+
+		const create = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp')] });
+		const sessionNew = await readNextMessage(peer.outbound);
+		peer.push({ jsonrpc: '2.0', id: sessionNew.id, result: { sessionId: 'sess-ask-skip', models: { currentModelId: 'm', availableModels: [{ modelId: 'm', name: 'm' }] } } });
+		await create;
+
+		const send = agent.chats.sendMessage(chat, 'ask', [URI.file('/tmp')], undefined, 'turn-ask-skip', undefined, context);
+		const prompt = await readNextMessage(peer.outbound);
+		pushUpdate(peer, 'sess-ask-skip', {
+			sessionUpdate: 'tool_call',
+			toolCallId: 'call-ask-skip',
+			rawInput: {},
+			_meta: { 'x.ai/tool': { name: 'ask_user_question', kind: 'ask_user' } },
+		});
+
+		const askParams = {
+			sessionId: 'sess-ask-skip',
+			toolCallId: 'call-ask-skip',
+			mode: 'plan',
+			questions: [{
+				question: 'Ready?',
+				options: [{ label: 'Yes', description: 'y' }, { label: 'No', description: 'n' }],
+				multiSelect: null,
+			}],
+		};
+
+		peer.push({ jsonrpc: '2.0', id: 91, method: '_x.ai/ask_user_question', params: askParams });
+		await new Promise(r => setTimeout(r, 20));
+		let request = signals.map(s => s.kind === 'action' && s.action.type === ActionType.ChatInputRequested ? s.action.request as ChatInputRequest : undefined)
+			.filter((r): r is ChatInputRequest => !!r)
+			.at(-1)!;
+		agent.respondToUserInputRequest(request.id, ChatInputResponseKind.Accept, {
+			'grok-ask-user-skip': {
+				state: ChatInputAnswerState.Submitted,
+				value: { kind: ChatInputAnswerValueKind.Selected, value: 'skip' },
+			},
+		});
+		const skipped = await readNextMessage(peer.outbound);
+		assert.deepStrictEqual(skipped.result, { outcome: 'skip_interview' });
+
+		peer.push({ jsonrpc: '2.0', id: 92, method: '_x.ai/ask_user_question', params: { ...askParams, toolCallId: 'call-ask-empty' } });
+		await new Promise(r => setTimeout(r, 20));
+		request = signals.map(s => s.kind === 'action' && s.action.type === ActionType.ChatInputRequested ? s.action.request as ChatInputRequest : undefined)
+			.filter((r): r is ChatInputRequest => !!r)
+			.at(-1)!;
+		agent.respondToUserInputRequest(request.id, ChatInputResponseKind.Accept, {});
+		const emptySkip = await readNextMessage(peer.outbound);
+		assert.deepStrictEqual(emptySkip.result, { outcome: 'skip_interview' });
+
+		peer.push({ jsonrpc: '2.0', id: 93, method: '_x.ai/ask_user_question', params: { ...askParams, toolCallId: 'call-ask-decline' } });
+		await new Promise(r => setTimeout(r, 20));
+		request = signals.map(s => s.kind === 'action' && s.action.type === ActionType.ChatInputRequested ? s.action.request as ChatInputRequest : undefined)
+			.filter((r): r is ChatInputRequest => !!r)
+			.at(-1)!;
+		agent.respondToUserInputRequest(request.id, ChatInputResponseKind.Decline);
+		const declined = await readNextMessage(peer.outbound);
+		assert.deepStrictEqual(declined.result, { outcome: 'cancelled' });
+
+		peer.push({ jsonrpc: '2.0', id: 94, method: '_x.ai/ask_user_question', params: { ...askParams, toolCallId: 'call-ask-cancel' } });
+		await new Promise(r => setTimeout(r, 20));
+		request = signals.map(s => s.kind === 'action' && s.action.type === ActionType.ChatInputRequested ? s.action.request as ChatInputRequest : undefined)
+			.filter((r): r is ChatInputRequest => !!r)
+			.at(-1)!;
+		agent.respondToUserInputRequest(request.id, ChatInputResponseKind.Cancel);
+		const cancelled = await readNextMessage(peer.outbound);
+		assert.deepStrictEqual(cancelled.result, { outcome: 'cancelled' });
+
+		peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
+		await send;
+	});
+
+	test('ask_user_question malformed / unknown session / no turn fail closed; cancel-while-pending cleans up', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client);
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/ask-user-fail' });
+		const context = chatContext(chat);
+		const signals: AgentSignal[] = [];
+		store.add(agent.onDidChatProgress(signal => signals.push(signal)));
+
+		const create = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp')] });
+		const sessionNew = await readNextMessage(peer.outbound);
+		peer.push({ jsonrpc: '2.0', id: sessionNew.id, result: { sessionId: 'sess-ask-fail', models: { currentModelId: 'm', availableModels: [{ modelId: 'm', name: 'm' }] } } });
+		await create;
+
+		peer.push({
+			jsonrpc: '2.0',
+			id: 100,
+			method: '_x.ai/ask_user_question',
+			params: { sessionId: 'sess-ask-fail', toolCallId: 'c', mode: 'default', questions: 'nope' },
+		});
+		const malformed = await readNextMessage(peer.outbound);
+		assert.strictEqual(malformed.id, 100);
+		assert.strictEqual(malformed.error?.code, -32602);
+
+		peer.push({
+			jsonrpc: '2.0',
+			id: 101,
+			method: '_x.ai/ask_user_question',
+			params: {
+				sessionId: 'unknown',
+				toolCallId: 'c',
+				mode: 'default',
+				questions: [{ question: 'Q?', options: [{ label: 'A', description: 'a' }], multiSelect: null }],
+			},
+		});
+		const unknownSession = await readNextMessage(peer.outbound);
+		assert.deepStrictEqual(unknownSession.result, { outcome: 'cancelled' });
+
+		peer.push({
+			jsonrpc: '2.0',
+			id: 102,
+			method: '_x.ai/ask_user_question',
+			params: {
+				sessionId: 'sess-ask-fail',
+				toolCallId: 'c',
+				mode: 'default',
+				questions: [{ question: 'Q?', options: [{ label: 'A', description: 'a' }], multiSelect: null }],
+			},
+		});
+		const noTurn = await readNextMessage(peer.outbound);
+		assert.deepStrictEqual(noTurn.result, { outcome: 'cancelled' });
+
+		const send = agent.chats.sendMessage(chat, 'ask', [URI.file('/tmp')], undefined, 'turn-ask-fail', undefined, context);
+		const prompt = await readNextMessage(peer.outbound);
+		pushUpdate(peer, 'sess-ask-fail', {
+			sessionUpdate: 'tool_call',
+			toolCallId: 'call-ask-pending',
+			rawInput: {},
+			_meta: { 'x.ai/tool': { name: 'ask_user_question', kind: 'ask_user' } },
+		});
+		peer.push({
+			jsonrpc: '2.0',
+			id: 103,
+			method: '_x.ai/ask_user_question',
+			params: {
+				sessionId: 'sess-ask-fail',
+				toolCallId: 'call-ask-pending',
+				mode: 'default',
+				questions: [{ question: 'Pending?', options: [{ label: 'A', description: 'a' }], multiSelect: null }],
+			},
+		});
+		await new Promise(r => setTimeout(r, 30));
+		assert.ok(signals.some(signal => signal.kind === 'action' && signal.action.type === ActionType.ChatInputRequested));
+
+		const outbound: any[] = [];
+		const onOutbound = (chunk: Buffer | string) => {
+			const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+			for (const line of text.split('\n')) {
+				const trimmed = line.trim();
+				if (!trimmed) {
+					continue;
+				}
+				try {
+					outbound.push(JSON.parse(trimmed));
+				} catch {
+					outbound.push({ raw: trimmed });
+				}
+			}
+		};
+		peer.outbound.on('data', onOutbound);
+		try {
+			await agent.chats.abort(chat, context);
+			await new Promise(r => setTimeout(r, 20));
+		} finally {
+			peer.outbound.off('data', onOutbound);
+		}
+		assert.ok(signals.some(signal =>
+			signal.kind === 'action'
+			&& signal.action.type === ActionType.ChatInputCompleted
+			&& signal.action.response === ChatInputResponseKind.Cancel
+		), 'expected ask-user UI dismissal');
+		assert.ok(signals.some(signal =>
+			signal.kind === 'action'
+			&& signal.action.type === ActionType.ChatToolCallComplete
+			&& signal.action.toolCallId === 'call-ask-pending'
+			&& signal.action.result.success === false
+		), 'expected local ask_user tool card cancellation');
+		assert.ok(outbound.some(message => message.method === 'session/cancel'));
+		assert.ok(
+			outbound.some(message => message.id === 103 && message.result?.outcome === 'cancelled'),
+			`expected cancelled reply among ${JSON.stringify(outbound)}`,
+		);
+
+		// Late reply after cleanup must not throw.
+		const request = signals.map(s => s.kind === 'action' && s.action.type === ActionType.ChatInputRequested ? s.action.request as ChatInputRequest : undefined)
+			.filter((r): r is ChatInputRequest => !!r)
+			.at(-1)!;
+		agent.respondToUserInputRequest(request.id, ChatInputResponseKind.Accept, {
+			'q-0': {
+				state: ChatInputAnswerState.Submitted,
+				value: { kind: ChatInputAnswerValueKind.Selected, value: 'A' },
+			},
+		});
+
+		peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'cancelled' } });
 		await send;
 	});
 });

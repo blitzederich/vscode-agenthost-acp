@@ -665,8 +665,9 @@ export function mapExitPlanContent(
 }
 
 /**
- * Locally complete an `exit_plan_mode` tool card as cancelled. grok sends no
- * `tool_call_update` for that card when the client cancels while the review is pending.
+ * Locally complete a tool card as cancelled when grok abandons a pending
+ * agent→client request without a `tool_call_update` (`exit_plan_mode` review
+ * or `ask_user_question`). Preserves any attached plan markdown on the card.
  */
 export function mapExitPlanCancelled(
 	state: IGrokBuildMapState,
