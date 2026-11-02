@@ -124,7 +124,7 @@ Reject ends the prompt with `stopReason: "cancelled"`.
 | `authenticate` | **Implemented** | No-op `false` for unknown resources (CLI auth path) |
 | `getChatMetadata` | **Implemented** | Live backing, or providerData. `activation: 'restore'` attaches the runtime; a passive read does not |
 | `listChatsToMigrate` | **Implemented** | One unfiltered paginated `session/list`. `[]` when list is not advertised. `undefined` when the catalog cannot be read |
-| `recoverLegacyChat` | **Implemented** | Session id from the owner URI, cwd and title from the `session/list` cache (or a lookup), then `session/load`. Returns canonical providerData only after load succeeds |
+| `recoverLegacyChat` | **Implemented** | Connects first (capabilities are empty before the handshake), then session id from the owner URI, cwd and title from `session/list`, then `session/load`. Provider data includes `models.currentModelId` from that load |
 | `setWorkingDirectory` | **Implemented** | Always rejects. grok cannot reload a session at a different cwd (`FS_NOT_FOUND`) |
 | `shutdown` / `dispose` | **Implemented** | Tears down ACP child |
 | All marketplace / canvas / MCP / sandbox / steering / truncate / plugin APIs | Stub | Omitted optional members |
@@ -146,7 +146,7 @@ id from a dead grok process is never used for `session/prompt` until
 
 Live `session/load` (grok 1.0.70):
 
-- Result is `{ models, configOptions, _meta }`. History arrives as `session/update` notifications before that result. `session_info_update` is not replayed; `summary` comes from the `session/list` title.
+- Result is `{ models, configOptions, _meta }`. History arrives as `session/update` notifications before that result. `session_info_update` is not replayed; `summary` comes from the `session/list` title. A restore looks that title up when it is not already cached. A prompt index is stored only after grok accepts the prompt (`promptIndex` on an update, a permission request, or the prompt result).
 - Replay chunks are whole messages. There is no `messageId`. `update._meta` is `{ modelId, promptIndex }`.
 - A `tool_call` between assistant messages joins those messages with `\n\n`. The first streamed `tool_call` has no top-level `kind`; kind is `_meta["x.ai/tool"].kind` (`execute` → shell).
 - `cwd` must be the directory the session was created with. A different cwd, on a fresh or already-loaded process, returns `-32603` `Path not found.` with `data.code: "FS_NOT_FOUND"`. The same error is returned for an unknown session id. That load failure is `grokSessionMissingError` ("This Grok session no longer exists on this machine.").

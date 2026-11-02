@@ -121,11 +121,18 @@ export function grokWorkingDirectoryRejectedError(): Error {
 	));
 }
 
-export function grokSessionMissingError(): Error {
-	return new Error(nls.localize(
-		'grokBuild.sessionMissing',
-		"This Grok session no longer exists on this machine.",
-	));
+export class GrokSessionMissingError extends Error {
+	constructor() {
+		super(nls.localize(
+			'grokBuild.sessionMissing',
+			"This Grok session no longer exists on this machine.",
+		));
+		this.name = 'GrokSessionMissingError';
+	}
+}
+
+export function grokSessionMissingError(): GrokSessionMissingError {
+	return new GrokSessionMissingError();
 }
 
 /** Last ~2 KB of grok stderr included in handshake and process-exit errors. */

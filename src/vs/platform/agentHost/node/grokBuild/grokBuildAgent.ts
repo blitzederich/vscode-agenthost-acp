@@ -67,6 +67,7 @@ import {
 	grokCliMissingError,
 	grokHandshakeTimeoutError,
 	grokNotLoggedInError,
+	GrokSessionMissingError,
 	grokProcessExitedError,
 	grokSessionMissingError,
 	grokUnreadableVersionWarning,
@@ -213,8 +214,24 @@ function mergeRestoredTurns(local: readonly IGrokBuildTurnRecord[], replayed: re
 			byPrompt.set(turn.promptIndex, turn);
 		}
 	}
+	const consumed = new Set<IGrokBuildTurnRecord>();
 	return replayed.map(turn => {
-		const previous = typeof turn.promptIndex === 'number' ? byPrompt.get(turn.promptIndex) : undefined;
+		let previous = typeof turn.promptIndex === 'number' ? byPrompt.get(turn.promptIndex) : undefined;
+		if (previous) {
+			consumed.add(previous);
+		} else {
+			// A prompt that died before grok assigned an index has none locally.
+			// Match it to grok's replayed turn by the user text and adopt that index.
+			previous = local.find(candidate =>
+				!consumed.has(candidate)
+				&& candidate.state === TurnState.Error
+				&& candidate.promptIndex === undefined
+				&& candidate.userText === turn.userText
+			);
+			if (previous) {
+				consumed.add(previous);
+			}
+		}
 		const promptIndex = turn.promptIndex ?? previous?.promptIndex;
 		if (previous?.state === TurnState.Error) {
 			return {
@@ -491,7 +508,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		try {
 			await this._ensureSessionAttached(backing);
 		} catch (err) {
-			if (err instanceof Error && err.message === grokSessionMissingError().message) {
+			if (err instanceof GrokSessionMissingError) {
 				this._dropBacking(chat, decoded.sessionId);
 			}
 			throw err;
@@ -801,7 +818,6 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			}
 		}
 		await this._ensureSessionAttached(backing);
-		backing.turnPromptIndex = this._nextPromptIndex(backing);
 		const client = this._connection?.client;
 		if (!client) {
 			throw grokCliMissingError();
@@ -829,6 +845,9 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			for (const action of mapTurnCompleted(turn, result.stopReason)) {
 				this._fireAction(chat, action);
 			}
+			// The prompt result means grok recorded the turn. Number it only then,
+			// unless an update already carried grok's own promptIndex.
+			this._notePromptAccepted(backing, result._meta);
 			this._finalizeTurn(backing, turn, result.stopReason === 'cancelled' ? TurnState.Cancelled : TurnState.Complete, usage);
 		} catch (err) {
 			// A dead grok process records the turn before this rejection is delivered.
@@ -955,6 +974,22 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		backing.modifiedTime = Date.now();
 	}
 
+	/**
+	 * Remember grok's `promptIndex` once the prompt is in the session.
+	 * A failure before that leaves the index unset, so the next prompt does
+	 * not skip a number grok never recorded.
+	 */
+	private _notePromptAccepted(backing: IGrokBuildChatBacking, meta?: Record<string, unknown>): void {
+		const fromGrok = meta?.promptIndex;
+		if (typeof fromGrok === 'number' && Number.isFinite(fromGrok)) {
+			backing.turnPromptIndex = fromGrok;
+			return;
+		}
+		if (backing.turnPromptIndex === undefined) {
+			backing.turnPromptIndex = this._nextPromptIndex(backing);
+		}
+	}
+
 	private _nextPromptIndex(backing: IGrokBuildChatBacking): number {
 		let max = -1;
 		for (const turn of backing.turns) {
@@ -1057,9 +1092,13 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 					mcpServers: [],
 				});
 				applyModelState(models => this._models.set(models, undefined), this.id, result.models);
+				const modelId = result.models?.currentModelId;
+				if (typeof modelId === 'string' && modelId.length > 0 && !backing.model) {
+					backing.model = { id: modelId };
+				}
 				const history = finishGrokHistoryReplay(replay);
 				backing.turns = mergeRestoredTurns(backing.turns, history.turns);
-				const listedTitle = this._listedTitle(backing.sessionId);
+				const listedTitle = await this._titleForRestore(backing.sessionId);
 				if (listedTitle) {
 					backing.summary = listedTitle;
 				} else if (history.title) {
@@ -1158,15 +1197,25 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		if (cached) {
 			return cached;
 		}
-		if (!this._capabilities.list) {
-			return undefined;
-		}
+		// Capabilities stay empty until the handshake. A check before connect
+		// makes a fresh recoverLegacyChat look like a missing session.
 		await this._ensureConnection();
 		if (!this._capabilities.list) {
 			return undefined;
 		}
 		await this._listSessionPages(undefined);
 		return this._listedSessions.get(sessionId);
+	}
+
+	/** Cached `session/list` title, or one lookup when discovery has not run. */
+	private async _titleForRestore(sessionId: string): Promise<string | undefined> {
+		const cached = this._listedTitle(sessionId);
+		if (cached) {
+			return cached;
+		}
+		const listed = await this._lookupListedSession(sessionId);
+		const title = listed?.title;
+		return typeof title === 'string' && title.trim().length > 0 ? title : undefined;
 	}
 
 	private _listedTitle(sessionId: string): string | undefined {
@@ -1447,6 +1496,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		if (!backing.activeTurnId || !backing.mapState) {
 			return;
 		}
+		this._notePromptAccepted(backing, params.update?._meta);
 		const chunkText = textFromSessionUpdate(params);
 		if (chunkText !== undefined && backing.turnAssistantMarkdown !== undefined) {
 			backing.turnAssistantMarkdown += chunkText;
@@ -1465,6 +1515,9 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			});
 		}
 		const backing = this._backings.get(chatKey(chat));
+		if (backing?.activeTurnId) {
+			this._notePromptAccepted(backing);
+		}
 		const turnId = backing?.activeTurnId ?? generateUuid();
 		const mapped = mapPermissionRequest(chat, turnId, params, backing?.mapState);
 		if (!mapped) {

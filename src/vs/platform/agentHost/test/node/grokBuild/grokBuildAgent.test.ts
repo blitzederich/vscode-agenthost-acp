@@ -636,6 +636,7 @@ suite('GrokBuildAgent', () => {
 		pushUpdate(peer, 'sess-old', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'second answer' } });
 		pushUpdate(peer, 'sess-old', { sessionUpdate: 'session_info_update', title: 'Probe title' });
 		peer.push({ jsonrpc: '2.0', id: load.id, result: {} });
+		await answerSessionList(peer);
 		await materialized;
 
 		const messages = await agent.chats.getMessages(chat, context);
@@ -679,6 +680,7 @@ suite('GrokBuildAgent', () => {
 		assert.strictEqual(load.params.sessionId, 'sess-meta');
 		pushUpdate(peer, 'sess-meta', { sessionUpdate: 'session_info_update', title: 'Restored' });
 		peer.push({ jsonrpc: '2.0', id: load.id, result: {} });
+		await answerSessionList(peer);
 		const metadata = await restoring;
 		assert.strictEqual(metadata?.summary, 'Restored');
 	});
@@ -906,6 +908,7 @@ suite('GrokBuildAgent', () => {
 		assert.deepStrictEqual(load.params, { sessionId: 'sess-crash', cwd: '/tmp/proj', mcpServers: [] });
 		pushLiveHistory(respawned, 'sess-crash', killed);
 		respawned.push({ jsonrpc: '2.0', id: load.id, result: { models: { currentModelId: 'grok-4.7', availableModels: [{ modelId: 'grok-4.7', name: 'Grok 4.7' }] }, configOptions: [] } });
+		await answerSessionList(respawned);
 		const promptAgain = await readNextMessage(respawned.outbound);
 		assert.strictEqual(promptAgain.method, 'session/prompt');
 		assert.strictEqual(promptAgain.params.prompt[0].text, 'after crash');
@@ -1075,6 +1078,7 @@ suite('GrokBuildAgent', () => {
 		assert.strictEqual(load.method, 'session/load');
 		pushLiveHistory(peer, 'sess-replay', trailing);
 		peer.push({ jsonrpc: '2.0', id: load.id, result: {} });
+		await answerSessionList(peer);
 		await materialized;
 
 		const messages = await agent.chats.getMessages(chat, context);
@@ -1086,6 +1090,76 @@ suite('GrokBuildAgent', () => {
 		assert.strictEqual(messages[2].message.text, trailing);
 		assert.strictEqual(messages[2].state, TurnState.Cancelled);
 		assert.strictEqual(markdownOf(messages[2]), '');
+	});
+
+	test('recoverLegacyChat on a fresh agent lists then loads', async () => {
+		const peer = store.add(makeFakePeer());
+		const agent = createAgent();
+		agent.bindTestSpawn(() => ({ transport: peer.transport, onDispose: () => { /* peer owned by the suite */ } }));
+		const sessionId = 'sess-fresh';
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/fresh-recover' });
+		const context = chatContextForSession(chat, sessionId);
+		const recovered = agent.recoverLegacyChat(chat, context);
+		await completeHandshake(peer);
+		const list = await readNextMessage(peer.outbound);
+		assert.strictEqual(list.method, 'session/list');
+		assert.deepStrictEqual(list.params, {});
+		peer.push({
+			jsonrpc: '2.0',
+			id: list.id,
+			result: { sessions: [{ sessionId, cwd: '/tmp/proj', title: 'Fresh title', updatedAt: '2026-01-02T00:00:00.000Z' }] },
+		});
+		const load = await readNextMessage(peer.outbound);
+		assert.strictEqual(load.method, 'session/load');
+		assert.deepStrictEqual(load.params, { sessionId, cwd: '/tmp/proj', mcpServers: [] });
+		peer.push({
+			jsonrpc: '2.0',
+			id: load.id,
+			result: { models: { currentModelId: 'grok-4.7', availableModels: [{ modelId: 'grok-4.7', name: 'Grok 4.7' }] }, configOptions: [] },
+		});
+		const result = await recovered;
+		const decoded = decodeGrokBuildChat(result.providerData);
+		assert.strictEqual(decoded?.sessionId, sessionId);
+		assert.strictEqual(decoded?.cwd, '/tmp/proj');
+		assert.strictEqual(decoded?.model?.id, 'grok-4.7');
+		const metadata = await agent.getChatMetadata(chat, context);
+		assert.strictEqual(metadata?.summary, 'Fresh title');
+		assert.strictEqual(metadata?.model?.id, 'grok-4.7');
+		assert.strictEqual(await readIfAny(peer.outbound), undefined);
+	});
+
+	test('session/load looks up a title when discovery has not run', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client, LIVE_CAPABILITIES);
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/list-title' });
+		const context = chatContext(chat);
+		const materialized = agent.materializeChat(chat, context, encodeGrokBuildChat({ sessionId: 'sess-title', cwd: '/tmp/proj' }));
+		const load = await readNextMessage(peer.outbound);
+		assert.strictEqual(load.method, 'session/load');
+		assert.deepStrictEqual(load.params, { sessionId: 'sess-title', cwd: '/tmp/proj', mcpServers: [] });
+		peer.push({
+			jsonrpc: '2.0',
+			id: load.id,
+			result: { models: { currentModelId: 'grok-4.7', availableModels: [{ modelId: 'grok-4.7', name: 'Grok 4.7' }] } },
+		});
+		const list = await readNextMessage(peer.outbound);
+		assert.strictEqual(list.method, 'session/list');
+		assert.deepStrictEqual(list.params, {});
+		peer.push({
+			jsonrpc: '2.0',
+			id: list.id,
+			result: { sessions: [{ sessionId: 'sess-title', cwd: '/tmp/proj', title: 'From the catalog' }] },
+		});
+		const result = await materialized;
+		assert.ok(result);
+		const decoded = decodeGrokBuildChat(result.providerData);
+		assert.strictEqual(decoded?.model?.id, 'grok-4.7');
+		assert.strictEqual(decoded?.cwd, '/tmp/proj');
+		const metadata = await agent.getChatMetadata(chat, context);
+		assert.strictEqual(metadata?.summary, 'From the catalog');
+		assert.strictEqual(metadata?.model?.id, 'grok-4.7');
 	});
 
 	test('recoverLegacyChat and materializeChat(undefined) load the listed cwd and title', async () => {
@@ -1225,6 +1299,12 @@ suite('GrokBuildAgent', () => {
 		assert.ok(log.warnings.some(message => message === grokUnreadableVersionWarning('garbage')));
 	});
 });
+
+async function answerSessionList(peer: IFakePeer, sessions: readonly object[] = []): Promise<void> {
+	const list = await readNextMessage(peer.outbound);
+	assert.strictEqual(list.method, 'session/list');
+	peer.push({ jsonrpc: '2.0', id: list.id, result: { sessions } });
+}
 
 function pushLiveHistory(peer: IFakePeer, sessionId: string, trailingUser: string): void {
 	const user = (promptIndex: number, text: string) => pushUpdate(peer, sessionId, {
