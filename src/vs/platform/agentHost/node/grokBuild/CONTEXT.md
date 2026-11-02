@@ -70,10 +70,15 @@ Session updates that do not become chat actions: `available_commands_update`
 `session_summary_generated`, `pending_interaction`, `interaction_resolved`,
 plus `_x.ai/*` (including `_x.ai/session/prompt_complete`,
 `_x.ai/mcp_initialized`, and hook events such as `subagent_stop`).
-`plan` updates become `manage_todo_list` tool calls.
+`plan` updates and `todo_write` tool calls become `manage_todo_list` tool
+calls. A turn renders only the first of those two sources.
 
-Live edit permission options (1.0.70): `allow-edits-session` (`allow_always`),
-`allow-once` (`allow_once`), `reject-once` (`reject_once`) — no `reject_always`.
+Live edit permission options (1.0.70): `allow-edits-session` (`allow_always`,
+"allow all edits during this session"), `allow-once` (`allow_once`),
+`reject-once` (`reject_once`). Shell prompts offer `always-allow` /
+`allow-once` / `reject-once` / `reject-always` and never
+`allow-edits-session`. Selecting `allow-edits-session` suppresses every later
+edit prompt in that grok process, so this adapter answers `allow-once`.
 Reject ends the prompt with `stopReason: "cancelled"`.
 
 ## Stages
@@ -83,7 +88,7 @@ Reject ends the prompt with `stopReason: "cancelled"`.
 | **0** | This design doc + IAgent surface table |
 | **1 (MVP)** | ACP client, launch, mapping, create/send/abort/getMessages/materialize, settings, unit tests |
 | **2 (persistence)** | `session/load` / `session/resume`, history → `Turn[]`, `session/list` discovery, crash reload, fixed cwd, `session/close`, stage 1 leftovers. **Implemented** and checked against grok 1.0.70. |
-| **3 (UX)** | Reasoning effort, slash commands, plan updates, plan mode, subagent tool calls, per-chat edit preset, `chat.editor.grokBuild.preferAgentHost`, prompt-error `promptIndex`. **Implemented** in this tree. Items marked "to verify live" were not in the captured 1.0.70 logs. |
+| **3 (UX)** | Reasoning effort, slash commands, plan updates, plan mode, subagent tool calls, per-chat edit preset, prompt-error `promptIndex`. **Implemented** and checked against grok 1.0.70. There is no non-agent-host Grok Build, so the editor has no `preferAgentHost` setting (Claude's precedent, not Codex's). |
 | 4 | Hardening, docs, CI-safe e2e replay. **Deferred** |
 
 ## IAgent / IAgentChats — MVP vs stub
@@ -116,7 +121,7 @@ Reject ends the prompt with `stopReason: "cancelled"`.
 | `onDidSpawnChat` / `onDidDiscoverChats` | **Implemented** | `startChatDiscovery` lists sessions and emits external chats whose ACP session id is not already in memory |
 | `chats` | **Implemented** | See table above |
 | `materializeChat` | **Implemented** | Decodes `{ sessionId, model, cwd, reasoningEffort }` and attaches it with `session/load` or `session/resume`. `providerData === undefined` recovers a discovered session (same path as `recoverLegacyChat`) |
-| `respondToPermissionRequest` | **Implemented** | Maps approve → `allow_once` / deny → `reject_once`. Preset `allowEdits` answers `allow-edits-session` for edits only, before this method runs |
+| `respondToPermissionRequest` | **Implemented** | Maps approve → `allow_once` / deny → `reject_once`. Preset `allowEdits` answers `allow-once` for edit prompts that offer `allow-edits-session`, before this method runs. It never selects `allow-edits-session` |
 | `getOrCreateActiveClient` / `removeActiveClient` | **Implemented** | Minimal in-memory handles |
 | `onClientToolCallComplete` | Stub | No-op |
 | `respondToUserInputRequest` | Stub | No-op |
@@ -170,23 +175,12 @@ Launch argv is unchanged: `--permission-mode` stays `default`. Presets and plan 
 
 | Item | Behavior |
 |------|----------|
-| Reasoning effort | `configOptions` entry `reasoning_effort` (category `thought_level`) becomes the model `thinkingLevel` schema. `changeModel` / create apply it with `session/set_config_option { sessionId, configId: "reasoning_effort", value }`. The value is stored on provider data. After `session/load` or `session/resume`, it is sent again only when grok's `currentValue` differs. |
-| Slash commands | `available_commands_update` with ACP `AvailableCommand` objects (`name`, `description`, optional `input.hint`) becomes a read-only skill directory. The host sends the chosen command as prompt text; this provider forwards that text unchanged. |
-| Plan | ACP `plan` entries become one completed `manage_todo_list` tool call per snapshot (`pending` → `not-started`, `in_progress` → `in-progress`, `completed` → `completed`). The chat todo widget reads that tool's input. A `todo_write` tool call is mapped the same way when its input has `entries`, `todos`, or `todoList`. |
-| Plan mode | Session config `mode` is `interactive` (default) or `plan`, the same picker Codex uses. `plan` calls `session/set_mode { modeId: "plan" }`. `interactive` calls `{ modeId: "default" }`. Neither relaunches the CLI. |
-| Subagents | A tool call whose `_meta["x.ai/tool"].kind` is `subagent` or `task`, or whose name is `spawn_subagent`, is rendered as tool name `task` with `_meta.toolKind: "subagent"`. No child chat is created. `subagent_stop` hook notifications are ignored. Shell and exec are never tagged as subagents. |
-| Permission preset | Chat config `grokPermissionPreset`. Default `ask` ("Ask Every Time") answers nothing. `allowEdits` ("Allow Edits This Session") selects option id `allow-edits-session` for edit kinds only. Shell / exec, including an `allow_always` option with a different id, is never auto-answered. `bypassPermissions`, `dontAsk`, and `auto` are never passed to the CLI. |
-| Editor surfacing | `chat.editor.grokBuild.preferAgentHost` (experimental, default `false`). The Agents window surfaces Grok Build when `chat.agentHost.grokBuildAgent.enabled` is true. The regular workbench also requires this setting, matching Codex. |
-
-### To verify live
-
-Captured 1.0.70 sessions redacted `available_commands_update` (private skill names) and never included a `plan` update, a `session/set_mode` call, a `spawn_subagent` tool call, or a `todo_write` input. These are implemented from the ACP v1 shapes plus the verified facts below, and still need a live check:
-
-- Exact `available_commands_update` payload (spec shape `AvailableCommand[]`; a non-array is ignored).
-- `session/set_mode` mode ids `plan` and `default`. `session/new` returns no `modes`. A live `session/set_mode` returned `{}` without proving the id stuck.
-- `spawn_subagent` / kind `subagent` tool-call payload. The commands tool list names `spawn_subagent` and hooks advertise `subagent_stop`, but no captured `tool_call` used that kind.
-- `todo_write` raw input, if grok sends that tool instead of an ACP `plan` update.
-- Whether grok keeps `reasoning_effort` across `session/load`. The adapter re-applies the persisted value when `currentValue` differs.
+| Reasoning effort | `configOptions` entry `reasoning_effort` (category `thought_level`) becomes the model `thinkingLevel` schema. Live values are `xhigh`, `high`, `medium`, and `low`. The default is `high`. It persists across `session/load` and `session/set_model`. `changeModel` / create apply it with `session/set_config_option { sessionId, configId: "reasoning_effort", value }`. The value is stored on provider data. After `session/load` or `session/resume`, it is sent again only when grok's `currentValue` differs. |
+| Slash commands | `available_commands_update` entries are `{ name, description, input: null \| { hint }, _meta? }`. A non-array is ignored. They become a read-only skill directory. The built-in `always-approve` command ("Toggle always-approve mode (skip all permission prompts)", hint `on\|off`) is omitted. `sendMessage` rejects a prompt whose first token is `/always-approve`, case-insensitive, with or without arguments. Other command text is forwarded unchanged. |
+| Plan | Live turns send both a `todo_write` tool call (`rawInput { todos: [{ id, content, status }], merge }`, `_meta["x.ai/tool"].kind` `"plan"`) and ACP `plan` updates (`entries: [{ content, priority, status }]`). The first source that yields todos owns the turn; the other is dropped, so the widget is not updated three times. Each snapshot is one completed `manage_todo_list` call (`pending` → `not-started`, `in_progress` → `in-progress`, `completed` → `completed`) stamped with `_meta["grokBuild.todoList"]: true`. The chat todo widget reads that marker, not the tool name alone. |
+| Plan mode | Session config `mode` is `interactive` (default) or `plan`, the same picker Codex uses. `session/new` does not include `modes`. `plan` calls `session/set_mode { modeId: "plan" }`. `interactive` calls `{ modeId: "default" }`. The request returns `{}` for any id; plan also emits `current_mode_update { currentModeId: "plan" }`. Neither relaunches the CLI. `appliedModeId` is cleared whenever the loaded connection generation changes, and mode is applied again after every successful `session/load` or `session/resume`. If the chat is in plan mode and `session/set_mode` fails, the prompt fails. |
+| Subagents | A tool call whose `_meta["x.ai/tool"].kind` is `subagent` or `task`, or whose name is `spawn_subagent`, is rendered as tool name `task` with `_meta.toolKind: "subagent"`. Live `spawn_subagent` is `{ name: "spawn_subagent", kind: "task" }` with `rawInput { description, prompt }` (and `background`). No child chat is created. `subagent_stop` hook notifications are ignored. Shell and exec are never tagged as subagents. |
+| Permission preset | Chat config `grokPermissionPreset`. Default `ask` ("Ask Every Time") answers nothing. `allowEdits` ("Allow Edits This Session") selects `allow-once` only when the prompt is an edit and the options include `allow-edits-session`. Shell prompts are never auto-answered. Switching the preset back to `ask` surfaces the next edit prompt. `bypassPermissions`, `dontAsk`, `auto`, and `--always-approve` are never passed to the CLI. |
 
 ### Deferred
 
@@ -196,8 +190,8 @@ Captured 1.0.70 sessions redacted `available_commands_update` (private skill nam
 - `session/delete`.
 - Child subagent chats. Captured traffic has no child session id to attach.
 - Relaunching to change permission mode or plan mode. The argv stays `default`.
+- Plan-mode turns end `cancelled`. grok's `exit_plan_mode` tool reports that plan approval could not be completed because the client disconnected ("Plan approval could not be completed because the client disconnected. Plan mode remains active; the approval will reappear on reconnect."). The prompt result is `stopReason: "cancelled"` with `cancellationCategory: "PermissionCancelled"`. A client capability is missing. Left as-is until that capability exists.
 
 ## Open TODOs
 
 1. **Auth error taxonomy** — auth-required is `-32000` + `/authentication required/i` only. `session/load` `FS_NOT_FOUND` (`-32603`) is the localized missing-session error. Other live failures are `-32602 Invalid params` with detail in `error.data` (`unknown model id`, and similar); already surfaced via `formatAcpError`.
-2. **Live UX check** — confirm the "to verify live" list above against grok 1.0.70 (or newer) with a non-redacted `available_commands_update` and a real plan / subagent turn.

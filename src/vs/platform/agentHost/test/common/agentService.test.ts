@@ -9,7 +9,7 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/c
 import { ConfigurationTarget, IConfigurationChangeEvent, IConfigurationService } from '../../../configuration/common/configuration.js';
 import { COPILOT_TEMPORARY_ALLOW_LOCAL_HARNESS_KEY, thirdPartyAgentEnabledValue } from '../../../policy/common/copilotManagedSettings.js';
 import { AgentSession, GITHUB_COPILOT_PROTECTED_RESOURCE, GITHUB_REPO_PROTECTED_RESOURCE, protectedResourcesRequireGitHubCopilotSignIn } from '../../common/agent.js';
-import { affectsAgentHostProviderPreference, AgentHostClaudeAgentEnabledSettingId, AgentHostCodexAgentEnabledSettingId, AgentHostGrokBuildAgentEnabledSettingId, AgentHostOTelEnvVars, AgentHostOTelPolicyState, buildAgentHostOTelEnv, CodexPreferAgentHostEditorSettingId, GrokBuildPreferAgentHostEditorSettingId, isAgentEnabled, readAgentHostOTelPolicySettings, sanitizeAgentHostOTelPolicySettings, shouldSurfaceLocalAgentHostProvider } from '../../common/agentService.js';
+import { affectsAgentHostProviderPreference, AgentHostClaudeAgentEnabledSettingId, AgentHostCodexAgentEnabledSettingId, AgentHostOTelEnvVars, AgentHostOTelPolicyState, buildAgentHostOTelEnv, CodexPreferAgentHostEditorSettingId, isAgentEnabled, readAgentHostOTelPolicySettings, sanitizeAgentHostOTelPolicySettings, shouldSurfaceLocalAgentHostProvider } from '../../common/agentService.js';
 import type { ProtectedResourceMetadata } from '../../common/state/protocol/state.js';
 import { TestConfigurationService } from '../../../configuration/test/common/testConfigurationService.js';
 
@@ -151,34 +151,6 @@ suite('shouldSurfaceLocalAgentHostProvider', () => {
 			agentsCodex: false,
 			editorCodex: false,
 		});
-	});
-
-	test('surfaces Grok Build in the Agents window when enabled and in the editor only when preferred', () => {
-		const configurationService = new TestConfigurationService({
-			[AgentHostGrokBuildAgentEnabledSettingId]: true,
-			[GrokBuildPreferAgentHostEditorSettingId]: false,
-		});
-		assert.deepStrictEqual({
-			agents: shouldSurfaceLocalAgentHostProvider('grokBuild', configurationService, true),
-			editor: shouldSurfaceLocalAgentHostProvider('grokBuild', configurationService, false),
-		}, { agents: true, editor: false });
-
-		const preferred = new TestConfigurationService({
-			[AgentHostGrokBuildAgentEnabledSettingId]: true,
-			[GrokBuildPreferAgentHostEditorSettingId]: true,
-		});
-		assert.strictEqual(shouldSurfaceLocalAgentHostProvider('grokBuild', preferred, false), true);
-
-		const event: IConfigurationChangeEvent = {
-			source: ConfigurationTarget.USER,
-			affectedKeys: new Set([GrokBuildPreferAgentHostEditorSettingId]),
-			change: { keys: [GrokBuildPreferAgentHostEditorSettingId], overrides: [] },
-			affectsConfiguration: key => key === GrokBuildPreferAgentHostEditorSettingId,
-		};
-		assert.deepStrictEqual({
-			agentsWindow: affectsAgentHostProviderPreference(event, true),
-			editorWindow: affectsAgentHostProviderPreference(event, false),
-		}, { agentsWindow: false, editorWindow: true });
 	});
 
 	test('reacts to Codex enablement changes in both windows', () => {

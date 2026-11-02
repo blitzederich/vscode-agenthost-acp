@@ -5,7 +5,7 @@
 
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { AgentPermissionKind, type IAgentToolPendingConfirmationSignal } from '../../common/agent.js';
-import { toToolCallMeta } from '../../common/meta/agentToolCallMeta.js';
+import { grokBuildTodoListMetaKey, toToolCallMeta } from '../../common/meta/agentToolCallMeta.js';
 import { ActionType, type ChatAction, type SessionAction } from '../../common/state/sessionActions.js';
 import { createErrorResponsePart, MessageKind, ResponsePartKind, ToolCallConfirmationReason, ToolCallStatus, ToolResultContentType, type ToolCallPendingConfirmationState, type ToolCallResult, type UsageInfo } from '../../common/state/sessionState.js';
 import { URI } from '../../../../base/common/uri.js';
@@ -45,6 +45,11 @@ export interface IGrokBuildMapState {
 		completed: boolean;
 	}>;
 	planSnapshots: number;
+	/**
+	 * Live grok emits `todo_write` and ACP `plan` for the same list.
+	 * The first source that produces todos owns the turn.
+	 */
+	todoSource?: 'tool' | 'plan';
 }
 
 export function createGrokBuildMapState(turnId: string): IGrokBuildMapState {
@@ -265,7 +270,15 @@ function toolCallMeta(entry: { readonly toolKind?: 'subagent'; readonly subagent
 }
 
 function mapPlanUpdate(state: IGrokBuildMapState, entries: unknown): (SessionAction | ChatAction)[] {
-	return completedTodoCall(state, undefined, todosFromPlanEntries(entries));
+	if (state.todoSource === 'tool') {
+		return [];
+	}
+	const todos = todosFromPlanEntries(entries);
+	if (todos.length === 0) {
+		return [];
+	}
+	state.todoSource = 'plan';
+	return completedTodoCall(state, undefined, todos);
 }
 
 function completedTodoCall(state: IGrokBuildMapState, toolCallId: string | undefined, todos: readonly IGrokTodoItem[]): (SessionAction | ChatAction)[] {
@@ -289,6 +302,7 @@ function completedTodoCall(state: IGrokBuildMapState, toolCallId: string | undef
 		pastTenseMessage: 'Updated todo list',
 		content: [],
 	};
+	const callMeta = toToolCallMeta({ [grokBuildTodoListMetaKey]: true });
 	return [
 		{
 			type: ActionType.ChatToolCallStart,
@@ -296,6 +310,7 @@ function completedTodoCall(state: IGrokBuildMapState, toolCallId: string | undef
 			toolCallId: id,
 			toolName: GROK_TODO_TOOL_NAME,
 			displayName: 'Update todo list',
+			...(callMeta ? { _meta: callMeta } : {}),
 		},
 		{
 			type: ActionType.ChatToolCallReady,
@@ -304,12 +319,14 @@ function completedTodoCall(state: IGrokBuildMapState, toolCallId: string | undef
 			invocationMessage: 'Update todo list',
 			toolInput: input,
 			confirmed: ToolCallConfirmationReason.NotNeeded,
+			...(callMeta ? { _meta: callMeta } : {}),
 		},
 		{
 			type: ActionType.ChatToolCallComplete,
 			turnId: state.turnId,
 			toolCallId: id,
 			result,
+			...(callMeta ? { _meta: callMeta } : {}),
 		},
 	];
 }
@@ -383,6 +400,10 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 	if (xaiName === 'todo_write' || update.title === 'todo_write') {
 		const todos = todosFromToolInput(update.rawInput);
 		if (todos) {
+			if (state.todoSource === 'plan') {
+				return [];
+			}
+			state.todoSource = 'tool';
 			return completedTodoCall(state, toolCallId, todos);
 		}
 	}

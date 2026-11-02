@@ -9,7 +9,6 @@ import { EventEmitter } from 'events';
 import { PassThrough } from 'stream';
 import { DeferredPromise } from '../../../../../base/common/async.js';
 import { Emitter, Event } from '../../../../../base/common/event.js';
-import { hasKey } from '../../../../../base/common/types.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../../log/common/log.js';
@@ -23,7 +22,7 @@ import {
 } from '../../../node/grokBuild/acpClient.js';
 import { decodeGrokBuildChat, encodeGrokBuildChat } from '../../../node/grokBuild/grokBuildChatBacking.js';
 import { GrokBuildAgent, mergeRestoredTurns } from '../../../node/grokBuild/grokBuildAgent.js';
-import { GROK_PERMISSION_PRESET_ALLOW_EDITS, GROK_PERMISSION_PRESET_KEY, GROK_THINKING_LEVEL_KEY } from '../../../node/grokBuild/grokBuildUx.js';
+import { GROK_PERMISSION_PRESET_ALLOW_EDITS, GROK_PERMISSION_PRESET_ASK, GROK_PERMISSION_PRESET_KEY, GROK_THINKING_LEVEL_KEY, grokAlwaysApproveRejectedError, grokPlanModeFailedError } from '../../../node/grokBuild/grokBuildUx.js';
 import { IAgentConfigurationService, type IAgentChatConfigurationChangeEvent } from '../../../node/agentConfigurationService.js';
 import { SessionConfigKey } from '../../../common/sessionConfigKeys.js';
 import { GROK_BUILD_ACP_ARGV, grokCannotRestoreSessionError, grokNotLoggedInError, grokSessionMissingError, grokUnreadableVersionWarning, grokWorkingDirectoryRejectedError } from '../../../node/grokBuild/grokBuildLaunchConfig.js';
@@ -335,7 +334,7 @@ suite('GrokBuildAgent', () => {
 			},
 		});
 		const created = await createPromise;
-		assert.ok(created && hasKey(created, { providerData: true }) && created.providerData);
+		assert.ok(created?.providerData);
 		assert.ok(agent.models.get().some(m => m.id === 'grok-4.7'));
 
 		peer.push({ jsonrpc: '2.0', method: '_x.ai/queue/changed', params: { sessionId: '01a199cf-f5b0-7ea0-9492-44c99e9e2603' } });
@@ -1472,7 +1471,12 @@ suite('GrokBuildAgent', () => {
 		const updated = Event.toPromise(agent.onDidCustomizationsChange!);
 		pushUpdate(peer, 'sess-commands', {
 			sessionUpdate: 'available_commands_update',
-			availableCommands: [{ name: 'compact', description: 'Compact the conversation', input: { hint: 'instructions' } }],
+			availableCommands: [
+				{ name: 'compact', description: 'Compact the conversation', input: { hint: 'instructions' } },
+				{ name: 'review', description: 'Review the change', input: null },
+				{ name: 'always-approve', description: 'Toggle always-approve mode (skip all permission prompts)', input: { hint: 'on|off' } },
+				{ name: 'Always-Approve', description: 'Toggle always-approve mode (skip all permission prompts)', input: null },
+			],
 		});
 		await updated;
 		const customizations = await agent.getChatCustomizations(chat, context, []);
@@ -1480,7 +1484,27 @@ suite('GrokBuildAgent', () => {
 		assert.ok(directory && directory.type === 'directory');
 		assert.deepStrictEqual(directory.children?.map(child => ({ name: child.name, description: child.type === CustomizationType.Skill ? child.description : undefined })), [
 			{ name: 'compact', description: 'Compact the conversation (instructions)' },
+			{ name: 'review', description: 'Review the change' },
 		]);
+
+		for (const text of ['/always-approve', '/Always-Approve on']) {
+			await assert.rejects(
+				agent.chats.sendMessage(chat, text, [URI.file('/tmp')], undefined, 'turn-blocked', undefined, context),
+				(err: unknown) => {
+					assert.ok(err instanceof Error);
+					assert.strictEqual(err.message, grokAlwaysApproveRejectedError().message);
+					return true;
+				},
+			);
+			assert.strictEqual(await readIfAny(peer.outbound), undefined);
+		}
+
+		const extra = agent.chats.sendMessage(chat, '/always-approve-extra', [URI.file('/tmp')], undefined, 'turn-extra', undefined, context);
+		const extraPrompt = await readNextMessage(peer.outbound);
+		assert.strictEqual(extraPrompt.method, 'session/prompt');
+		assert.strictEqual(extraPrompt.params.prompt[0].text, '/always-approve-extra');
+		peer.push({ jsonrpc: '2.0', id: extraPrompt.id, result: { stopReason: 'end_turn' } });
+		await extra;
 
 		pushUpdate(peer, 'sess-commands', {
 			sessionUpdate: 'available_commands_update',
@@ -1554,6 +1578,81 @@ suite('GrokBuildAgent', () => {
 		peer.push({ jsonrpc: '2.0', id: leave.id, result: {} });
 	});
 
+	test('plan mode is sent again after grok restarts, before the prompt', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent(new NullLogService(), {
+			getChatConfigValues: () => ({ [SessionConfigKey.Mode]: 'plan' }),
+		});
+		agent.bindTestClient(client);
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/plan-restart' });
+		const context = chatContext(chat);
+		const create = agent.chats.createChat(chat, context, {
+			workingDirectories: [URI.file('/tmp')],
+			config: { [SessionConfigKey.Mode]: 'plan' },
+		});
+		const sessionNew = await readNextMessage(peer.outbound);
+		peer.push({ jsonrpc: '2.0', id: sessionNew.id, result: { sessionId: 'sess-plan-restart' } });
+		const setMode = await readNextMessage(peer.outbound);
+		assert.deepStrictEqual(setMode.params, { sessionId: 'sess-plan-restart', modeId: 'plan' });
+		peer.push({ jsonrpc: '2.0', id: setMode.id, result: {} });
+		await create;
+
+		const peer2 = store.add(makeFakePeer());
+		const client2 = store.add(new AcpClient(peer2.transport));
+		agent.bindTestClient(client2, LIVE_CAPABILITIES);
+		const send = agent.chats.sendMessage(chat, 'continue', [URI.file('/tmp')], undefined, 'turn-plan-restart', undefined, context);
+		const load = await readNextMessage(peer2.outbound);
+		assert.strictEqual(load.method, 'session/load');
+		peer2.push({ jsonrpc: '2.0', id: load.id, result: {} });
+		await answerSessionList(peer2);
+		const setModeAgain = await readNextMessage(peer2.outbound);
+		assert.deepStrictEqual(setModeAgain.params, { sessionId: 'sess-plan-restart', modeId: 'plan' });
+		peer2.push({ jsonrpc: '2.0', id: setModeAgain.id, result: {} });
+		const prompt = await readNextMessage(peer2.outbound);
+		assert.strictEqual(prompt.method, 'session/prompt');
+		peer2.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
+		await send;
+	});
+
+	test('a failed plan mode switch after reload fails the prompt', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent(new NullLogService(), {
+			getChatConfigValues: () => ({ [SessionConfigKey.Mode]: 'plan' }),
+		});
+		agent.bindTestClient(client);
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/plan-fail' });
+		const context = chatContext(chat);
+		const create = agent.chats.createChat(chat, context, {
+			workingDirectories: [URI.file('/tmp')],
+			config: { [SessionConfigKey.Mode]: 'plan' },
+		});
+		const sessionNew = await readNextMessage(peer.outbound);
+		peer.push({ jsonrpc: '2.0', id: sessionNew.id, result: { sessionId: 'sess-plan-fail' } });
+		const setMode = await readNextMessage(peer.outbound);
+		peer.push({ jsonrpc: '2.0', id: setMode.id, result: {} });
+		await create;
+
+		const peer2 = store.add(makeFakePeer());
+		const client2 = store.add(new AcpClient(peer2.transport));
+		agent.bindTestClient(client2, LIVE_CAPABILITIES);
+		const send = agent.chats.sendMessage(chat, 'continue', [URI.file('/tmp')], undefined, 'turn-plan-fail', undefined, context);
+		const load = await readNextMessage(peer2.outbound);
+		assert.strictEqual(load.method, 'session/load');
+		peer2.push({ jsonrpc: '2.0', id: load.id, result: {} });
+		await answerSessionList(peer2);
+		const setModeAgain = await readNextMessage(peer2.outbound);
+		assert.strictEqual(setModeAgain.method, 'session/set_mode');
+		peer2.push({ jsonrpc: '2.0', id: setModeAgain.id, error: { code: -32603, message: 'mode rejected' } });
+		await assert.rejects(send, (err: unknown) => {
+			assert.ok(err instanceof Error);
+			assert.strictEqual(err.message, grokPlanModeFailedError().message);
+			return true;
+		});
+		assert.strictEqual(await readIfAny(peer2.outbound), undefined);
+	});
+
 	test('subagent tool kinds render as task calls and shell does not', async () => {
 		const peer = store.add(makeFakePeer());
 		const client = store.add(new AcpClient(peer.transport));
@@ -1598,7 +1697,7 @@ suite('GrokBuildAgent', () => {
 		]);
 	});
 
-	test('the default permission preset never auto-answers and allow-edits is edit-only', async () => {
+	test('the default permission preset never auto-answers and allow-edits selects allow-once', async () => {
 		const peer = store.add(makeFakePeer());
 		const client = store.add(new AcpClient(peer.transport));
 		const agent = createAgent();
@@ -1630,8 +1729,9 @@ suite('GrokBuildAgent', () => {
 
 		const allowPeer = store.add(makeFakePeer());
 		const allowClient = store.add(new AcpClient(allowPeer.transport));
+		let preset: Record<string, unknown> = { [GROK_PERMISSION_PRESET_KEY]: GROK_PERMISSION_PRESET_ALLOW_EDITS };
 		const allowAgent = createAgent(new NullLogService(), {
-			getChatConfigValues: () => ({ [GROK_PERMISSION_PRESET_KEY]: GROK_PERMISSION_PRESET_ALLOW_EDITS }),
+			getChatConfigValues: () => preset,
 		});
 		allowAgent.bindTestClient(allowClient);
 		const allowChat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/preset-edits' });
@@ -1653,7 +1753,21 @@ suite('GrokBuildAgent', () => {
 			},
 		});
 		const auto = await readNextMessage(allowPeer.outbound);
-		assert.deepStrictEqual(auto.result, { outcome: { outcome: 'selected', optionId: 'allow-edits-session' } });
+		assert.deepStrictEqual(auto.result, { outcome: { outcome: 'selected', optionId: 'allow-once' } });
+		allowPeer.push({
+			jsonrpc: '2.0',
+			id: 10,
+			method: 'session/request_permission',
+			params: {
+				sessionId: 'sess-edits',
+				toolCall: { toolCallId: 'edit-no-once', kind: 'edit', _meta: { 'x.ai/tool': { name: 'search_replace', kind: 'edit' } } },
+				options: [LIVE_PERMISSION_OPTIONS[0], LIVE_PERMISSION_OPTIONS[2]],
+			},
+		});
+		assert.strictEqual(await readIfAny(allowPeer.outbound), undefined);
+		allowAgent.respondToPermissionRequest('edit-no-once', false);
+		const missingOnce = await readNextMessage(allowPeer.outbound);
+		assert.deepStrictEqual(missingOnce.result, { outcome: { outcome: 'selected', optionId: 'reject-once' } });
 		allowPeer.push({
 			jsonrpc: '2.0',
 			id: 9,
@@ -1672,6 +1786,21 @@ suite('GrokBuildAgent', () => {
 		allowAgent.respondToPermissionRequest('shell-2', false);
 		const shellDecision = await readNextMessage(allowPeer.outbound);
 		assert.deepStrictEqual(shellDecision.result, { outcome: { outcome: 'selected', optionId: 'reject-once' } });
+		preset = { [GROK_PERMISSION_PRESET_KEY]: GROK_PERMISSION_PRESET_ASK };
+		allowPeer.push({
+			jsonrpc: '2.0',
+			id: 11,
+			method: 'session/request_permission',
+			params: {
+				sessionId: 'sess-edits',
+				toolCall: { toolCallId: 'edit-3', kind: 'edit', _meta: { 'x.ai/tool': { name: 'search_replace', kind: 'edit' } } },
+				options: LIVE_PERMISSION_OPTIONS,
+			},
+		});
+		assert.strictEqual(await readIfAny(allowPeer.outbound), undefined);
+		allowAgent.respondToPermissionRequest('edit-3', true);
+		const asked = await readNextMessage(allowPeer.outbound);
+		assert.deepStrictEqual(asked.result, { outcome: { outcome: 'selected', optionId: 'allow-once' } });
 		allowPeer.push({ jsonrpc: '2.0', id: allowPrompt.id, result: { stopReason: 'end_turn' } });
 		await allowSend;
 	});

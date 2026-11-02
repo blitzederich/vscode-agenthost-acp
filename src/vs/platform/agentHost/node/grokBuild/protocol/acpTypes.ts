@@ -136,9 +136,8 @@ export interface AcpConfigOption {
 }
 
 /**
- * ACP v1 `AvailableCommand`. The captured 1.0.70 `available_commands_update`
- * payloads were redacted, so this is the spec shape. The exact live payload
- * is still to verify.
+ * Live grok 1.0.70 `available_commands_update` entry:
+ * `{ name, description, input: null | { hint }, _meta? }`.
  */
 export interface AcpAvailableCommand {
 	readonly name: string;
@@ -146,7 +145,7 @@ export interface AcpAvailableCommand {
 	readonly input?: { readonly hint?: string } | null;
 }
 
-/** ACP v1 `session/update` plan entry. Not observed in the captured 1.0.70 logs. */
+/** ACP `plan` entry. Live grok 1.0.70 sends `{ content, priority, status }`. */
 export interface AcpPlanEntry {
 	readonly content: string;
 	readonly priority?: 'high' | 'medium' | 'low' | string;
@@ -210,8 +209,9 @@ export interface AcpSessionSetConfigOptionResult {
 }
 
 /**
- * ACP v1 `session/set_mode`. Live grok 1.0.70 returns `{}`. `session/new`
- * does not advertise `modes`, so the mode ids this provider sends are to verify live.
+ * ACP v1 `session/set_mode`. Live grok 1.0.70 returns `{}` for any id.
+ * `session/new` has no `modes`. Plan also emits `current_mode_update`
+ * `{ currentModeId: "plan" }`. This provider sends `plan` and `default`.
  */
 export interface AcpSessionSetModeParams {
 	readonly sessionId: string;
@@ -438,7 +438,7 @@ export interface AcpPlanUpdate extends AcpSessionUpdateBase {
 
 export interface AcpAvailableCommandsUpdate extends AcpSessionUpdateBase {
 	readonly sessionUpdate: 'available_commands_update';
-	/** Spec shape is `AvailableCommand[]`. Captured logs redacted this field. */
+	/** Live entries are `{ name, description, input: null | { hint }, _meta? }`. A non-array is ignored. */
 	readonly availableCommands?: readonly AcpAvailableCommand[] | string | null;
 }
 

@@ -98,11 +98,15 @@ import {
 	type IGrokReplayedTurn,
 } from './grokBuildSessionReplay.js';
 import {
-	allowEditsSessionOptionId,
+	allowEditsOnceOptionId,
 	buildGrokCommandCustomizations,
+	grokAlwaysApproveRejectedError,
 	grokBuildSessionSchema,
+	grokPlanModeFailedError,
 	GROK_PERMISSION_PRESET_ALLOW_EDITS,
+	GROK_PLAN_MODE_ID,
 	GROK_REASONING_CONFIG_ID,
+	isAlwaysApprovePrompt,
 	modeIdForSessionMode,
 	modelWithThinkingLevel,
 	readAvailableCommands,
@@ -158,7 +162,7 @@ interface IGrokBuildChatBacking {
 	modifiedTime: number;
 	workingDirectories?: readonly URI[];
 	turns: IGrokBuildTurnRecord[];
-	/** Connection generation that created or loaded this session. Undefined means it must be restored. */
+	/** Connection generation that created or loaded this session. Undefined means it must be restored. Changing it clears `appliedModeId`. */
 	loadedGeneration?: number;
 	activeTurnId?: string;
 	mapState?: IGrokBuildMapState;
@@ -168,11 +172,11 @@ interface IGrokBuildChatBacking {
 	turnPromptIndex?: number;
 	/** Reasoning effort last applied or adopted from grok. Persisted in provider data. */
 	reasoningEffort?: string;
-	/** ACP available commands for this session. Exact live payload is to verify. */
+	/** ACP available commands for this session. Live entries are `{ name, description, input: null | { hint }, _meta? }`. */
 	commands?: readonly IGrokAvailableCommand[];
 	/** Read at use. Not the URI `get()` returned earlier. */
 	ownerRef?: IAgentChatOwnerRef;
-	/** Last `session/set_mode` id accepted for this chat. */
+	/** Last `session/set_mode` id accepted on the current grok process. Cleared when `loadedGeneration` changes. */
 	appliedModeId?: string;
 	/**
 	 * Cwd to try on the next `session/load` when the backing has none yet.
@@ -852,10 +856,10 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 
 		const backing = this._storeBacking(chat, { sessionId: sessionNew.sessionId, model: modelWithThinkingLevel(model, reasoningEffort), reasoningEffort }, workingDirectories);
 		this._rememberOwner(backing, context);
-		backing.loadedGeneration = this._connectionGeneration;
+		this._setLoadedGeneration(backing, this._connectionGeneration);
 		const modeId = modeIdForSessionMode(options?.config?.[SessionConfigKey.Mode]);
 		if (modeId) {
-			await this._applySessionMode(backing, modeId);
+			await this._applySessionMode(backing, modeId, false);
 		}
 		const providerData = this._persistProviderData(backing);
 		const result: IAgentCreateChatResult = {
@@ -885,6 +889,9 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			resolveAgentChatContext(context, chat);
 		}
 		const backing = this._requireBacking(chat);
+		if (isAlwaysApprovePrompt(prompt)) {
+			throw grokAlwaysApproveRejectedError();
+		}
 		this._rememberOwner(backing, context);
 		const workingDirectories = this._resolveWorkingDirectories(workingDirectoriesOrDirectory);
 		if (workingDirectories && workingDirectories.length > 0) {
@@ -895,6 +902,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			}
 		}
 		await this._ensureSessionAttached(backing);
+		await this._ensurePlanModeForPrompt(backing);
 		const client = this._connection?.client;
 		if (!client) {
 			throw grokCliMissingError();
@@ -1138,8 +1146,17 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 
 	private _invalidateLoadedSessions(): void {
 		for (const backing of this._backings.values()) {
-			backing.loadedGeneration = undefined;
+			this._setLoadedGeneration(backing, undefined);
 		}
+	}
+
+	/** A new grok process does not keep the previous process's mode. */
+	private _setLoadedGeneration(backing: IGrokBuildChatBacking, generation: number | undefined): void {
+		if (backing.loadedGeneration === generation) {
+			return;
+		}
+		backing.loadedGeneration = generation;
+		backing.appliedModeId = undefined;
 	}
 
 	private _ensureSessionAttached(backing: IGrokBuildChatBacking): Promise<void> {
@@ -1238,7 +1255,8 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			backing.workingDirectories = [URI.file(cwd)];
 		}
 		backing.pendingLoadCwd = undefined;
-		backing.loadedGeneration = this._connectionGeneration;
+		this._setLoadedGeneration(backing, this._connectionGeneration);
+		await this._reapplySessionMode(backing);
 	}
 
 	/**
@@ -1758,29 +1776,70 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		const toolMeta = params.toolCall?._meta;
 		const xai = toolMeta?.['x.ai/tool'];
 		const xaiRecord = xai && typeof xai === 'object' ? xai as { kind?: unknown; name?: unknown } : undefined;
-		return allowEditsSessionOptionId(params.options ?? [], {
+		return allowEditsOnceOptionId(params.options ?? [], {
 			kind: typeof xaiRecord?.kind === 'string' ? xaiRecord.kind : params.toolCall?.kind,
 			name: typeof xaiRecord?.name === 'string' ? xaiRecord.name : undefined,
 			permissionKind: entry?.permissionKind,
 		});
 	}
 
-	private async _applySessionMode(backing: IGrokBuildChatBacking, modeId: string): Promise<void> {
+	/**
+	 * `session/set_mode` returns `{}` for any id. A resolved request is treated
+	 * as applied. Plan is required for the next prompt: a failed `set_mode`
+	 * throws {@link grokPlanModeFailedError} when `failIfPlanUnapplied` is set.
+	 * Other modes are logged and left unchanged.
+	 */
+	private async _applySessionMode(backing: IGrokBuildChatBacking, modeId: string, failIfPlanUnapplied: boolean): Promise<void> {
 		if (backing.appliedModeId === modeId) {
 			return;
 		}
+		const fail = failIfPlanUnapplied && modeId === GROK_PLAN_MODE_ID;
 		try {
 			await this._ensureSessionAttached(backing);
+			if (backing.appliedModeId === modeId) {
+				return;
+			}
 			const client = this._connection?.client;
 			if (!client || backing.loadedGeneration !== this._connectionGeneration) {
+				if (fail) {
+					throw grokPlanModeFailedError();
+				}
 				return;
 			}
 			await client.request('session/set_mode', { sessionId: backing.sessionId, modeId });
 			backing.appliedModeId = modeId;
 		} catch (err) {
 			const formatted = formatAcpError(err);
-			this._logService.warn(`[GrokBuild] session/set_mode ${modeId} failed: ${formatted.message}`);
+			const alreadyLocalized = formatted.message === grokPlanModeFailedError().message;
+			if (!alreadyLocalized) {
+				this._logService.warn(`[GrokBuild] session/set_mode ${modeId} failed: ${formatted.message}`);
+			}
+			if (fail) {
+				throw grokPlanModeFailedError();
+			}
 		}
+	}
+
+	/** Chat config is the mode source after `session/load` and `session/resume`. */
+	private async _reapplySessionMode(backing: IGrokBuildChatBacking): Promise<void> {
+		const modeId = modeIdForSessionMode(this._chatConfig(backing)?.[SessionConfigKey.Mode]);
+		if (!modeId) {
+			return;
+		}
+		await this._applySessionMode(backing, modeId, true);
+	}
+
+	/**
+	 * Create and config changes apply plan without failing the caller. The
+	 * prompt retries once the session is on this process, and fails if plan
+	 * still did not stick.
+	 */
+	private async _ensurePlanModeForPrompt(backing: IGrokBuildChatBacking): Promise<void> {
+		const modeId = modeIdForSessionMode(this._chatConfig(backing)?.[SessionConfigKey.Mode]);
+		if (modeId !== GROK_PLAN_MODE_ID || backing.appliedModeId === GROK_PLAN_MODE_ID) {
+			return;
+		}
+		await this._applySessionMode(backing, modeId, true);
 	}
 
 	private _onChatConfigChanged(event: IAgentChatConfigurationChangeEvent): void {
@@ -1799,7 +1858,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			if (owner && owner !== event.session) {
 				continue;
 			}
-			void this._applySessionMode(backing, modeId);
+			void this._applySessionMode(backing, modeId, false);
 		}
 	}
 

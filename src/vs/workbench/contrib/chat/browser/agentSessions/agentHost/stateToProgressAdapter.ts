@@ -22,7 +22,7 @@ import { getTurnError, MessageKind, ToolCallCancellationReason, ToolCallContribu
 import { readAgentPlanReview, type IAgentPlanReview } from '../../../../../../platform/agentHost/common/meta/agentPlanReview.js';
 import { isComputerUseActivationAccepted, readComputerUseActivationCard, readComputerUseSetupCard } from '../../../../../../platform/agentHost/common/meta/computerUse.js';
 import { getToolKind as getProtocolToolKind } from '../../../../../../platform/agentHost/common/state/sessionReducers.js';
-import { copilotCliToolInputContract, readToolCallMeta, readToolCallPresentation, type IAgentToolOutputChunk } from '../../../../../../platform/agentHost/common/meta/agentToolCallMeta.js';
+import { copilotCliToolInputContract, grokBuildTodoListMetaKey, readToolCallMeta, readToolCallPresentation, type IAgentToolOutputChunk } from '../../../../../../platform/agentHost/common/meta/agentToolCallMeta.js';
 import { readImageGenerationToolMetadata } from '../../../../../../platform/agentHost/common/meta/agentImageGenerationMeta.js';
 import { readAttachmentDetail } from '../../../../../../platform/agentHost/common/meta/attachmentMeta.js';
 import { COPILOT_HYDRA_FUSION_MODEL_ID } from '../../../../../../platform/agentHost/common/copilotCliConfig.js';
@@ -2228,8 +2228,9 @@ function completedToolCallConfirmedReason(tc: ICompletedToolCall): NonNullable<I
 	return { type: tc.reason === ToolCallCancellationReason.Skipped ? ToolConfirmKind.Skipped : ToolConfirmKind.Denied };
 }
 
-function buildTodoListToolData(toolName: string, toolInput: Parameters<typeof getInlineToolInput>[0]): IChatTodoListContent | undefined {
-	if (toolName !== 'manage_todo_list') {
+function buildTodoListToolData(tc: { readonly toolName: string; readonly _meta?: Record<string, unknown> }, toolInput: Parameters<typeof getInlineToolInput>[0]): IChatTodoListContent | undefined {
+	// Grok Build stamps this marker. The tool name alone would also match other hosts.
+	if (tc.toolName !== 'manage_todo_list' || readToolCallMeta(tc)[grokBuildTodoListMetaKey] !== true) {
 		return undefined;
 	}
 	const raw = getInlineToolInput(toolInput);
@@ -2326,7 +2327,7 @@ export function completedToolCallToSerialized(tc: ICompletedToolCall, subAgentIn
 		};
 	}
 
-	const todoListData = buildTodoListToolData(tc.toolName, tc.toolInput);
+	const todoListData = buildTodoListToolData(tc, tc.toolInput);
 	let toolSpecificData: IChatTerminalToolInvocationData | IChatSearchToolInvocationData | IChatToolInputInvocationData | IChatSessionTargetData | IChatGeneratedImageData | IChatAutomationConfiguredData | IChatTodoListContent | undefined;
 	if (todoListData) {
 		toolSpecificData = todoListData;
@@ -2903,7 +2904,7 @@ export function toolCallStateToInvocation(tc: ToolCallState, subAgentInvocationI
 		invocation.invocationMessage = addCommentReference(tc, resourceUris) ?? invocation.invocationMessage;
 	}
 
-	const todoListData = tc.status === ToolCallStatus.Streaming ? undefined : buildTodoListToolData(tc.toolName, tc.toolInput);
+	const todoListData = tc.status === ToolCallStatus.Streaming ? undefined : buildTodoListToolData(tc, tc.toolInput);
 	if (todoListData) {
 		invocation.toolSpecificData = todoListData;
 	} else if (isTerminalToolCall(tc)) {

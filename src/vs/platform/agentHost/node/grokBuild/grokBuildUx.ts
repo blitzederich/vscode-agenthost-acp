@@ -29,13 +29,21 @@ export const GROK_PERMISSION_PRESET_KEY = 'grokPermissionPreset';
 export const GROK_PERMISSION_PRESET_ASK = 'ask';
 export const GROK_PERMISSION_PRESET_ALLOW_EDITS = 'allowEdits';
 
-/** Live edit option id. Kind is `allow_always`; shell uses the same kind for a different option id. */
+/**
+ * Present only on edit prompts. Kind is `allow_always` ("allow all edits during
+ * this session") and one selection suppresses every later edit prompt in that
+ * grok process, so this adapter never selects it. Shell prompts do not offer it.
+ */
 export const GROK_ALLOW_EDITS_OPTION_ID = 'allow-edits-session';
 
+/** One-shot edit approval. Auto-answered while the chat preset is `allowEdits`. */
+export const GROK_ALLOW_ONCE_OPTION_ID = 'allow-once';
+
 /**
- * Mode ids passed to `session/set_mode`. `session/new` does not advertise
- * `modes` and a live `session/set_mode` returned `{}`, so both ids are to verify live.
- * Launch argv stays `--permission-mode default`.
+ * Mode ids passed to `session/set_mode`. Live grok 1.0.70: `session/new` has no
+ * `modes`, and `session/set_mode` returns `{}` for any id. Plan also emits
+ * `current_mode_update` `{ currentModeId: "plan" }`. Launch argv stays
+ * `--permission-mode default`.
  */
 export const GROK_PLAN_MODE_ID = 'plan';
 export const GROK_DEFAULT_MODE_ID = 'default';
@@ -168,15 +176,39 @@ export function sameCommands(left: readonly IGrokAvailableCommand[] | undefined,
 	});
 }
 
+/** Built-in grok command that skips every permission prompt. Never advertised or forwarded. */
+const GROK_ALWAYS_APPROVE_COMMAND = 'always-approve';
+
+export function isAlwaysApprovePrompt(prompt: string): boolean {
+	const token = prompt.trim().split(/\s+/, 1)[0];
+	return token?.toLowerCase() === `/${GROK_ALWAYS_APPROVE_COMMAND}`;
+}
+
+export function grokAlwaysApproveRejectedError(): Error {
+	return new Error(localize(
+		'grokBuild.alwaysApproveRejected',
+		"Grok Build does not allow the /always-approve command.",
+	));
+}
+
+export function grokPlanModeFailedError(): Error {
+	return new Error(localize(
+		'grokBuild.planModeFailed',
+		"Grok Build could not switch this chat to plan mode.",
+	));
+}
+
 /**
  * Read-only slash commands. The host invokes a skill by sending its name as
- * prompt text; this provider forwards that text unchanged.
+ * prompt text; this provider forwards that text unchanged. `always-approve`
+ * is grok's "skip all permission prompts" command and is omitted.
  */
 export function buildGrokCommandCustomizations(commands: readonly IGrokAvailableCommand[]): DirectoryCustomization | undefined {
-	if (commands.length === 0) {
+	const visible = commands.filter(command => command.name.toLowerCase() !== GROK_ALWAYS_APPROVE_COMMAND);
+	if (visible.length === 0) {
 		return undefined;
 	}
-	const children = commands.map(command => {
+	const children = visible.map(command => {
 		const uri = URI.from({
 			scheme: AGENT_BUILTIN_CUSTOMIZATION_SCHEME,
 			path: `/grok-build/skill/${encodeURIComponent(command.name)}`,
@@ -279,17 +311,23 @@ export function isEditPermissionTarget(target: IGrokPermissionTarget): boolean {
 }
 
 /**
- * Auto-approve only the live edit option id. Matching `kind: allow_always`
- * would also select the shell "always allow" option.
+ * While the chat preset is `allowEdits`, answer an edit prompt with
+ * `allow-once`. `allow-edits-session` only recognises the prompt: selecting it
+ * suppresses later edit prompts for the life of the grok process. Shell
+ * prompts are never edited here (`isEditPermissionTarget` is false for them)
+ * and they do not offer `allow-edits-session`.
  */
-export function allowEditsSessionOptionId(
+export function allowEditsOnceOptionId(
 	options: readonly { readonly optionId: string }[],
 	target: IGrokPermissionTarget,
 ): string | undefined {
 	if (!isEditPermissionTarget(target)) {
 		return undefined;
 	}
-	return options.find(option => option.optionId === GROK_ALLOW_EDITS_OPTION_ID)?.optionId;
+	if (!options.some(option => option.optionId === GROK_ALLOW_EDITS_OPTION_ID)) {
+		return undefined;
+	}
+	return options.find(option => option.optionId === GROK_ALLOW_ONCE_OPTION_ID)?.optionId;
 }
 
 export function isSubagentTool(kind: string | undefined, name: string | undefined): boolean {
@@ -327,7 +365,7 @@ export function todosFromPlanEntries(entries: unknown): readonly IGrokTodoItem[]
 	return todos;
 }
 
-/** Best-effort read of a `todo_write` tool input. The live shape is to verify. */
+/** `todo_write` raw input on grok 1.0.70: `{ todos: [{ id, content, status }], merge }`. */
 export function todosFromToolInput(rawInput: unknown): readonly IGrokTodoItem[] | undefined {
 	if (!rawInput || typeof rawInput !== 'object') {
 		return undefined;
