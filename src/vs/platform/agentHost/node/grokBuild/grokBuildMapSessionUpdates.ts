@@ -5,9 +5,18 @@
 
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { AgentPermissionKind, type IAgentToolPendingConfirmationSignal } from '../../common/agent.js';
+import { grokBuildTodoListMetaKey, toToolCallMeta } from '../../common/meta/agentToolCallMeta.js';
 import { ActionType, type ChatAction, type SessionAction } from '../../common/state/sessionActions.js';
 import { createErrorResponsePart, MessageKind, ResponsePartKind, ToolCallConfirmationReason, ToolCallStatus, ToolResultContentType, type ToolCallPendingConfirmationState, type ToolCallResult, type UsageInfo } from '../../common/state/sessionState.js';
 import { URI } from '../../../../base/common/uri.js';
+import {
+	GROK_SUBAGENT_TOOL_NAME,
+	GROK_TODO_TOOL_NAME,
+	isSubagentTool,
+	todosFromPlanEntries,
+	todosFromToolInput,
+	type IGrokTodoItem,
+} from './grokBuildUx.js';
 import type {
 	AcpPermissionOption,
 	AcpRequestPermissionParams,
@@ -30,9 +39,17 @@ export interface IGrokBuildMapState {
 		readonly displayName: string;
 		readonly permissionKind: AgentPermissionKind;
 		readonly permissionPath?: string;
+		readonly toolKind?: 'subagent';
+		readonly subagentDescription?: string;
 		started: boolean;
 		completed: boolean;
 	}>;
+	planSnapshots: number;
+	/**
+	 * Live grok emits `todo_write` and ACP `plan` for the same list.
+	 * The first source that produces todos owns the turn.
+	 */
+	todoSource?: 'tool' | 'plan';
 }
 
 export function createGrokBuildMapState(turnId: string): IGrokBuildMapState {
@@ -41,6 +58,7 @@ export function createGrokBuildMapState(turnId: string): IGrokBuildMapState {
 		markdownPartId: undefined,
 		reasoningPartId: undefined,
 		toolCalls: new Map(),
+		planSnapshots: 0,
 	};
 }
 
@@ -73,6 +91,8 @@ export function mapSessionUpdate(
 		case 'tool_call':
 		case 'tool_call_update':
 			return mapToolCall(state, update as AcpToolCallUpdate);
+		case 'plan':
+			return mapPlanUpdate(state, (update as { entries?: unknown }).entries);
 		case 'available_commands_update':
 		case 'session_info_update':
 		case 'config_option_update':
@@ -159,7 +179,8 @@ function mapAgentThoughtChunk(state: IGrokBuildMapState, update: AcpSessionUpdat
 }
 
 function xaiToolMeta(update: AcpToolCallUpdate): AcpXaiToolMeta | undefined {
-	const meta = update._meta?.['x.ai/tool'];
+	const metaBag = update._meta;
+	const meta = metaBag?.['x.ai/tool'];
 	return meta && typeof meta === 'object' ? meta : undefined;
 }
 
@@ -169,12 +190,27 @@ function resolveToolIdentity(update: AcpToolCallUpdate): {
 	permissionKind: AgentPermissionKind;
 	permissionPath?: string;
 	isEdit: boolean;
+	toolKind?: 'subagent';
+	subagentDescription?: string;
 } {
 	const xai = xaiToolMeta(update);
 	const kind = (xai?.kind ?? update.kind ?? '').toLowerCase();
 	const name = xai?.name ?? update.title ?? 'tool';
 	const label = xai?.label ?? update.title ?? name;
 	const path = extractPath(update);
+
+	if (isSubagentTool(kind, typeof name === 'string' ? name : undefined) || name === 'spawn_subagent') {
+		const description = subagentDescription(update) ?? (typeof label === 'string' ? label : name);
+		return {
+			toolName: GROK_SUBAGENT_TOOL_NAME,
+			displayName: typeof label === 'string' ? label : 'Subagent',
+			permissionKind: AgentPermissionKind.CustomTool,
+			permissionPath: path,
+			isEdit: false,
+			toolKind: 'subagent',
+			subagentDescription: typeof description === 'string' ? description : undefined,
+		};
+	}
 
 	if (kind === 'edit' || name === 'search_replace' || name === 'write' || name === 'edit') {
 		return {
@@ -212,6 +248,89 @@ function resolveToolIdentity(update: AcpToolCallUpdate): {
 	};
 }
 
+function subagentDescription(update: AcpToolCallUpdate): string | undefined {
+	const raw = update.rawInput;
+	if (!raw || typeof raw !== 'object') {
+		return undefined;
+	}
+	const record = raw as { prompt?: unknown; description?: unknown; task?: unknown };
+	for (const value of [record.description, record.prompt, record.task]) {
+		if (typeof value === 'string' && value.length > 0) {
+			return value;
+		}
+	}
+	return undefined;
+}
+
+function toolCallMeta(entry: { readonly toolKind?: 'subagent'; readonly subagentDescription?: string }): Record<string, unknown> | undefined {
+	if (entry.toolKind !== 'subagent') {
+		return undefined;
+	}
+	return toToolCallMeta({ toolKind: 'subagent', subagentDescription: entry.subagentDescription });
+}
+
+function mapPlanUpdate(state: IGrokBuildMapState, entries: unknown): (SessionAction | ChatAction)[] {
+	if (state.todoSource === 'tool') {
+		return [];
+	}
+	const todos = todosFromPlanEntries(entries);
+	if (todos.length === 0) {
+		return [];
+	}
+	state.todoSource = 'plan';
+	return completedTodoCall(state, undefined, todos);
+}
+
+function completedTodoCall(state: IGrokBuildMapState, toolCallId: string | undefined, todos: readonly IGrokTodoItem[]): (SessionAction | ChatAction)[] {
+	state.planSnapshots++;
+	const id = toolCallId ?? `plan-${state.planSnapshots}`;
+	if (state.toolCalls.get(id)?.completed) {
+		return [];
+	}
+	state.markdownPartId = undefined;
+	const input = JSON.stringify({ todoList: todos });
+	state.toolCalls.set(id, {
+		toolCallId: id,
+		toolName: GROK_TODO_TOOL_NAME,
+		displayName: 'Update todo list',
+		permissionKind: AgentPermissionKind.Read,
+		started: true,
+		completed: true,
+	});
+	const result: ToolCallResult = {
+		success: true,
+		pastTenseMessage: 'Updated todo list',
+		content: [],
+	};
+	const callMeta = toToolCallMeta({ [grokBuildTodoListMetaKey]: true });
+	return [
+		{
+			type: ActionType.ChatToolCallStart,
+			turnId: state.turnId,
+			toolCallId: id,
+			toolName: GROK_TODO_TOOL_NAME,
+			displayName: 'Update todo list',
+			...(callMeta ? { _meta: callMeta } : {}),
+		},
+		{
+			type: ActionType.ChatToolCallReady,
+			turnId: state.turnId,
+			toolCallId: id,
+			invocationMessage: 'Update todo list',
+			toolInput: input,
+			confirmed: ToolCallConfirmationReason.NotNeeded,
+			...(callMeta ? { _meta: callMeta } : {}),
+		},
+		{
+			type: ActionType.ChatToolCallComplete,
+			turnId: state.turnId,
+			toolCallId: id,
+			result,
+			...(callMeta ? { _meta: callMeta } : {}),
+		},
+	];
+}
+
 function extractPath(update: AcpToolCallUpdate): string | undefined {
 	const raw = update.rawInput;
 	if (raw && typeof raw === 'object') {
@@ -226,7 +345,7 @@ function extractPath(update: AcpToolCallUpdate): string | undefined {
 	if (typeof loc === 'string') {
 		return loc;
 	}
-	const xaiPath = xaiToolMeta(update)?.input?.['path'];
+	const xaiPath = xaiToolMeta(update)?.input?.path;
 	return typeof xaiPath === 'string' ? xaiPath : undefined;
 }
 
@@ -277,9 +396,22 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 		return [];
 	}
 
+	const xaiName = xaiToolMeta(update)?.name;
+	if (xaiName === 'todo_write' || update.title === 'todo_write') {
+		const todos = todosFromToolInput(update.rawInput);
+		if (todos) {
+			if (state.todoSource === 'plan') {
+				return [];
+			}
+			state.todoSource = 'tool';
+			return completedTodoCall(state, toolCallId, todos);
+		}
+	}
+
 	const identity = resolveToolIdentity(update);
 	let entry = state.toolCalls.get(toolCallId);
 	const actions: (SessionAction | ChatAction)[] = [];
+	const meta = () => toolCallMeta(entry!);
 
 	if (!entry) {
 		entry = {
@@ -288,17 +420,21 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 			displayName: identity.displayName,
 			permissionKind: identity.permissionKind,
 			permissionPath: identity.permissionPath,
+			toolKind: identity.toolKind,
+			subagentDescription: identity.subagentDescription,
 			started: false,
 			completed: false,
 		};
 		state.toolCalls.set(toolCallId, entry);
-	} else if (update.title || identity.displayName !== entry.displayName) {
+	} else if (update.title || identity.displayName !== entry.displayName || identity.toolKind) {
 		entry = {
 			...entry,
 			displayName: update.title ?? identity.displayName,
 			permissionPath: identity.permissionPath ?? entry.permissionPath,
 			permissionKind: identity.permissionKind,
-			toolName: identity.isEdit ? 'file_edit' : entry.toolName,
+			toolName: identity.toolKind === 'subagent' ? identity.toolName : identity.isEdit ? 'file_edit' : entry.toolName,
+			toolKind: identity.toolKind ?? entry.toolKind,
+			subagentDescription: identity.subagentDescription ?? entry.subagentDescription,
 		};
 		state.toolCalls.set(toolCallId, entry);
 	}
@@ -308,6 +444,7 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 		// Post-tool assistant text must open a new markdown part.
 		state.markdownPartId = undefined;
 		const input = toolInputText(update);
+		const callMeta = meta();
 		actions.push(
 			{
 				type: ActionType.ChatToolCallStart,
@@ -315,12 +452,14 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 				toolCallId,
 				toolName: entry.toolName,
 				displayName: entry.displayName,
+				...(callMeta ? { _meta: callMeta } : {}),
 			},
 			{
 				type: ActionType.ChatToolCallDelta,
 				turnId: state.turnId,
 				toolCallId,
 				content: input,
+				...(callMeta ? { _meta: callMeta } : {}),
 			},
 			{
 				type: ActionType.ChatToolCallReady,
@@ -329,6 +468,7 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 				invocationMessage: entry.displayName,
 				toolInput: input,
 				confirmed: ToolCallConfirmationReason.NotNeeded,
+				...(callMeta ? { _meta: callMeta } : {}),
 			},
 		);
 	} else if (update.title && update.sessionUpdate === 'tool_call_update') {
@@ -367,11 +507,13 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 			],
 			...(status === 'failed' ? { error: { message: outputText || 'Tool call failed' } } : {}),
 		};
+		const callMeta = meta();
 		actions.push({
 			type: ActionType.ChatToolCallComplete,
 			turnId: state.turnId,
 			toolCallId,
 			result,
+			...(callMeta ? { _meta: callMeta } : {}),
 		});
 	}
 
@@ -424,10 +566,11 @@ export function mapPermissionRequest(
 	params: AcpRequestPermissionParams,
 	state: IGrokBuildMapState | undefined,
 ): { signal: IAgentToolPendingConfirmationSignal; toolCallId: string; options: readonly AcpPermissionOption[] } | undefined {
+	const subjectToolCallId = params.subject?.toolCallId;
 	const toolCallId =
 		params.toolCall?.toolCallId
 		?? params.subject?.toolCall?.toolCallId
-		?? (typeof params.subject?.['toolCallId'] === 'string' ? params.subject['toolCallId'] as string : undefined);
+		?? (typeof subjectToolCallId === 'string' ? subjectToolCallId : undefined);
 	if (!toolCallId) {
 		return undefined;
 	}

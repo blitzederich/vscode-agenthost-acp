@@ -7,6 +7,7 @@ import assert from 'assert';
 import { URI } from '../../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { AgentPermissionKind } from '../../../common/agent.js';
+import { grokBuildTodoListMetaKey } from '../../../common/meta/agentToolCallMeta.js';
 import { chatReducer } from '../../../common/state/protocol/reducers.js';
 import { ActionType, type ChatAction } from '../../../common/state/sessionActions.js';
 import { ChatOriginKind, ResponsePartKind, SessionStatus, type ChatState } from '../../../common/state/sessionState.js';
@@ -243,5 +244,107 @@ suite('GrokBuild mapSessionUpdates', () => {
 		assert.strictEqual(mapped!.toolCallId, 'call-1');
 		assert.strictEqual(selectPermissionOptionId(options, true), 'allow-once');
 		assert.strictEqual(selectPermissionOptionId(options, false), 'reject-once');
+	});
+
+	test('todo_write owns the turn when a plan update follows it', () => {
+		const state = createGrokBuildMapState('turn-1');
+		const tool = mapSessionUpdate(state, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'tool_call',
+				toolCallId: 'todo-1',
+				status: 'completed',
+				title: 'todo_write',
+				rawInput: {
+					todos: [{ id: 'tokenize', content: 'tokenize', status: 'in_progress' }],
+					merge: false,
+				},
+				_meta: { 'x.ai/tool': { name: 'todo_write', kind: 'plan', label: 'Plan' } },
+			},
+		});
+		const plan = mapSessionUpdate(state, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'plan',
+				entries: [
+					{ content: 'tokenize', priority: 'medium', status: 'in_progress' },
+					{ content: 'ship', priority: 'low', status: 'pending' },
+				],
+			},
+		});
+		assert.deepStrictEqual(plan, []);
+		const starts = tool.filter(action => action.type === ActionType.ChatToolCallStart);
+		assert.strictEqual(starts.length, 1);
+		const start = starts[0];
+		if (start.type !== ActionType.ChatToolCallStart) {
+			assert.fail('missing todo tool call');
+		}
+		assert.strictEqual(start.toolName, 'manage_todo_list');
+		assert.strictEqual(start._meta?.[grokBuildTodoListMetaKey], true);
+		const ready = tool.find(action => action.type === ActionType.ChatToolCallReady);
+		if (!ready || ready.type !== ActionType.ChatToolCallReady) {
+			assert.fail('missing todo tool input');
+		}
+		assert.deepStrictEqual(JSON.parse(String(ready.toolInput)), {
+			todoList: [{ id: 'tokenize', title: 'tokenize', status: 'in-progress' }],
+		});
+		assert.strictEqual(ready._meta?.[grokBuildTodoListMetaKey], true);
+	});
+
+	test('plan updates still render when todo_write has not arrived', () => {
+		const state = createGrokBuildMapState('turn-1');
+		const first = mapSessionUpdate(state, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'plan',
+				entries: [{ content: 'tokenize', priority: 'medium', status: 'in_progress' }],
+			},
+		});
+		const second = mapSessionUpdate(state, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'plan',
+				entries: [{ content: 'tokenize', priority: 'medium', status: 'completed' }],
+			},
+		});
+		const laterTool = mapSessionUpdate(state, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'tool_call',
+				toolCallId: 'todo-2',
+				status: 'completed',
+				rawInput: { todos: [{ id: 'tokenize', content: 'tokenize', status: 'completed' }], merge: true },
+				_meta: { 'x.ai/tool': { name: 'todo_write', kind: 'plan' } },
+			},
+		});
+		assert.deepStrictEqual(laterTool, []);
+		const ids = [first, second].map(actions => {
+			const start = actions.find(action => action.type === ActionType.ChatToolCallStart);
+			assert.ok(start && start.type === ActionType.ChatToolCallStart);
+			assert.strictEqual(start.toolName, 'manage_todo_list');
+			assert.strictEqual(start._meta?.[grokBuildTodoListMetaKey], true);
+			return start.toolCallId;
+		});
+		assert.notStrictEqual(ids[0], ids[1]);
+	});
+
+	test('spawn_subagent kind task renders as a subagent task call', () => {
+		const state = createGrokBuildMapState('turn-1');
+		const actions = mapSessionUpdate(state, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'tool_call',
+				toolCallId: 'sub-1',
+				status: 'completed',
+				title: 'Subagent',
+				rawInput: { description: 'List current directory', prompt: 'List the files in this directory.', background: false },
+				_meta: { 'x.ai/tool': { name: 'spawn_subagent', kind: 'task', label: 'Subagent' } },
+			},
+		});
+		const start = actions.find(action => action.type === ActionType.ChatToolCallStart);
+		assert.ok(start && start.type === ActionType.ChatToolCallStart);
+		assert.strictEqual(start.toolName, 'task');
+		assert.strictEqual(start._meta?.toolKind, 'subagent');
+		assert.strictEqual(start._meta?.subagentDescription, 'List current directory');
 	});
 });

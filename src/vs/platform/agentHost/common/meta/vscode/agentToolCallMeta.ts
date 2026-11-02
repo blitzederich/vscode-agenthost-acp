@@ -11,6 +11,9 @@ import { isSandboxPathGrant, type ISandboxPathGrant } from '../../sandboxPathGra
 
 export const copilotCliToolInputContract = 'copilot-cli-v1';
 
+/** Stamped on Grok Build todo snapshots so the widget does not match the tool name alone. */
+export const grokBuildTodoListMetaKey = 'grokBuild.todoList';
+
 /** Anything carrying a tool call's `_meta` bag (persisted state or wire actions). */
 interface IHasToolCallMeta {
 	readonly _meta?: Record<string, unknown>;
@@ -66,6 +69,8 @@ export interface IToolCallMeta {
 	readonly progressMessage?: string;
 	/** Presentation-only Fusion phase, not an SDK tool call or a separately addressable subagent chat. */
 	readonly fusionPhase?: IFusionPhaseMeta;
+	/** Grok Build plan snapshot (`todo_write` or an ACP `plan` update). */
+	readonly [grokBuildTodoListMetaKey]?: true;
 }
 
 const fusionPhaseStatuses = ['running', 'succeeded', 'failed', 'cancelled'] as const;
@@ -80,6 +85,7 @@ const toolCallMetaKeys = [
 	'vscode.sandboxPathGrant',
 	'agentHost.sandboxBypass', 'toolKind', 'language', 'subagentDescription', 'subagentAgentName', 'subagentChatUri',
 	'mcpServerName', 'mcpToolName', 'autoApproveBySetting', 'toolSearchCandidates', 'progressMessage', 'fusionPhase',
+	grokBuildTodoListMetaKey,
 ] as const;
 
 export function hasVSCodeToolCallMeta(source: IHasToolCallMeta): boolean {
@@ -213,6 +219,7 @@ export function readToolCallMeta(source: IHasToolCallMeta): IToolCallMeta {
 	if (toolSearchCandidates) { result.toolSearchCandidates = toolSearchCandidates; }
 	const ui = readToolCallUiMeta(meta.ui);
 	if (ui) { result.ui = ui; }
+	if (meta[grokBuildTodoListMetaKey] === true) { result[grokBuildTodoListMetaKey] = true; }
 	return result;
 }
 

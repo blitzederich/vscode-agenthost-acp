@@ -114,9 +114,48 @@ export interface AcpSessionNewParams {
 	readonly _meta?: Record<string, unknown>;
 }
 
+/**
+ * ACP v1 select option. Live grok 1.0.70 returns these on `session/new` and
+ * `session/load` (`configOptions`), including `reasoning_effort`
+ * (category `thought_level`).
+ */
+export interface AcpConfigSelectOption {
+	readonly value: string;
+	readonly name?: string;
+	readonly description?: string;
+}
+
+export interface AcpConfigOption {
+	readonly id: string;
+	readonly name?: string;
+	readonly category?: string;
+	readonly type?: string;
+	readonly currentValue?: string;
+	readonly options?: readonly AcpConfigSelectOption[];
+	readonly _meta?: Record<string, unknown>;
+}
+
+/**
+ * Live grok 1.0.70 `available_commands_update` entry:
+ * `{ name, description, input: null | { hint }, _meta? }`.
+ */
+export interface AcpAvailableCommand {
+	readonly name: string;
+	readonly description?: string;
+	readonly input?: { readonly hint?: string } | null;
+}
+
+/** ACP `plan` entry. Live grok 1.0.70 sends `{ content, priority, status }`. */
+export interface AcpPlanEntry {
+	readonly content: string;
+	readonly priority?: 'high' | 'medium' | 'low' | string;
+	readonly status?: 'pending' | 'in_progress' | 'completed' | string;
+}
+
 export interface AcpSessionNewResult {
 	readonly sessionId: string;
 	readonly models?: AcpModelState;
+	readonly configOptions?: readonly AcpConfigOption[] | null;
 	readonly _meta?: Record<string, unknown>;
 }
 
@@ -154,6 +193,34 @@ export interface AcpSessionSetModelResult {
 	readonly _meta?: Record<string, unknown> & {
 		readonly model?: { readonly Ok?: string;[key: string]: unknown };
 	};
+}
+
+/** ACP v1 `session/set_config_option`. Live grok 1.0.70 accepts `{ sessionId, configId, value }`. */
+export interface AcpSessionSetConfigOptionParams {
+	readonly sessionId: string;
+	readonly configId: string;
+	readonly value: string;
+	readonly _meta?: Record<string, unknown>;
+}
+
+export interface AcpSessionSetConfigOptionResult {
+	readonly configOptions?: readonly AcpConfigOption[] | null;
+	readonly _meta?: Record<string, unknown>;
+}
+
+/**
+ * ACP v1 `session/set_mode`. Live grok 1.0.70 returns `{}` for any id.
+ * `session/new` has no `modes`. Plan also emits `current_mode_update`
+ * `{ currentModeId: "plan" }`. This provider sends `plan` and `default`.
+ */
+export interface AcpSessionSetModeParams {
+	readonly sessionId: string;
+	readonly modeId: string;
+	readonly _meta?: Record<string, unknown>;
+}
+
+export interface AcpSessionSetModeResult {
+	readonly _meta?: Record<string, unknown>;
 }
 
 export interface AcpSessionCancelParams {
@@ -299,6 +366,8 @@ export type AcpSessionUpdateKind =
 	| 'session_summary_generated'
 	| 'pending_interaction'
 	| 'interaction_resolved'
+	| 'plan'
+	| 'config_option_update'
 	| string;
 
 export interface AcpXaiToolMeta {
@@ -362,12 +431,25 @@ export interface AcpSessionInfoUpdate extends AcpSessionUpdateBase {
 	readonly title?: string;
 }
 
+export interface AcpPlanUpdate extends AcpSessionUpdateBase {
+	readonly sessionUpdate: 'plan';
+	readonly entries?: readonly AcpPlanEntry[];
+}
+
+export interface AcpAvailableCommandsUpdate extends AcpSessionUpdateBase {
+	readonly sessionUpdate: 'available_commands_update';
+	/** Live entries are `{ name, description, input: null | { hint }, _meta? }`. A non-array is ignored. */
+	readonly availableCommands?: readonly AcpAvailableCommand[] | string | null;
+}
+
 export type AcpSessionUpdate =
 	| AcpAgentMessageChunkUpdate
 	| AcpUserMessageChunkUpdate
 	| AcpAgentThoughtChunkUpdate
 	| AcpToolCallUpdate
 	| AcpSessionInfoUpdate
+	| AcpPlanUpdate
+	| AcpAvailableCommandsUpdate
 	| AcpSessionUpdateBase;
 
 export interface AcpSessionUpdateParams {
@@ -385,6 +467,8 @@ export type AcpClientRequestMethod =
 	| 'session/resume'
 	| 'session/list'
 	| 'session/set_model'
+	| 'session/set_config_option'
+	| 'session/set_mode'
 	| 'session/prompt'
 	| 'session/close';
 
@@ -405,6 +489,8 @@ export type AcpClientRequestParams = {
 	'session/resume': AcpSessionResumeParams;
 	'session/list': AcpSessionListParams;
 	'session/set_model': AcpSessionSetModelParams;
+	'session/set_config_option': AcpSessionSetConfigOptionParams;
+	'session/set_mode': AcpSessionSetModeParams;
 	'session/prompt': AcpSessionPromptParams;
 	'session/close': AcpSessionCloseParams;
 };
@@ -417,6 +503,8 @@ export type AcpClientRequestResult = {
 	'session/resume': AcpSessionResumeResult;
 	'session/list': AcpSessionListResult;
 	'session/set_model': AcpSessionSetModelResult;
+	'session/set_config_option': AcpSessionSetConfigOptionResult;
+	'session/set_mode': AcpSessionSetModeResult;
 	'session/prompt': AcpSessionPromptResult;
 	'session/close': unknown;
 };
