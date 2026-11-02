@@ -60,9 +60,37 @@ export interface AcpInitializeParams {
 	readonly _meta?: Record<string, unknown>;
 }
 
+/**
+ * Advertised on `initialize`. Empty objects mean the method is supported.
+ * Omitted and `null` both mean "not advertised" (ACP v1).
+ *
+ * grok 1.0.70 advertises `loadSession: true` and `sessionCapabilities` of
+ * `list`, `resume`, and `close` (each `{}`).
+ */
+export interface AcpAgentCapabilities {
+	readonly loadSession?: boolean;
+	readonly promptCapabilities?: {
+		readonly image?: boolean;
+		readonly audio?: boolean;
+		readonly embeddedContext?: boolean;
+	};
+	readonly mcpCapabilities?: {
+		readonly http?: boolean;
+		readonly sse?: boolean;
+	};
+	readonly sessionCapabilities?: {
+		readonly list?: Record<string, unknown> | null;
+		readonly resume?: Record<string, unknown> | null;
+		readonly close?: Record<string, unknown> | null;
+		readonly additionalDirectories?: Record<string, unknown> | null;
+	} | null;
+	readonly auth?: Record<string, unknown>;
+	readonly _meta?: Record<string, unknown>;
+}
+
 export interface AcpInitializeResult {
 	readonly protocolVersion: number;
-	readonly agentCapabilities?: Record<string, unknown>;
+	readonly agentCapabilities?: AcpAgentCapabilities;
 	readonly authMethods?: readonly AcpAuthMethod[];
 	readonly _meta?: Record<string, unknown> & {
 		readonly agentVersion?: string;
@@ -132,8 +160,84 @@ export interface AcpSessionCancelParams {
 	readonly sessionId: string;
 }
 
+/**
+ * ACP v1 `session/close`. grok 1.0.70 returns success. `_meta["x.ai/closeOutcome"]`
+ * is `"closed"` when the session was resident and `"notResident"` for an
+ * unknown or already-closed session. It does not fail with -32002.
+ */
 export interface AcpSessionCloseParams {
 	readonly sessionId: string;
+	readonly _meta?: Record<string, unknown>;
+}
+
+/**
+ * ACP v1 `session/load`. grok 1.0.70 replays history as `session/update`
+ * notifications before the result and does not emit `session_info_update`.
+ * Replay chunks are whole messages with no `messageId`; turn identity is
+ * `update._meta.promptIndex` (`{ modelId, promptIndex }`). The result is
+ * `{ models, configOptions, _meta }`. `cwd` must be the directory the
+ * session was created with. A different directory, or an unknown session
+ * id, fails with JSON-RPC -32603 `Path not found.` and
+ * `data.code: "FS_NOT_FOUND"`.
+ */
+export interface AcpSessionLoadParams {
+	readonly sessionId: string;
+	readonly cwd: string;
+	readonly mcpServers: readonly unknown[];
+	readonly _meta?: Record<string, unknown>;
+}
+
+export interface AcpSessionLoadResult {
+	readonly models?: AcpModelState;
+	readonly modes?: unknown;
+	readonly configOptions?: readonly unknown[] | null;
+	readonly _meta?: Record<string, unknown>;
+}
+
+/**
+ * ACP v1 `session/resume`. grok 1.0.70 returns `{ models, configOptions, _meta }`
+ * and does not replay history. Params are `{ sessionId, cwd, mcpServers }`.
+ */
+export interface AcpSessionResumeParams {
+	readonly sessionId: string;
+	readonly cwd: string;
+	readonly mcpServers: readonly unknown[];
+	readonly _meta?: Record<string, unknown>;
+}
+
+export interface AcpSessionResumeResult {
+	readonly models?: AcpModelState;
+	readonly modes?: unknown;
+	readonly configOptions?: readonly unknown[] | null;
+	readonly _meta?: Record<string, unknown>;
+}
+
+/**
+ * ACP v1 `session/list`. grok 1.0.70 returns
+ * `{ sessions: [{ sessionId, cwd, title, updatedAt, _meta }], nextCursor? }`.
+ * Pages hold 30 sessions. `nextCursor` is present when another page exists
+ * and absent on the last page. `cwd` is an exact-match filter. A cursor grok
+ * does not recognize restarts at page 1, so callers must stop on a repeated
+ * cursor. An empty string is a valid cursor; `null` ends the list.
+ */
+export interface AcpSessionListParams {
+	readonly cwd?: string;
+	readonly cursor?: string;
+	readonly _meta?: Record<string, unknown>;
+}
+
+export interface AcpSessionInfo {
+	readonly sessionId: string;
+	readonly cwd: string;
+	readonly title?: string | null;
+	readonly updatedAt?: string | null;
+	readonly _meta?: Record<string, unknown> | null;
+}
+
+export interface AcpSessionListResult {
+	readonly sessions?: readonly AcpSessionInfo[];
+	readonly nextCursor?: string | null;
+	readonly _meta?: Record<string, unknown> | null;
 }
 
 export type AcpPermissionOptionKind = 'allow_once' | 'allow_always' | 'reject_once' | 'reject_always' | 'reject' | string;
@@ -224,6 +328,13 @@ export interface AcpSessionUpdateBase {
 export interface AcpAgentMessageChunkUpdate extends AcpSessionUpdateBase {
 	readonly sessionUpdate: 'agent_message_chunk';
 	readonly content: AcpContentBlock;
+	readonly messageId?: string;
+}
+
+export interface AcpUserMessageChunkUpdate extends AcpSessionUpdateBase {
+	readonly sessionUpdate: 'user_message_chunk';
+	readonly content: AcpContentBlock;
+	readonly messageId?: string;
 }
 
 export interface AcpAgentThoughtChunkUpdate extends AcpSessionUpdateBase {
@@ -253,6 +364,7 @@ export interface AcpSessionInfoUpdate extends AcpSessionUpdateBase {
 
 export type AcpSessionUpdate =
 	| AcpAgentMessageChunkUpdate
+	| AcpUserMessageChunkUpdate
 	| AcpAgentThoughtChunkUpdate
 	| AcpToolCallUpdate
 	| AcpSessionInfoUpdate
@@ -264,11 +376,14 @@ export interface AcpSessionUpdateParams {
 	readonly _meta?: Record<string, unknown>;
 }
 
-/** Client → agent request methods used by the MVP. */
+/** Client → agent request methods used by the provider. */
 export type AcpClientRequestMethod =
 	| 'initialize'
 	| 'authenticate'
 	| 'session/new'
+	| 'session/load'
+	| 'session/resume'
+	| 'session/list'
 	| 'session/set_model'
 	| 'session/prompt'
 	| 'session/close';
@@ -286,6 +401,9 @@ export type AcpClientRequestParams = {
 	'initialize': AcpInitializeParams;
 	'authenticate': AcpAuthenticateParams;
 	'session/new': AcpSessionNewParams;
+	'session/load': AcpSessionLoadParams;
+	'session/resume': AcpSessionResumeParams;
+	'session/list': AcpSessionListParams;
 	'session/set_model': AcpSessionSetModelParams;
 	'session/prompt': AcpSessionPromptParams;
 	'session/close': AcpSessionCloseParams;
@@ -295,6 +413,9 @@ export type AcpClientRequestResult = {
 	'initialize': AcpInitializeResult;
 	'authenticate': AcpAuthenticateResult;
 	'session/new': AcpSessionNewResult;
+	'session/load': AcpSessionLoadResult;
+	'session/resume': AcpSessionResumeResult;
+	'session/list': AcpSessionListResult;
 	'session/set_model': AcpSessionSetModelResult;
 	'session/prompt': AcpSessionPromptResult;
 	'session/close': unknown;

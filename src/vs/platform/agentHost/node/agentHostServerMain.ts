@@ -285,6 +285,7 @@ async function main(): Promise<void> {
 			providerService,
 			instantiationService,
 			disposables,
+			logService,
 			onRegistered: () => log('GrokBuildAgent registered'),
 		});
 	}

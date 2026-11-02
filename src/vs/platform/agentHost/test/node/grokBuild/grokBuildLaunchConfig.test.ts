@@ -10,11 +10,17 @@ import { join } from '../../../../../base/common/path.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import {
 	buildGrokBuildLaunchConfig,
+	buildGrokSubprocessEnv,
 	GROK_BUILD_ACP_ARGV,
 	GROK_BUILD_MIN_VERSION,
+	GROK_CLIENT_NAME_ENV,
+	GROK_CLIENT_VERSION_ENV,
 	grokCliMissingError,
+	interpretGrokVersion,
 	isGrokVersionAtLeast,
 	parseGrokVersion,
+	probeGrokBinaryAvailability,
+	resolveGrokBinary,
 	resolveGrokBinaryPath,
 } from '../../../node/grokBuild/grokBuildLaunchConfig.js';
 
@@ -58,6 +64,88 @@ suite('GrokBuild launch config', () => {
 		const resolved = await resolveGrokBinaryPath(missing, { PATH: '' }, tmpdir());
 		assert.strictEqual(resolved, undefined);
 		assert.strictEqual(grokCliMissingError().message.length > 0, true);
+	});
+
+	test('subprocess env copies the host environment except editor and node overrides', () => {
+		const env = buildGrokSubprocessEnv({
+			PATH: '/usr/bin',
+			HOME: '/home/tester',
+			USER: 'tester',
+			XAI_API_KEY: 'test-key',
+			GROK_SANDBOX: '1',
+			GROK_FOO: 'kept',
+			GROK_CLIENT_NAME: 'inherited-name',
+			GROK_CLIENT_VERSION: 'inherited-version',
+			ELECTRON_RUN_AS_NODE: '1',
+			ELECTRON_FOO: '1',
+			VSCODE_FOO: 'secret',
+			NODE_OPTIONS: '--inspect',
+			SSH_AUTH_SOCK: '/tmp/ssh-agent.sock',
+			NODE_EXTRA_CA_CERTS: '/tmp/ca.pem',
+			KUBECONFIG: '/tmp/kubeconfig',
+			SECRET: 'kept-too',
+		}, 'Code - OSS', '1.145.0');
+		assert.strictEqual(env.PATH, '/usr/bin');
+		assert.strictEqual(env.HOME, '/home/tester');
+		assert.strictEqual(env.XAI_API_KEY, 'test-key');
+		assert.strictEqual(env.GROK_SANDBOX, '1');
+		assert.strictEqual(env.GROK_FOO, 'kept');
+		assert.strictEqual(env.SSH_AUTH_SOCK, '/tmp/ssh-agent.sock');
+		assert.strictEqual(env.NODE_EXTRA_CA_CERTS, '/tmp/ca.pem');
+		assert.strictEqual(env.KUBECONFIG, '/tmp/kubeconfig');
+		assert.strictEqual(env.SECRET, 'kept-too');
+		assert.strictEqual(env[GROK_CLIENT_NAME_ENV], 'Code - OSS');
+		assert.strictEqual(env[GROK_CLIENT_VERSION_ENV], '1.145.0');
+		assert.ok(!('ELECTRON_RUN_AS_NODE' in env));
+		assert.ok(!('ELECTRON_FOO' in env));
+		assert.ok(!('VSCODE_FOO' in env));
+		assert.ok(!('NODE_OPTIONS' in env));
+		const launch = buildGrokBuildLaunchConfig('/bin/grok', { ELECTRON_RUN_AS_NODE: '1', VSCODE_AGENT_HOST: '1', SSH_AUTH_SOCK: '/tmp/ssh-agent.sock' }, 'Code - OSS', '1.145.0');
+		assert.deepStrictEqual([...launch.args], [...GROK_BUILD_ACP_ARGV]);
+		assert.strictEqual(launch.env.SSH_AUTH_SOCK, '/tmp/ssh-agent.sock');
+		assert.ok(!('ELECTRON_RUN_AS_NODE' in launch.env));
+		assert.ok(!Object.keys(launch.env).some(key => key.startsWith('VSCODE_')));
+	});
+
+	test('interpretGrokVersion reads the live banner and flags unreadable output', () => {
+		const live = interpretGrokVersion('grok 1.0.70 (f50904eaee6c) [stable]\n', '');
+		assert.strictEqual(live.unreadable, false);
+		assert.strictEqual(live.version, '1.0.70');
+		const weirdExit = interpretGrokVersion('', 'grok 1.0.70 (f50904eaee6c) [stable]');
+		assert.strictEqual(weirdExit.unreadable, false);
+		assert.strictEqual(weirdExit.version, '1.0.70');
+		const garbage = interpretGrokVersion('nope', '');
+		assert.strictEqual(garbage.unreadable, true);
+		assert.strictEqual(garbage.version, undefined);
+	});
+
+	test('resolveGrokBinary rejects an old version, keeps an unreadable banner, and misses an explicit path', async () => {
+		const dir = await fs.mkdtemp(join(tmpdir(), 'grok-ver-'));
+		const oldBinary = join(dir, 'old-grok');
+		const garbageBinary = join(dir, 'garbage-grok');
+		const liveBinary = join(dir, 'live-grok');
+		await fs.writeFile(oldBinary, '#!/bin/sh\nprintf "grok 0.0.1 (abc)\\n"\n', { mode: 0o755 });
+		await fs.writeFile(garbageBinary, '#!/bin/sh\nprintf "nope\\n"\nexit 1\n', { mode: 0o755 });
+		await fs.writeFile(liveBinary, '#!/bin/sh\nprintf "grok 1.0.70 (f50904eaee6c) [stable]\\n"\nexit 1\n', { mode: 0o755 });
+		const missing = join(dir, 'missing-grok');
+		try {
+			await assert.rejects(resolveGrokBinary(oldBinary, { PATH: '' }, dir), /too old/);
+			const unreadable = await resolveGrokBinary(garbageBinary, { PATH: '' }, dir);
+			assert.strictEqual(unreadable.path, garbageBinary);
+			assert.strictEqual(unreadable.versionUnreadable, true);
+			const live = await resolveGrokBinary(liveBinary, { PATH: '' }, dir);
+			assert.strictEqual(live.version, '1.0.70');
+			assert.strictEqual(live.versionUnreadable, undefined);
+			await assert.rejects(resolveGrokBinary(missing, { PATH: '' }, dir), (err: unknown) => {
+				assert.ok(err instanceof Error);
+				assert.strictEqual(err.message, grokCliMissingError().message);
+				return true;
+			});
+			assert.strictEqual(await probeGrokBinaryAvailability(missing, { PATH: '' }, dir), 'explicit-path-missing');
+			assert.strictEqual(await probeGrokBinaryAvailability(liveBinary, { PATH: '' }, dir), 'found');
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
 	});
 
 	test('resolveGrokBinaryPath returns configured path when it exists', async () => {
