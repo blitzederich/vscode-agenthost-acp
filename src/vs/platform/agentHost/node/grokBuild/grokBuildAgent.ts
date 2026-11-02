@@ -4,11 +4,9 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
-import { homedir } from 'os';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { Disposable, DisposableStore, toDisposable } from '../../../../base/common/lifecycle.js';
 import { type IObservable, observableValue } from '../../../../base/common/observable.js';
-import { join } from '../../../../base/common/path.js';
 import { extUri } from '../../../../base/common/resources.js';
 import { URI } from '../../../../base/common/uri.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
@@ -261,13 +259,6 @@ interface IPendingPlanReview {
 	readonly toolCallId: string;
 	readonly questionId: string;
 	resolve(result: AcpServerRequestHandlerResult<AcpExitPlanModeResult>): void;
-}
-
-function grokPlanFileUri(cwd: string | undefined, sessionId: string): string | undefined {
-	if (!cwd) {
-		return undefined;
-	}
-	return URI.file(join(homedir(), '.grok', 'sessions', encodeURIComponent(cwd), sessionId, 'plan.md')).toString();
 }
 
 interface IConnection {
@@ -1912,8 +1903,6 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 
 		const requestId = generateUuid();
 		const questionId = generateUuid();
-		const cwd = backing.workingDirectories?.[0]?.fsPath;
-		const planUri = grokPlanFileUri(cwd, backing.sessionId);
 		const actions: IAgentHostPlanReviewAction[] = [
 			{
 				id: GROK_PLAN_REVIEW_APPROVE_ID,
@@ -1935,7 +1924,6 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 				actions,
 				canProvideFeedback: true,
 				answerQuestionId: questionId,
-				...(planUri ? { planUri } : {}),
 			},
 			questions: [{
 				kind: ChatInputQuestionKind.SingleSelect,

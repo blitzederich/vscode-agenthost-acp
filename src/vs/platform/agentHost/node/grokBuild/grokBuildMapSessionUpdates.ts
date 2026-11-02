@@ -4,11 +4,12 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { generateUuid } from '../../../../base/common/uuid.js';
+import { URI } from '../../../../base/common/uri.js';
+import { localize } from '../../../../nls.js';
 import { AgentPermissionKind, type IAgentToolPendingConfirmationSignal } from '../../common/agent.js';
 import { grokBuildTodoListMetaKey, toToolCallMeta } from '../../common/meta/agentToolCallMeta.js';
 import { ActionType, type ChatAction, type SessionAction } from '../../common/state/sessionActions.js';
 import { createErrorResponsePart, MessageKind, ResponsePartKind, ToolCallConfirmationReason, ToolCallStatus, ToolResultContentType, type ToolCallPendingConfirmationState, type ToolCallResult, type UsageInfo } from '../../common/state/sessionState.js';
-import { URI } from '../../../../base/common/uri.js';
 import {
 	GROK_SUBAGENT_TOOL_NAME,
 	GROK_TODO_TOOL_NAME,
@@ -57,7 +58,7 @@ export interface IGrokBuildMapState {
 }
 
 /** Host display title for grok's `exit_plan_mode` / `_x.ai/exit_plan_mode` tool card. */
-export const GROK_PRESENT_PLAN_DISPLAY_NAME = 'Present plan';
+export const GROK_PRESENT_PLAN_DISPLAY_NAME = localize('grokBuild.tool.presentPlan', "Present plan");
 
 export function createGrokBuildMapState(turnId: string): IGrokBuildMapState {
 	return {
@@ -578,12 +579,15 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 	if ((status === 'completed' || status === 'failed' || status === 'cancelled') && !entry.completed) {
 		entry.completed = true;
 		const contentMessage = textFromToolCallContent(update.content);
-		const outputText = contentMessage
-			?? (update.rawOutput !== undefined
-				? (typeof update.rawOutput === 'string' ? update.rawOutput : (() => { try { return JSON.stringify(update.rawOutput); } catch { return ''; } })())
-				: undefined);
+		const rawOutputText = rawOutputAsText(update.rawOutput);
+		// Prefer ACP content text only for exit_plan cards. Other tools keep
+		// rawOutput (e.g. grep stdout) and fall back to content when absent so
+		// failures still show the nested rejection text instead of "Tool call failed".
+		const outputText = entry.toolKind === 'exit_plan'
+			? (contentMessage ?? rawOutputText)
+			: (rawOutputText ?? contentMessage);
 		const success = status === 'completed';
-		const failureMessage = contentMessage || outputText || 'Tool call failed';
+		const failureMessage = outputText || 'Tool call failed';
 		const resultContent: { type: ToolResultContentType.Text; text: string }[] = [
 			...diffContent,
 			...(entry.planContent && entry.toolKind === 'exit_plan'
@@ -598,7 +602,7 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 			pastTenseMessage: success
 				? (entry.toolKind === 'exit_plan' ? GROK_PRESENT_PLAN_DISPLAY_NAME : entry.displayName)
 				: (status === 'cancelled'
-					? localizeCancelledTool(entry.displayName)
+					? cancelledToolMessage(entry.displayName)
 					: `${entry.displayName} failed`),
 			content: resultContent,
 			...(status === 'failed' ? { error: { message: failureMessage } } : {}),
@@ -616,8 +620,22 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 	return actions;
 }
 
-function localizeCancelledTool(displayName: string): string {
-	return `${displayName} cancelled`;
+function rawOutputAsText(rawOutput: unknown): string | undefined {
+	if (rawOutput === undefined) {
+		return undefined;
+	}
+	if (typeof rawOutput === 'string') {
+		return rawOutput;
+	}
+	try {
+		return JSON.stringify(rawOutput);
+	} catch {
+		return '';
+	}
+}
+
+function cancelledToolMessage(displayName: string): string {
+	return localize('grokBuild.tool.cancelled', "{0} cancelled", displayName);
 }
 
 /**
@@ -638,20 +656,12 @@ export function mapExitPlanContent(
 	if (entry.completed || !planContent) {
 		return [];
 	}
-	return [
-		{
-			type: ActionType.ChatToolCallDelta,
-			turnId: state.turnId,
-			toolCallId,
-			content: planContent,
-		},
-		{
-			type: ActionType.ChatToolCallContentChanged,
-			turnId: state.turnId,
-			toolCallId,
-			content: [{ type: ToolResultContentType.Text, text: planContent }],
-		},
-	];
+	return [{
+		type: ActionType.ChatToolCallContentChanged,
+		turnId: state.turnId,
+		toolCallId,
+		content: [{ type: ToolResultContentType.Text, text: planContent }],
+	}];
 }
 
 /**
@@ -676,7 +686,7 @@ export function mapExitPlanCancelled(
 		toolCallId,
 		result: {
 			success: false,
-			pastTenseMessage: localizeCancelledTool(entry.displayName),
+			pastTenseMessage: cancelledToolMessage(entry.displayName),
 			content,
 		},
 	}];

@@ -390,6 +390,7 @@ suite('GrokBuild mapSessionUpdates', () => {
 
 		const planActions = mapExitPlanContent(state, 'call-exit', '# Ship it');
 		assert.ok(planActions.some(action => action.type === ActionType.ChatToolCallContentChanged));
+		assert.ok(!planActions.some(action => action.type === ActionType.ChatToolCallDelta), 'plan should render once via content, not also as tool input delta');
 		const content = planActions.find(action => action.type === ActionType.ChatToolCallContentChanged);
 		assert.ok(content && content.type === ActionType.ChatToolCallContentChanged);
 		assert.deepStrictEqual(content.content, [{ type: ToolResultContentType.Text, text: '# Ship it' }]);
@@ -422,5 +423,34 @@ suite('GrokBuild mapSessionUpdates', () => {
 		assert.strictEqual(complete.result.success, false);
 		assert.strictEqual(complete.result.error?.message, 'User rejected the execution for tool `search_replace`');
 		assert.ok(complete.result.content?.some(block => block.type === ToolResultContentType.Text && block.text.includes('User rejected')));
+	});
+
+	test('normal tools prefer rawOutput over ACP content text', () => {
+		const state = createGrokBuildMapState('turn-1');
+		mapSessionUpdate(state, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'tool_call',
+				toolCallId: 'call-grep',
+				title: 'grep',
+				rawInput: { pattern: 'foo' },
+				_meta: { 'x.ai/tool': { name: 'grep', kind: 'search', label: 'Grep' } },
+			},
+		});
+		const completed = mapSessionUpdate(state, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'tool_call_update',
+				toolCallId: 'call-grep',
+				status: 'completed',
+				content: [{ type: 'content', content: { type: 'text', text: 'found 40 matches' } }],
+				rawOutput: 'src/a.ts:1:foo\nsrc/b.ts:2:foo\n',
+			},
+		});
+		const complete = completed.find(action => action.type === ActionType.ChatToolCallComplete);
+		assert.ok(complete && complete.type === ActionType.ChatToolCallComplete);
+		assert.strictEqual(complete.result.success, true);
+		assert.ok(complete.result.content?.some(block => block.type === ToolResultContentType.Text && block.text === 'src/a.ts:1:foo\nsrc/b.ts:2:foo\n'));
+		assert.ok(!complete.result.content?.some(block => block.type === ToolResultContentType.Text && block.text === 'found 40 matches'));
 	});
 });
