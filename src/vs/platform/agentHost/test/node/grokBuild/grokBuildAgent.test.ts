@@ -22,10 +22,10 @@ import {
 } from '../../../node/grokBuild/acpClient.js';
 import { decodeGrokBuildChat, encodeGrokBuildChat } from '../../../node/grokBuild/grokBuildChatBacking.js';
 import { GrokBuildAgent, mergeRestoredTurns } from '../../../node/grokBuild/grokBuildAgent.js';
-import { GROK_PERMISSION_PRESET_ALLOW_EDITS, GROK_PERMISSION_PRESET_ASK, GROK_PERMISSION_PRESET_KEY, GROK_THINKING_LEVEL_KEY, grokPlanModeFailedError, grokSlashCommandRejectedError } from '../../../node/grokBuild/grokBuildUx.js';
+import { GROK_PERMISSION_PRESET_ALLOW_EDITS, GROK_PERMISSION_PRESET_ASK, GROK_PERMISSION_PRESET_KEY, GROK_THINKING_LEVEL_KEY, grokPathPrefixRejectedError, grokPlanModeFailedError, grokSlashCommandRejectedError, grokSlashCommandsUnavailableError } from '../../../node/grokBuild/grokBuildUx.js';
 import { IAgentConfigurationService, type IAgentChatConfigurationChangeEvent } from '../../../node/agentConfigurationService.js';
 import { SessionConfigKey } from '../../../common/sessionConfigKeys.js';
-import { GROK_BUILD_ACP_ARGV, grokCannotRestoreSessionError, grokNotLoggedInError, grokSessionMissingError, grokUnreadableVersionWarning, grokWorkingDirectoryRejectedError } from '../../../node/grokBuild/grokBuildLaunchConfig.js';
+import { GROK_BUILD_ACP_ARGV, grokCannotRestoreSessionError, grokCliMissingError, grokCliNotExecutableError, grokHandshakeTimeoutError, grokNotLoggedInError, grokSessionMissingError, grokUnreadableVersionWarning, grokVersionTooOldError, grokWorkingDirectoryRejectedError } from '../../../node/grokBuild/grokBuildLaunchConfig.js';
 import type { AcpAgentCapabilities } from '../../../node/grokBuild/protocol/acpTypes.js';
 
 class TestProductService {
@@ -54,8 +54,9 @@ interface IFakeChild {
 interface IFakePeer {
 	readonly transport: IAcpTransport;
 	readonly outbound: PassThrough;
-	readonly child: IFakeChild;
+	readonly child: EventEmitter & IFakeChild;
 	push(message: object): void;
+	pushRaw(text: string): void;
 	writeStderr(text: string): void;
 	exit(code: number | null, signal: NodeJS.Signals | null): void;
 	dispose(): void;
@@ -125,6 +126,9 @@ function makeFakePeer(): IFakePeer {
 		push(message: object) {
 			clientStdout.write(JSON.stringify(message) + '\n');
 		},
+		pushRaw(text: string) {
+			clientStdout.write(text);
+		},
 		writeStderr(text: string) {
 			stderr.write(text);
 		},
@@ -145,9 +149,13 @@ function makeFakePeer(): IFakePeer {
 }
 
 class CapturingLogService extends NullLogService {
+	readonly infos: string[] = [];
 	readonly warnings: string[] = [];
 	readonly errors: string[] = [];
 	readonly traces: string[] = [];
+	override info(message: string): void {
+		this.infos.push(message);
+	}
 	override warn(message: string): void {
 		this.warnings.push(message);
 	}
@@ -156,6 +164,11 @@ class CapturingLogService extends NullLogService {
 	}
 	override trace(message: string): void {
 		this.traces.push(message);
+	}
+
+	/** Info and above. That is the default log level (`LogLevel.Info`). */
+	defaultLevelText(): string {
+		return [...this.infos, ...this.warnings, ...this.errors].join('\n');
 	}
 }
 
@@ -987,6 +1000,177 @@ suite('GrokBuildAgent', () => {
 		assert.strictEqual(spawnCount, 2);
 	});
 
+	test('a missing or old grok binary fails before spawn with a localized message', async () => {
+		const missing = createAgent();
+		let missingSpawns = 0;
+		missing.bindTestBinaryResolver(async () => {
+			throw grokCliMissingError();
+		});
+		missing.bindTestSpawn(() => {
+			missingSpawns++;
+			throw new Error('spawned');
+		});
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/missing-bin' });
+		await assert.rejects(
+			missing.chats.createChat(chat, chatContext(chat), { workingDirectories: [URI.file('/tmp')] }),
+			(err: unknown) => {
+				assert.ok(err instanceof Error);
+				assert.strictEqual(err.message, grokCliMissingError().message);
+				return true;
+			},
+		);
+		assert.strictEqual(missingSpawns, 0);
+
+		const old = createAgent();
+		let oldSpawns = 0;
+		old.bindTestBinaryResolver(async () => {
+			throw grokVersionTooOldError('1.0.69');
+		});
+		old.bindTestSpawn(() => {
+			oldSpawns++;
+			throw new Error('spawned');
+		});
+		const chatOld = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/old-bin' });
+		await assert.rejects(
+			old.chats.createChat(chatOld, chatContext(chatOld), { workingDirectories: [URI.file('/tmp')] }),
+			(err: unknown) => {
+				assert.ok(err instanceof Error);
+				assert.strictEqual(err.message, grokVersionTooOldError('1.0.69').message);
+				return true;
+			},
+		);
+		assert.strictEqual(oldSpawns, 0);
+	});
+
+	test('spawn ENOENT and EACCES use localized messages and exit 127 does too', async () => {
+		const enoent = store.add(makeFakePeer());
+		const agent = createAgent();
+		agent.bindTestSpawn(() => ({ transport: enoent.transport, child: enoent.child as unknown as ChildProcessWithoutNullStreams }));
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/enoent' });
+		const create = agent.chats.createChat(chat, chatContext(chat), { workingDirectories: [URI.file('/tmp')] });
+		await readNextMessage(enoent.outbound);
+		const missing = Object.assign(new Error('spawn grok ENOENT'), { code: 'ENOENT' });
+		enoent.child.emit('error', missing);
+		await assert.rejects(create, (err: unknown) => {
+			assert.ok(err instanceof Error);
+			assert.strictEqual(err.message, grokCliMissingError().message);
+			return true;
+		});
+
+		const eacces = store.add(makeFakePeer());
+		const agentAccess = createAgent();
+		agentAccess.bindTestSpawn(() => ({ transport: eacces.transport, child: eacces.child as unknown as ChildProcessWithoutNullStreams }));
+		const createAccess = agentAccess.chats.createChat(
+			URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/eacces' }),
+			chatContext(URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/eacces' })),
+			{ workingDirectories: [URI.file('/tmp')] },
+		);
+		await readNextMessage(eacces.outbound);
+		eacces.child.stdin.emit('error', Object.assign(new Error('EACCES'), { code: 'EACCES' }));
+		await assert.rejects(createAccess, (err: unknown) => {
+			assert.ok(err instanceof Error);
+			assert.strictEqual(err.message, grokCliNotExecutableError().message);
+			return true;
+		});
+
+		const exited = store.add(makeFakePeer());
+		const agentExit = createAgent();
+		agentExit.bindTestSpawn(() => ({ transport: exited.transport, child: exited.child as unknown as ChildProcessWithoutNullStreams }));
+		const createExit = agentExit.chats.createChat(
+			URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/exit127' }),
+			chatContext(URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/exit127' })),
+			{ workingDirectories: [URI.file('/tmp')] },
+		);
+		await readNextMessage(exited.outbound);
+		exited.exit(127, null);
+		await assert.rejects(createExit, (err: unknown) => {
+			assert.ok(err instanceof Error);
+			assert.ok(err.message.startsWith(grokCliMissingError().message));
+			return true;
+		});
+	});
+
+	test('initialize timeout is localized and does not reject the abandoned request later', async () => {
+		const peer = store.add(makeFakePeer());
+		const agent = createAgent();
+		agent.bindTestHandshakeTimeout(30);
+		agent.bindTestSpawn(() => ({ transport: peer.transport, child: peer.child as unknown as ChildProcessWithoutNullStreams }));
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => unhandled.push(reason);
+		process.on('unhandledRejection', onUnhandled);
+		try {
+			const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/timeout' });
+			await assert.rejects(
+				agent.chats.createChat(chat, chatContext(chat), { workingDirectories: [URI.file('/tmp')] }),
+				(err: unknown) => {
+					assert.ok(err instanceof Error);
+					assert.strictEqual(err.message, grokHandshakeTimeoutError('initialize').message);
+					return true;
+				},
+			);
+			await new Promise(resolve => setTimeout(resolve, 40));
+			assert.deepStrictEqual(unhandled, []);
+		} finally {
+			process.off('unhandledRejection', onUnhandled);
+		}
+	});
+
+	test('stderr and ACP payloads do not log authenticate results, skill names, or MCP names', async () => {
+		const log = new CapturingLogService();
+		const peer = store.add(makeFakePeer());
+		const agent = createAgent(log);
+		agent.bindTestSpawn(() => ({ transport: peer.transport, child: peer.child as unknown as ChildProcessWithoutNullStreams }));
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/redact' });
+		const context = chatContext(chat);
+		const create = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp')] });
+		const init = await readNextMessage(peer.outbound);
+		peer.push({ jsonrpc: '2.0', id: init.id, result: { protocolVersion: 1, agentCapabilities: LIVE_CAPABILITIES } });
+		const auth = await readNextMessage(peer.outbound);
+		assert.strictEqual(auth.method, 'authenticate');
+		peer.push({
+			jsonrpc: '2.0',
+			id: auth.id,
+			result: { _meta: { email: 'ada@example.com', team: 'xai-team', tier: 'super' } },
+		});
+		const sessionNew = await readNextMessage(peer.outbound);
+		peerPushSession(peer, sessionNew.id, 'sess-redact');
+		await create;
+
+		peer.pushRaw('not-json {"email":"ada@example.com","team":"xai-team","tier":"super"}\n');
+		const updated = Event.toPromise(agent.onDidCustomizationsChange!);
+		pushUpdate(peer, 'sess-redact', {
+			sessionUpdate: 'available_commands_update',
+			availableCommands: [{ name: 'secret-skill-name', description: 'hidden skill', input: null }],
+		});
+		await updated;
+		peer.push({
+			jsonrpc: '2.0',
+			method: '_x.ai/mcp/server',
+			params: { name: 'secret-mcp-server', serverName: 'secret-mcp-server' },
+		});
+		peer.writeStderr('auth {"email":"ada@example.com","team":"xai-team","tier":"super"} skill=secret-skill-name mcp=secret-mcp-server\n');
+		await new Promise(resolve => setTimeout(resolve, 20));
+
+		const secret = /ada@example\.com|xai-team|secret-skill-name|secret-mcp-server/;
+		assert.ok(!secret.test(log.defaultLevelText()), log.defaultLevelText());
+		assert.ok(!/ada@example\.com|xai-team|"tier"/.test(log.traces.join('\n')), log.traces.join('\n'));
+		assert.ok(log.errors.some(message => message.includes('parse error on ACP line')));
+		assert.ok(log.traces.some(message => message.includes('secret-skill-name') || message.includes('[GrokBuild stderr]')));
+
+		const send = agent.chats.sendMessage(chat, 'hi', [URI.file('/tmp')], undefined, 'turn-redact', undefined, context);
+		const prompt = await readNextMessage(peer.outbound);
+		assert.strictEqual(prompt.method, 'session/prompt');
+		peer.exit(1, null);
+		await assert.rejects(send, (err: unknown) => {
+			assert.ok(err instanceof Error);
+			assert.ok(!/ada@example\.com|xai-team/.test(err.message));
+			assert.match(err.message, /secret-skill-name/);
+			return true;
+		});
+		assert.ok(!secret.test(log.defaultLevelText()), log.defaultLevelText());
+		assert.ok(!/ada@example\.com/.test([...log.infos, ...log.warnings, ...log.errors, ...log.traces].join('\n')));
+	});
+
 	test('session/close is sent on dispose and release when advertised', async () => {
 		const peer = store.add(makeFakePeer());
 		const client = store.add(new AcpClient(peer.transport));
@@ -1479,7 +1663,24 @@ suite('GrokBuildAgent', () => {
 			);
 			assert.strictEqual(await readIfAny(peer.outbound), undefined);
 		};
-		await rejectSlash('/compact', 'compact');
+		await assert.rejects(
+			agent.chats.sendMessage(chat, '/compact', [URI.file('/tmp')], undefined, 'turn-blocked', undefined, context),
+			(err: unknown) => {
+				assert.ok(err instanceof Error);
+				assert.strictEqual(err.message, grokSlashCommandsUnavailableError().message);
+				return true;
+			},
+		);
+		assert.strictEqual(await readIfAny(peer.outbound), undefined);
+		await assert.rejects(
+			agent.chats.sendMessage(chat, '/Users/x/a.ts explain', [URI.file('/tmp')], undefined, 'turn-path', undefined, context),
+			(err: unknown) => {
+				assert.ok(err instanceof Error);
+				assert.strictEqual(err.message, grokPathPrefixRejectedError().message);
+				return true;
+			},
+		);
+		assert.strictEqual(await readIfAny(peer.outbound), undefined);
 
 		const denied = ['always-approve', 'yolo', 'auto', 'plugins', 'plugin', 'reload-plugins', 'feedback', 'statusline', 'hooks-trust', 'hooks-add', 'settings', 'YOLO'];
 		const updated = Event.toPromise(agent.onDidCustomizationsChange!);
@@ -1488,6 +1689,8 @@ suite('GrokBuildAgent', () => {
 			availableCommands: [
 				{ name: 'compact', description: 'Compact the conversation', input: { hint: 'instructions' } },
 				{ name: 'review', description: 'Review the change', input: null },
+				{ name: 'bundled:imagine', description: 'Imagine', input: null },
+				{ name: 'yolo:on', description: 'must stay hidden', input: null },
 				...denied.map(name => ({ name, description: name, input: null })),
 			],
 		});
@@ -1498,15 +1701,27 @@ suite('GrokBuildAgent', () => {
 		assert.deepStrictEqual(directory.children?.map(child => ({ name: child.name, description: child.type === CustomizationType.Skill ? child.description : undefined })), [
 			{ name: 'compact', description: 'Compact the conversation (instructions)' },
 			{ name: 'review', description: 'Review the change' },
+			{ name: 'bundled:imagine', description: 'Imagine' },
 		]);
 
 		await rejectSlash('/yolo', 'yolo');
 		await rejectSlash('/YOLO', 'YOLO');
 		await rejectSlash('  /yolo', 'yolo');
+		await rejectSlash('/yolo:on', 'yolo');
 		await rejectSlash('/always-approve on', 'always-approve');
+		await rejectSlash('/always-approve:on', 'always-approve');
 		await rejectSlash('/plugins trust', 'plugins');
 		await rejectSlash('/auto', 'auto');
 		await rejectSlash('/foo', 'foo');
+		await assert.rejects(
+			agent.chats.sendMessage(chat, '/Users/x/a.ts explain', [URI.file('/tmp')], undefined, 'turn-path-2', undefined, context),
+			(err: unknown) => {
+				assert.ok(err instanceof Error);
+				assert.strictEqual(err.message, grokPathPrefixRejectedError().message);
+				return true;
+			},
+		);
+		assert.strictEqual(await readIfAny(peer.outbound), undefined);
 
 		pushUpdate(peer, 'sess-commands', {
 			sessionUpdate: 'available_commands_update',
@@ -1516,7 +1731,7 @@ suite('GrokBuildAgent', () => {
 		const afterRedaction = await agent.getChatCustomizations(chat, context, []);
 		assert.strictEqual(afterRedaction.find(entry => entry.type === 'directory')?.type, 'directory');
 
-		for (const text of ['/compact now', 'note\n/always-approve', 'hello']) {
+		for (const text of ['/compact now', '/bundled:imagine', '/Bundled:Imagine draw', 'note\n/always-approve', 'hello']) {
 			const send = agent.chats.sendMessage(chat, text, [URI.file('/tmp')], undefined, 'turn-cmd', undefined, context);
 			const prompt = await readNextMessage(peer.outbound);
 			assert.strictEqual(prompt.method, 'session/prompt');

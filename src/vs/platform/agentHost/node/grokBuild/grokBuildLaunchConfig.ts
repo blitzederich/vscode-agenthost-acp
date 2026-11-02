@@ -69,6 +69,44 @@ export function grokCliMissingError(): Error {
 	));
 }
 
+/** Spawn failed because the resolved path is not executable. */
+export function grokCliNotExecutableError(): Error {
+	return new Error(nls.localize(
+		'grokBuild.cliNotExecutable',
+		"The Grok CLI could not be started. Check that `grok` is installed and executable (https://x.ai/cli).",
+	));
+}
+
+/**
+ * Map a spawn `error` event onto a localized message. `ENOENT` is a missing
+ * binary; `EACCES` / `EPERM` is a path that exists but cannot be executed.
+ * Other codes return undefined so the caller keeps the original error.
+ */
+export function grokSpawnFailureError(error: unknown): Error | undefined {
+	const code = error && typeof error === 'object' && 'code' in error ? (error as { code?: unknown }).code : undefined;
+	if (code === 'ENOENT' || code === 'ENOTDIR') {
+		return grokCliMissingError();
+	}
+	if (code === 'EACCES' || code === 'EPERM') {
+		return grokCliNotExecutableError();
+	}
+	return undefined;
+}
+
+/** Process exit 127: command not found. Exit 126: not executable. */
+export function grokExitStatusError(code: number | null, signal: NodeJS.Signals | null, stderrTail: string): Error | undefined {
+	if (signal) {
+		return undefined;
+	}
+	if (code === 127) {
+		return new Error(withStderrTail(grokCliMissingError().message, stderrTail));
+	}
+	if (code === 126) {
+		return new Error(withStderrTail(grokCliNotExecutableError().message, stderrTail));
+	}
+	return undefined;
+}
+
 /**
  * Localized error when ACP authentication fails / user is not logged in.
  * Never reads `~/.grok/auth.json`.
@@ -144,12 +182,35 @@ export function appendStderrTail(previous: string, chunk: string, max: number = 
 }
 
 export function withStderrTail(message: string, stderrTail: string): string {
-	const tail = stderrTail.trim();
+	const tail = redactGrokAuthenticateText(stderrTail).trim();
 	if (!tail) {
 		return message;
 	}
 	const clipped = tail.length > GROK_STDERR_TAIL_MAX ? tail.slice(tail.length - GROK_STDERR_TAIL_MAX) : tail;
 	return `${message}\n${clipped}`;
+}
+
+/**
+ * Authenticate results carry email, team, and tier. Strip those fields and
+ * any email address before the text is logged or attached to an error.
+ * Skill names and MCP server names are not redacted here; callers must not
+ * write ACP payloads at the default log level.
+ */
+const GROK_AUTHENTICATE_FIELD = /"(email|team|tier|teamId|teamName|subscriptionTier)"\s*:\s*(?:"(?:\\.|[^"\\])*"|-?\d+(?:\.\d+)?|true|false|null)/gi;
+const GROK_EMAIL = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+
+export function redactGrokAuthenticateText(text: string): string {
+	if (!text) {
+		return text;
+	}
+	const withoutObject = text.replace(/\{[^{}]*"(?:email|team|tier|teamId|teamName|subscriptionTier)"[^{}]*\}/gi, '[redacted-authenticate]');
+	return withoutObject.replace(GROK_AUTHENTICATE_FIELD, '"$1":"[redacted]"').replace(GROK_EMAIL, '[redacted-email]');
+}
+
+/** First line of an error. Stderr tails stay off the default log level. */
+export function grokLogSummary(message: string): string {
+	const line = message.split('\n', 1)[0] ?? message;
+	return redactGrokAuthenticateText(line);
 }
 
 export function grokUnreadableVersionWarning(output: string | undefined): string {

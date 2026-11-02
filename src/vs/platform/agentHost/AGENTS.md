@@ -3,7 +3,8 @@
   Living spec — keep in sync with code after each significant change.
   See: node/agentService.ts, node/agentHostStateManager.ts,
        node/claude/claudeAgent.ts, node/copilot/copilotAgent.ts,
-       node/codex/codexAgent.ts, node/agentSideEffects.ts,
+       node/codex/codexAgent.ts, node/grokBuild/grokBuildAgent.ts,
+       node/agentSideEffects.ts,
        common/agent.ts (IAgent, IAgentChats, IAgentCapabilities),
        common/agentService.ts (IAgentService, IAgentConnection).
 -->
@@ -47,7 +48,7 @@ The word **session** means two different things depending on which side of the s
 | Where | What `session` means | Notes |
 |-------|----------------------|-------|
 | AHP wire protocol (`common/state/protocol/`) and the orchestrator (`AgentService`, `AgentHostStateManager`) | The **AH session** — the protocol-visible grouping of a default chat plus its peer chats. | This is the vocabulary the generated protocol types pin (`SessionState`, `SessionSummary`, `sessionAdded`, ...); it is immutable and authoritative. |
-| Inside an agent harness (`node/claude`, `node/copilot`, `node/codex`) | The agent's **own SDK / provider session** — the provider's native concept (Codex calls it a *thread*). The agent has no notion of the AH grouping; it only ever deals in chats and its own SDK sessions. | Prefer the provider's native term where one exists (Codex "thread"); otherwise spell it out as "SDK session" / "provider session" in comments and local names wherever the two could be confused. |
+| Inside an agent harness (`node/claude`, `node/copilot`, `node/codex`, `node/grokBuild`) | The agent's **own SDK / provider session** — the provider's native concept (Codex calls it a *thread*; Grok Build uses the ACP session id). The agent has no notion of the AH grouping; it only ever deals in chats and its own SDK sessions. | Prefer the provider's native term where one exists (Codex "thread"); otherwise spell it out as "SDK session" / "provider session" in comments and local names wherever the two could be confused. |
 | The `IAgent` seam (`chats.*` plus chat metadata/configuration events) | Operations receive an exact chat plus opaque persistence/configuration scopes. | Providers never receive AH ownership or chat-role fields. |
 
 **Why we do not rename the agents' "SDK session" symbols:** the generated protocol fixes "Session" = AH session across hundreds of references we cannot change. Provider-internal SDK sessions remain native runtime concepts, while the chat seam exposes no AH session ownership.
@@ -74,6 +75,7 @@ graph TB
         claude["ClaudeAgent"]
         copilot["CopilotAgent"]
         codex["CodexAgent"]
+        grok["GrokBuildAgent"]
     end
 
     UI -->|"createChat / disposeChat / dispatchAction"| svc
@@ -686,6 +688,26 @@ When a restored Agent Host conversation's intended model is missing from the pic
 Metadata and history reads use `thread/read` and `thread/turns/list` without resuming the thread or claiming its writer lock, so a thread still open in another Codex client remains readable. Subscribing to an interactive chat invokes the optional provider-internal `IAgentChats.prepareChat` seam before returning the snapshot. Codex resumes an existing backing to acquire its writer lock without sending a turn; fresh chats remain lazy. The host publishes temporary input restrictions through existing read-only chat interactivity and validated `vscode.chatInputState` session metadata. These restrictions are not persisted as permanent read-only state. Clients retain history and the editable draft; Retry refreshes the existing subscription without sending a turn or discarding pending local actions. No additional AHP method or capability is required. Sends still apply pending launch configuration and replace a never-persisted backing only when the SDK reports that its rollout is missing. Reads still retry when their app-server connection is replaced.
 
 An additional chat is backed by a **fresh top-level thread minted eagerly** in `chats.createChat` (via `thread/start` or `thread/fork` at the requested turn, reusing `_forkSession`). For these internal peer backings only, the backing entry and URI are keyed by the app-server-assigned thread id. This does not couple the parent AH session id to its default thread id; it gives the peer-chat-backing marker a stable `codex:/<threadId>` database across restart. `_createChat`/`fork` therefore return `backingSession: AgentSession.uri(this.id, threadId)` so the orchestrator suppresses that backing from the top-level session list (invariant I7), plus an opaque `providerData` blob (the backing thread id + model) that `materializeChat` decodes on restore. The additional chat inherits the parent session's working directory, model, and permissions. Exact disposal/release affects only the addressed chat's own thread — there is no cascade between chats of the same session. The persisted `codex.threadId`, `codex.cwd`, and `codex.model` keys and app-server protocol are unchanged, and Codex still never recognizes or derives a default-chat URI. The orchestrator registry contains the parent AH session, not these chat backing URIs; provider-owned discovery pushes external chats through `onDidDiscoverChats`. Capabilities are `multipleChats: { fork: true, sideChat: true }`.
+
+### Grok Build (`node/grokBuild/grokBuildAgent.ts`)
+
+Fork-only ACP stdio provider. It does not bundle the `grok` binary, does not read `~/.grok/auth.json`, and does not log the `authenticate` result (that payload carries email, team, and tier). There is no logo. The UI label is "Grok Build"; the provider id is `grokBuild`. `workspaceConversion` is false. Living detail is in [`node/grokBuild/CONTEXT.md`](node/grokBuild/CONTEXT.md).
+
+Launch argv is fixed and always passes permission mode explicitly:
+
+```
+['--no-auto-update', '--permission-mode', 'default', 'agent', '--no-leader', 'stdio']
+```
+
+`--permission-mode` is top-level only and the value is always `default`. The adapter never passes `--always-approve`, `bypassPermissions`, or `dontAsk`. `--no-leader` is valid only after `agent`. Per-chat edit presets and plan mode are applied on the live ACP session; they do not relaunch the CLI.
+
+Slash commands are default-deny. A prompt is treated as a command only when its first token starts with `/`. That full token, up to the first whitespace and without the leading `/`, must exactly match a name from the latest `available_commands_update`, case-insensitively, or the prompt is rejected. The deny-list (`always-approve`, `yolo`, `auto`, `plugins`, `plugin`, `reload-plugins`, `feedback`, `statusline`, `hooks-trust`, `hooks-add`, `settings`) is the part before the first `:`, so `/yolo:on` and `/always-approve:on` stay rejected even when the full token is advertised. A token that contains a second `/` is a path (`/Users/x/a.ts explain`) and is rejected. grok 1.0.70 sends `available_commands_update` only after the first prompt, so a slash command as the first message of a new chat is rejected until that list arrives. A slash token on a later line is plain text and is forwarded.
+
+Session recovery uses the original cwd. `providerData` is `{ sessionId, model?, cwd?, reasoningEffort? }`. `session/load` (preferred when advertised) or `session/resume` runs in that directory; a different cwd returns `FS_NOT_FOUND`. `setWorkingDirectory` rejects and changes nothing. `sendMessage` keeps the session cwd.
+
+Plan mode is re-applied after every successful `session/load` or `session/resume`. `appliedModeId` is cleared when the connection generation changes, then `session/set_mode` sends `plan` or `default` again. If the chat is in plan mode and that call fails, the prompt fails.
+
+Stderr and ACP payloads stay off the default log level. Info, warn, and error lines do not include authenticate results, skill names, or MCP server names. Trace may include a redacted stderr line. The user-facing process-exit error keeps the redacted stderr tail and must not contain an email, team, or tier.
 
 
 ---

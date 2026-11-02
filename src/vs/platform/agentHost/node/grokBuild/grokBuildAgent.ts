@@ -4,7 +4,6 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
-import { raceTimeout } from '../../../../base/common/async.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { Disposable, DisposableStore, toDisposable } from '../../../../base/common/lifecycle.js';
 import { type IObservable, observableValue } from '../../../../base/common/observable.js';
@@ -67,13 +66,17 @@ import {
 	GROK_BUILD_MIN_VERSION,
 	grokCannotRestoreSessionError,
 	grokCliMissingError,
+	grokExitStatusError,
 	grokHandshakeTimeoutError,
+	grokLogSummary,
 	grokNotLoggedInError,
 	GrokSessionMissingError,
 	grokProcessExitedError,
 	grokSessionMissingError,
+	grokSpawnFailureError,
 	grokUnreadableVersionWarning,
 	grokWorkingDirectoryRejectedError,
+	redactGrokAuthenticateText,
 	resolveGrokBinary,
 	withStderrTail,
 	type IGrokBuildLaunchConfig,
@@ -132,6 +135,52 @@ import {
 
 const HANDSHAKE_TIMEOUT_MS = 30_000;
 const GROK_SESSION_LIST_MAX_PAGES = 20;
+
+/**
+ * Bound a promise without leaving a rejection unhandled when the timer wins.
+ * `raceTimeout` settles on the timer and still rejects the original promise.
+ */
+/** AcpClient rejects in-flight RPCs with this text before the agent sees the exit event. */
+const GROK_TRANSPORT_EXIT = /grok acp process exited \(code=(-?\d+|null), signal=([^;)]+)\)/;
+
+function grokExitFromTransportError(err: unknown): { code: number | null; signal: NodeJS.Signals | null } | undefined {
+	const message = err instanceof Error ? err.message : undefined;
+	const match = message ? GROK_TRANSPORT_EXIT.exec(message) : undefined;
+	if (!match) {
+		return undefined;
+	}
+	const code = match[1] === 'null' ? null : Number(match[1]);
+	const signal = match[2] === 'null' ? null : match[2] as NodeJS.Signals;
+	return { code, signal };
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | undefined> {
+	let settled = false;
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(() => {
+			if (settled) {
+				return;
+			}
+			settled = true;
+			resolve(undefined);
+		}, timeoutMs);
+		promise.then(value => {
+			if (settled) {
+				return;
+			}
+			settled = true;
+			clearTimeout(timer);
+			resolve(value);
+		}, error => {
+			if (settled) {
+				return;
+			}
+			settled = true;
+			clearTimeout(timer);
+			reject(error);
+		});
+	});
+}
 
 export type GrokBuildTestSpawnResult = {
 	readonly transport: IAcpTransport;
@@ -465,6 +514,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 	private _testClient: IAcpClient | undefined;
 	private _reasoningOption: AcpConfigOption | undefined;
 	private _spawn: GrokBuildTestSpawn = spawnGrokBuildProcess;
+	private _handshakeTimeoutMs = HANDSHAKE_TIMEOUT_MS;
 	private _resolveBinary: (configuredPath: string | undefined) => Promise<IGrokBuildResolvedBinary> = configuredPath => resolveGrokBinary(configuredPath);
 	private _binaryResolverOverridden = false;
 
@@ -512,6 +562,14 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		if (!this._binaryResolverOverridden) {
 			this._resolveBinary = async () => ({ path: 'grok', version: GROK_BUILD_MIN_VERSION });
 		}
+	}
+
+	/**
+	 * @internal Test seam: shorten the initialize / authenticate wait.
+	 * Session prompts are not timed out; a model turn has no fixed budget.
+	 */
+	bindTestHandshakeTimeout(timeoutMs: number): void {
+		this._handshakeTimeoutMs = timeoutMs;
 	}
 
 	/**
@@ -1454,10 +1512,14 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		const child = spawned.child;
 		const transport = spawned.transport;
 		const client = new AcpClient(transport, (level, message) => {
+			// Never write an authenticate result. Payloads stay at trace; error/warn stay summary-only.
+			const safe = redactGrokAuthenticateText(message);
 			if (level === 'error') {
-				this._logService.error(`[GrokBuild ACP] ${message}`);
+				this._logService.error(`[GrokBuild ACP] ${safe}`);
+			} else if (level === 'warn') {
+				this._logService.warn(`[GrokBuild ACP] ${safe}`);
 			} else {
-				this._logService.trace(`[GrokBuild ACP] ${message}`);
+				this._logService.trace(`[GrokBuild ACP] ${safe}`);
 			}
 		});
 
@@ -1474,7 +1536,9 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		};
 
 		store.add(client.onExit(e => {
-			this._teardownFailedConnection(client, store, child, grokProcessExitedError(e.code, e.signal, this._stderrTail));
+			const exited = grokExitStatusError(e.code, e.signal, this._stderrTail)
+				?? grokProcessExitedError(e.code, e.signal, this._stderrTail);
+			this._teardownFailedConnection(client, store, child, exited);
 		}));
 		store.add(client.onTransportError(err => {
 			failConnection(err);
@@ -1482,16 +1546,16 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 
 		if (child) {
 			child.on('error', (err: Error) => {
-				failConnection(err);
+				failConnection(grokSpawnFailureError(err) ?? err);
 			});
 			child.stdin.on('error', (err: Error) => {
-				failConnection(err);
+				failConnection(grokSpawnFailureError(err) ?? err);
 			});
 		}
 
 		let capabilities = noGrokCapabilities;
 		try {
-			const init = await raceTimeout(
+			const init = await withTimeout(
 				client.request('initialize', {
 					protocolVersion: ACP_PROTOCOL_VERSION,
 					clientCapabilities: {
@@ -1500,7 +1564,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 					},
 					clientInfo: { name: clientName, version: clientVersion },
 				}),
-				HANDSHAKE_TIMEOUT_MS,
+				this._handshakeTimeoutMs,
 			);
 			if (init === undefined) {
 				throw grokHandshakeTimeoutError('initialize');
@@ -1510,17 +1574,22 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			this._publishModels(initMeta?.modelState);
 
 			// Do not log the authenticate result — `_meta` includes email / team / tier.
-			const auth = await raceTimeout(
+			const auth = await withTimeout(
 				client.request('authenticate', { methodId: 'grok.com' }),
-				HANDSHAKE_TIMEOUT_MS,
+				this._handshakeTimeoutMs,
 			);
 			if (auth === undefined) {
 				throw grokHandshakeTimeoutError('authenticate');
 			}
 		} catch (err) {
+			const transportExit = grokExitFromTransportError(err);
+			const exitError = transportExit
+				? grokExitStatusError(transportExit.code, transportExit.signal, this._stderrTail)
+					?? grokProcessExitedError(transportExit.code, transportExit.signal, this._stderrTail)
+				: undefined;
 			const error = isGrokAuthError(err)
 				? new Error(withStderrTail(grokNotLoggedInError().message, this._stderrTail))
-				: this._enrichError(err);
+				: exitError ?? this._enrichError(err);
 			this._teardownFailedConnection(client, store, child, error);
 			throw error;
 		}
@@ -1540,9 +1609,10 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		child.stderr.setEncoding('utf8');
 		child.stderr.on('data', chunk => {
 			const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
-			this._stderrTail = appendStderrTail(this._stderrTail, text);
-			const line = text.trimEnd();
+			this._stderrTail = redactGrokAuthenticateText(appendStderrTail(this._stderrTail, text));
+			const line = redactGrokAuthenticateText(text).trimEnd();
 			if (line.length > 0) {
+				// Trace is below the default Info level. The error log records only the summary.
 				this._logService.trace(`[GrokBuild stderr] ${line}`);
 			}
 		});
@@ -1573,7 +1643,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			return;
 		}
 		this._tornDown.add(client);
-		this._logService.error(`[GrokBuild] ${error.message}`);
+		this._logService.error(`[GrokBuild] ${grokLogSummary(error.message)}`);
 		this._failActiveTurns(error);
 		this._cancelAllPendingPermissions();
 		client.rejectAllPending(error);

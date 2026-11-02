@@ -16,7 +16,12 @@ import {
 	GROK_CLIENT_NAME_ENV,
 	GROK_CLIENT_VERSION_ENV,
 	grokCliMissingError,
+	grokCliNotExecutableError,
+	grokExitStatusError,
+	grokProcessExitedError,
+	grokSpawnFailureError,
 	interpretGrokVersion,
+	redactGrokAuthenticateText,
 	isGrokVersionAtLeast,
 	parseGrokVersion,
 	probeGrokBinaryAvailability,
@@ -146,6 +151,34 @@ suite('GrokBuild launch config', () => {
 		} finally {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
+	});
+
+	test('spawn and exit failures name a missing or non-executable binary', () => {
+		assert.strictEqual(grokSpawnFailureError(Object.assign(new Error('enoent'), { code: 'ENOENT' }))?.message, grokCliMissingError().message);
+		assert.strictEqual(grokSpawnFailureError(Object.assign(new Error('access'), { code: 'EACCES' }))?.message, grokCliNotExecutableError().message);
+		assert.strictEqual(grokSpawnFailureError(new Error('other')), undefined);
+		const missing = grokExitStatusError(127, null, '');
+		assert.ok(missing);
+		assert.ok(missing.message.startsWith(grokCliMissingError().message));
+		const blocked = grokExitStatusError(126, null, 'detail');
+		assert.ok(blocked);
+		assert.ok(blocked.message.includes(grokCliNotExecutableError().message));
+		assert.ok(blocked.message.includes('detail'));
+		assert.strictEqual(grokExitStatusError(1, null, ''), undefined);
+		assert.strictEqual(grokExitStatusError(127, 'SIGTERM', ''), undefined);
+		const crashed = grokProcessExitedError(1, null, 'tail');
+		assert.match(crashed.message, /exited unexpectedly/);
+		assert.match(crashed.message, /tail/);
+	});
+
+	test('authenticate fields and email addresses are removed before logging', () => {
+		const raw = 'auth {"email":"ada@example.com","team":"xai-team","tier":"super"} still ada@example.com';
+		const redacted = redactGrokAuthenticateText(raw);
+		assert.ok(!redacted.includes('ada@example.com'));
+		assert.ok(!redacted.includes('xai-team'));
+		assert.ok(!redacted.includes('"tier"'));
+		assert.ok(redacted.includes('[redacted-authenticate]'));
+		assert.ok(redacted.includes('[redacted-email]'));
 	});
 
 	test('resolveGrokBinaryPath returns configured path when it exists', async () => {
