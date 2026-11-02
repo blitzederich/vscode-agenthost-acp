@@ -176,19 +176,46 @@ export function sameCommands(left: readonly IGrokAvailableCommand[] | undefined,
 	});
 }
 
-/** Built-in grok command that skips every permission prompt. Never advertised or forwarded. */
-const GROK_ALWAYS_APPROVE_COMMAND = 'always-approve';
+/** Live grok 1.0.70 honours `/yolo` as an unadvertised alias of `/always-approve`. Default-deny is the invariant. */
+const GROK_DENIED_SLASH_COMMANDS = new Set([
+	'always-approve',
+	'yolo',
+	'auto',
+	'plugins',
+	'plugin',
+	'reload-plugins',
+	'feedback',
+	'statusline',
+	'hooks-trust',
+	'hooks-add',
+	'settings',
+]);
 
-export function isAlwaysApprovePrompt(prompt: string): boolean {
-	const token = prompt.trim().split(/\s+/, 1)[0];
-	return token?.toLowerCase() === `/${GROK_ALWAYS_APPROVE_COMMAND}`;
+export function grokSlashCommandRejectedError(name: string): Error {
+	return new Error(localize(
+		'grokBuild.slashCommandRejected',
+		"Grok Build does not allow /{0} in VS Code.",
+		name,
+	));
 }
 
-export function grokAlwaysApproveRejectedError(): Error {
-	return new Error(localize(
-		'grokBuild.alwaysApproveRejected',
-		"Grok Build does not allow the /always-approve command.",
-	));
+/**
+ * Grok honours a slash command only as the first token. Forward it only when
+ * that command is in the latest advertised list and not denied. Before grok
+ * has sent the list, every slash-prefixed prompt is rejected.
+ */
+export function rejectedGrokSlashCommand(prompt: string, commands: readonly IGrokAvailableCommand[] | undefined): Error | undefined {
+	const token = prompt.trim().split(/\s+/, 1)[0];
+	if (!token?.startsWith('/')) {
+		return undefined;
+	}
+	const name = token.slice(1).split(':', 1)[0];
+	const key = name.toLowerCase();
+	const advertised = !!commands?.some(command => command.name.toLowerCase() === key);
+	if (advertised && !GROK_DENIED_SLASH_COMMANDS.has(key)) {
+		return undefined;
+	}
+	return grokSlashCommandRejectedError(name);
 }
 
 export function grokPlanModeFailedError(): Error {
@@ -200,11 +227,11 @@ export function grokPlanModeFailedError(): Error {
 
 /**
  * Read-only slash commands. The host invokes a skill by sending its name as
- * prompt text; this provider forwards that text unchanged. `always-approve`
- * is grok's "skip all permission prompts" command and is omitted.
+ * prompt text; this provider forwards that text unchanged. Denied commands
+ * are omitted.
  */
 export function buildGrokCommandCustomizations(commands: readonly IGrokAvailableCommand[]): DirectoryCustomization | undefined {
-	const visible = commands.filter(command => command.name.toLowerCase() !== GROK_ALWAYS_APPROVE_COMMAND);
+	const visible = commands.filter(command => !GROK_DENIED_SLASH_COMMANDS.has(command.name.toLowerCase()));
 	if (visible.length === 0) {
 		return undefined;
 	}

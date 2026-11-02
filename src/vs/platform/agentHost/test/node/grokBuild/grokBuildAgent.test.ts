@@ -22,7 +22,7 @@ import {
 } from '../../../node/grokBuild/acpClient.js';
 import { decodeGrokBuildChat, encodeGrokBuildChat } from '../../../node/grokBuild/grokBuildChatBacking.js';
 import { GrokBuildAgent, mergeRestoredTurns } from '../../../node/grokBuild/grokBuildAgent.js';
-import { GROK_PERMISSION_PRESET_ALLOW_EDITS, GROK_PERMISSION_PRESET_ASK, GROK_PERMISSION_PRESET_KEY, GROK_THINKING_LEVEL_KEY, grokAlwaysApproveRejectedError, grokPlanModeFailedError } from '../../../node/grokBuild/grokBuildUx.js';
+import { GROK_PERMISSION_PRESET_ALLOW_EDITS, GROK_PERMISSION_PRESET_ASK, GROK_PERMISSION_PRESET_KEY, GROK_THINKING_LEVEL_KEY, grokPlanModeFailedError, grokSlashCommandRejectedError } from '../../../node/grokBuild/grokBuildUx.js';
 import { IAgentConfigurationService, type IAgentChatConfigurationChangeEvent } from '../../../node/agentConfigurationService.js';
 import { SessionConfigKey } from '../../../common/sessionConfigKeys.js';
 import { GROK_BUILD_ACP_ARGV, grokCannotRestoreSessionError, grokNotLoggedInError, grokSessionMissingError, grokUnreadableVersionWarning, grokWorkingDirectoryRejectedError } from '../../../node/grokBuild/grokBuildLaunchConfig.js';
@@ -1468,14 +1468,27 @@ suite('GrokBuildAgent', () => {
 		peer.push({ jsonrpc: '2.0', id: sessionNew.id, result: { sessionId: 'sess-commands' } });
 		await create;
 
+		const rejectSlash = async (text: string, name: string) => {
+			await assert.rejects(
+				agent.chats.sendMessage(chat, text, [URI.file('/tmp')], undefined, 'turn-blocked', undefined, context),
+				(err: unknown) => {
+					assert.ok(err instanceof Error);
+					assert.strictEqual(err.message, grokSlashCommandRejectedError(name).message);
+					return true;
+				},
+			);
+			assert.strictEqual(await readIfAny(peer.outbound), undefined);
+		};
+		await rejectSlash('/compact', 'compact');
+
+		const denied = ['always-approve', 'yolo', 'auto', 'plugins', 'plugin', 'reload-plugins', 'feedback', 'statusline', 'hooks-trust', 'hooks-add', 'settings', 'YOLO'];
 		const updated = Event.toPromise(agent.onDidCustomizationsChange!);
 		pushUpdate(peer, 'sess-commands', {
 			sessionUpdate: 'available_commands_update',
 			availableCommands: [
 				{ name: 'compact', description: 'Compact the conversation', input: { hint: 'instructions' } },
 				{ name: 'review', description: 'Review the change', input: null },
-				{ name: 'always-approve', description: 'Toggle always-approve mode (skip all permission prompts)', input: { hint: 'on|off' } },
-				{ name: 'Always-Approve', description: 'Toggle always-approve mode (skip all permission prompts)', input: null },
+				...denied.map(name => ({ name, description: name, input: null })),
 			],
 		});
 		await updated;
@@ -1487,24 +1500,13 @@ suite('GrokBuildAgent', () => {
 			{ name: 'review', description: 'Review the change' },
 		]);
 
-		for (const text of ['/always-approve', '/Always-Approve on']) {
-			await assert.rejects(
-				agent.chats.sendMessage(chat, text, [URI.file('/tmp')], undefined, 'turn-blocked', undefined, context),
-				(err: unknown) => {
-					assert.ok(err instanceof Error);
-					assert.strictEqual(err.message, grokAlwaysApproveRejectedError().message);
-					return true;
-				},
-			);
-			assert.strictEqual(await readIfAny(peer.outbound), undefined);
-		}
-
-		const extra = agent.chats.sendMessage(chat, '/always-approve-extra', [URI.file('/tmp')], undefined, 'turn-extra', undefined, context);
-		const extraPrompt = await readNextMessage(peer.outbound);
-		assert.strictEqual(extraPrompt.method, 'session/prompt');
-		assert.strictEqual(extraPrompt.params.prompt[0].text, '/always-approve-extra');
-		peer.push({ jsonrpc: '2.0', id: extraPrompt.id, result: { stopReason: 'end_turn' } });
-		await extra;
+		await rejectSlash('/yolo', 'yolo');
+		await rejectSlash('/YOLO', 'YOLO');
+		await rejectSlash('  /yolo', 'yolo');
+		await rejectSlash('/always-approve on', 'always-approve');
+		await rejectSlash('/plugins trust', 'plugins');
+		await rejectSlash('/auto', 'auto');
+		await rejectSlash('/foo', 'foo');
 
 		pushUpdate(peer, 'sess-commands', {
 			sessionUpdate: 'available_commands_update',
@@ -1514,12 +1516,14 @@ suite('GrokBuildAgent', () => {
 		const afterRedaction = await agent.getChatCustomizations(chat, context, []);
 		assert.strictEqual(afterRedaction.find(entry => entry.type === 'directory')?.type, 'directory');
 
-		const send = agent.chats.sendMessage(chat, '/compact now', [URI.file('/tmp')], undefined, 'turn-cmd', undefined, context);
-		const prompt = await readNextMessage(peer.outbound);
-		assert.strictEqual(prompt.method, 'session/prompt');
-		assert.strictEqual(prompt.params.prompt[0].text, '/compact now');
-		peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
-		await send;
+		for (const text of ['/compact now', 'note\n/always-approve', 'hello']) {
+			const send = agent.chats.sendMessage(chat, text, [URI.file('/tmp')], undefined, 'turn-cmd', undefined, context);
+			const prompt = await readNextMessage(peer.outbound);
+			assert.strictEqual(prompt.method, 'session/prompt');
+			assert.strictEqual(prompt.params.prompt[0].text, text);
+			peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
+			await send;
+		}
 	});
 
 	test('ACP plan updates become todo tool calls and plan mode uses session/set_mode', async () => {

@@ -100,13 +100,12 @@ import {
 import {
 	allowEditsOnceOptionId,
 	buildGrokCommandCustomizations,
-	grokAlwaysApproveRejectedError,
 	grokBuildSessionSchema,
 	grokPlanModeFailedError,
 	GROK_PERMISSION_PRESET_ALLOW_EDITS,
 	GROK_PLAN_MODE_ID,
 	GROK_REASONING_CONFIG_ID,
-	isAlwaysApprovePrompt,
+	rejectedGrokSlashCommand,
 	modeIdForSessionMode,
 	modelWithThinkingLevel,
 	readAvailableCommands,
@@ -889,8 +888,9 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			resolveAgentChatContext(context, chat);
 		}
 		const backing = this._requireBacking(chat);
-		if (isAlwaysApprovePrompt(prompt)) {
-			throw grokAlwaysApproveRejectedError();
+		const rejectedSlashCommand = rejectedGrokSlashCommand(prompt, backing.commands);
+		if (rejectedSlashCommand) {
+			throw rejectedSlashCommand;
 		}
 		this._rememberOwner(backing, context);
 		const workingDirectories = this._resolveWorkingDirectories(workingDirectoriesOrDirectory);
