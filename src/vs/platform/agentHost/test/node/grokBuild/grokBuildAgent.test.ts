@@ -4,21 +4,28 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
+import type { ChildProcessWithoutNullStreams } from 'child_process';
 import { EventEmitter } from 'events';
 import { PassThrough } from 'stream';
-import { Emitter } from '../../../../../base/common/event.js';
+import { DeferredPromise } from '../../../../../base/common/async.js';
+import { Emitter, Event } from '../../../../../base/common/event.js';
+import { hasKey } from '../../../../../base/common/types.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../../log/common/log.js';
+import type { IProductService } from '../../../../product/common/productService.js';
 import { AgentSession, fixedChatOwnerRef, GROK_BUILD_AGENT_PROVIDER_ID, type AgentSignal, type IAgentChatContext, type IAgentDiscoveredChat } from '../../../common/agent.js';
 import { ActionType } from '../../../common/state/sessionActions.js';
-import { ResponsePartKind, TurnState, type Turn } from '../../../common/state/sessionState.js';
+import { CustomizationType, ResponsePartKind, TurnState, type Turn } from '../../../common/state/sessionState.js';
 import {
 	AcpClient,
 	type IAcpTransport,
 } from '../../../node/grokBuild/acpClient.js';
 import { decodeGrokBuildChat, encodeGrokBuildChat } from '../../../node/grokBuild/grokBuildChatBacking.js';
-import { GrokBuildAgent } from '../../../node/grokBuild/grokBuildAgent.js';
+import { GrokBuildAgent, mergeRestoredTurns } from '../../../node/grokBuild/grokBuildAgent.js';
+import { GROK_PERMISSION_PRESET_ALLOW_EDITS, GROK_PERMISSION_PRESET_KEY, GROK_THINKING_LEVEL_KEY } from '../../../node/grokBuild/grokBuildUx.js';
+import { IAgentConfigurationService, type IAgentChatConfigurationChangeEvent } from '../../../node/agentConfigurationService.js';
+import { SessionConfigKey } from '../../../common/sessionConfigKeys.js';
 import { GROK_BUILD_ACP_ARGV, grokCannotRestoreSessionError, grokNotLoggedInError, grokSessionMissingError, grokUnreadableVersionWarning, grokWorkingDirectoryRejectedError } from '../../../node/grokBuild/grokBuildLaunchConfig.js';
 import type { AcpAgentCapabilities } from '../../../node/grokBuild/protocol/acpTypes.js';
 
@@ -273,8 +280,15 @@ suite('GrokBuildAgent', () => {
 
 	const store = ensureNoDisposablesAreLeakedInTestSuite();
 
-	function createAgent(log: NullLogService = new NullLogService()): GrokBuildAgent {
-		return store.add(new GrokBuildAgent(log, new TestProductService() as any));
+	function createAgent(log: NullLogService = new NullLogService(), configuration?: {
+		readonly onDidChatConfigChange?: Event<IAgentChatConfigurationChangeEvent>;
+		readonly getChatConfigValues?: () => Record<string, unknown> | undefined;
+	}): GrokBuildAgent {
+		const configurationService = {
+			onDidChatConfigChange: configuration?.onDidChatConfigChange ?? Event.None,
+			getChatConfigValues: configuration?.getChatConfigValues ?? (() => undefined),
+		} as unknown as IAgentConfigurationService;
+		return store.add(new GrokBuildAgent(log, new TestProductService() as unknown as IProductService, configurationService));
 	}
 
 	test('descriptor uses Grok Build label and provider id', () => {
@@ -321,7 +335,7 @@ suite('GrokBuildAgent', () => {
 			},
 		});
 		const created = await createPromise;
-		assert.ok(created && 'providerData' in created && created.providerData);
+		assert.ok(created && hasKey(created, { providerData: true }) && created.providerData);
 		assert.ok(agent.models.get().some(m => m.id === 'grok-4.7'));
 
 		peer.push({ jsonrpc: '2.0', method: '_x.ai/queue/changed', params: { sessionId: '01a199cf-f5b0-7ea0-9492-44c99e9e2603' } });
@@ -603,9 +617,9 @@ suite('GrokBuildAgent', () => {
 			assert.strictEqual(launchEnv.GROK_CLIENT_NAME, 'Code - OSS');
 			assert.strictEqual(launchEnv.GROK_CLIENT_VERSION, '1.145.0');
 			assert.strictEqual(launchEnv.SSH_AUTH_SOCK, '/tmp/ssh-agent.sock');
-			assert.ok(!('ELECTRON_RUN_AS_NODE' in launchEnv));
-			assert.ok(!('VSCODE_FOO' in launchEnv));
-			assert.ok(!('NODE_OPTIONS' in launchEnv));
+			assert.strictEqual(Object.hasOwn(launchEnv, 'ELECTRON_RUN_AS_NODE'), false);
+			assert.strictEqual(Object.hasOwn(launchEnv, 'VSCODE_FOO'), false);
+			assert.strictEqual(Object.hasOwn(launchEnv, 'NODE_OPTIONS'), false);
 		} finally {
 			restoreEnv('ELECTRON_RUN_AS_NODE', previousElectron);
 			restoreEnv('VSCODE_FOO', previousVscode);
@@ -831,7 +845,7 @@ suite('GrokBuildAgent', () => {
 	});
 
 	test('grok exit mid-turn records the failure with stderr and the next send reloads', async () => {
-		const peers: IFakePeer[] = [];
+		const spawnedPeers = createPeerQueue();
 		let spawnCount = 0;
 		const agent = createAgent();
 		agent.bindTestSpawn(launch => {
@@ -839,14 +853,14 @@ suite('GrokBuildAgent', () => {
 			assert.deepStrictEqual([...launch.args], [...GROK_BUILD_ACP_ARGV]);
 			assert.ok(!Object.keys(launch.env).some(key => key === 'ELECTRON_RUN_AS_NODE' || key.startsWith('VSCODE_')));
 			const peer = store.add(makeFakePeer());
-			peers.push(peer);
-			return { transport: peer.transport, child: peer.child as any, onDispose: () => { /* peer owned by the suite */ } };
+			spawnedPeers.push(peer);
+			return { transport: peer.transport, child: peer.child as unknown as ChildProcessWithoutNullStreams, onDispose: () => { /* peer owned by the suite */ } };
 		});
 
 		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/crash' });
 		const context = chatContext(chat);
 		const create = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp/proj')] });
-		const crashed = await nextPeer(peers, 0);
+		const crashed = await spawnedPeers.next();
 		await completeHandshake(crashed);
 		const sessionNew = await readNextMessage(crashed.outbound);
 		assert.strictEqual(sessionNew.method, 'session/new');
@@ -901,7 +915,7 @@ suite('GrokBuildAgent', () => {
 		assert.match(errorPart.error.message, /TAILMARK/);
 
 		const sendAgain = agent.chats.sendMessage(chat, 'after crash', [URI.file('/tmp/other')], undefined, 'turn-after', undefined, context);
-		const respawned = await nextPeer(peers, 1);
+		const respawned = await spawnedPeers.next();
 		await completeHandshake(respawned);
 		const load = await readNextMessage(respawned.outbound);
 		assert.strictEqual(load.method, 'session/load');
@@ -944,7 +958,7 @@ suite('GrokBuildAgent', () => {
 		const agent = createAgent();
 		agent.bindTestSpawn(() => {
 			spawnCount++;
-			return { transport: peer.transport, child: peer.child as any, onDispose: () => { disposeCount++; } };
+			return { transport: peer.transport, child: peer.child as unknown as ChildProcessWithoutNullStreams, onDispose: () => { disposeCount++; } };
 		});
 		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/handshake' });
 		const context = chatContext(chat);
@@ -963,7 +977,7 @@ suite('GrokBuildAgent', () => {
 		const peer2 = store.add(makeFakePeer());
 		agent.bindTestSpawn(() => {
 			spawnCount++;
-			return { transport: peer2.transport, child: peer2.child as any, onDispose: () => { disposeCount++; } };
+			return { transport: peer2.transport, child: peer2.child as unknown as ChildProcessWithoutNullStreams, onDispose: () => { disposeCount++; } };
 		});
 		const chat2 = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/handshake-2' });
 		const create2 = agent.chats.createChat(chat2, chatContext(chat2), { workingDirectories: [URI.file('/tmp')] });
@@ -1298,6 +1312,369 @@ suite('GrokBuildAgent', () => {
 		await create;
 		assert.ok(log.warnings.some(message => message === grokUnreadableVersionWarning('garbage')));
 	});
+
+	test('mergeRestoredTurns keeps a promptIndex match only when the user text matches', () => {
+		const merged = mergeRestoredTurns(
+			[{ id: 'bad', userText: 'fail this', assistantMarkdown: '', state: TurnState.Error, errorMessage: 'prompt failed', promptIndex: 0 }],
+			[
+				{ id: 'r0', userText: 'other turn', assistantMarkdown: 'ok', promptIndex: 0 },
+				{ id: 'r1', userText: 'fail this', assistantMarkdown: '', promptIndex: 3 },
+			],
+		);
+		assert.deepStrictEqual({
+			first: { text: merged[0].userText, state: merged[0].state, promptIndex: merged[0].promptIndex },
+			second: { text: merged[1].userText, state: merged[1].state, promptIndex: merged[1].promptIndex, error: merged[1].errorMessage },
+		}, {
+			first: { text: 'other turn', state: TurnState.Complete, promptIndex: 0 },
+			second: { text: 'fail this', state: TurnState.Error, promptIndex: 3, error: 'prompt failed' },
+		});
+	});
+
+	test('session/prompt error while grok is alive records no promptIndex and the next load adopts grok index', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client, LIVE_CAPABILITIES);
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/prompt-error' });
+		const context = chatContext(chat);
+		const create = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp/proj')] });
+		const sessionNew = await readNextMessage(peer.outbound);
+		peer.push({ jsonrpc: '2.0', id: sessionNew.id, result: { sessionId: 'sess-prompt-error' } });
+		await create;
+
+		const send = agent.chats.sendMessage(chat, 'fail this', [URI.file('/tmp/proj')], undefined, 'turn-fail', undefined, context);
+		const prompt = await readNextMessage(peer.outbound);
+		assert.strictEqual(prompt.method, 'session/prompt');
+		peer.push({ jsonrpc: '2.0', id: prompt.id, error: { code: -32603, message: 'prompt failed' } });
+		await assert.rejects(send, /prompt failed/);
+		const failed = await agent.chats.getMessages(chat, context);
+		assert.strictEqual(failed.length, 1);
+		assert.strictEqual(failed[0].state, TurnState.Error);
+		assert.strictEqual(failed[0].message.text, 'fail this');
+
+		const peer2 = store.add(makeFakePeer());
+		const client2 = store.add(new AcpClient(peer2.transport));
+		agent.bindTestClient(client2, LIVE_CAPABILITIES);
+		const restoring = agent.getChatMetadata(chat, context, undefined, { activation: 'restore' });
+		const load = await readNextMessage(peer2.outbound);
+		assert.strictEqual(load.method, 'session/load');
+		pushUpdate(peer2, 'sess-prompt-error', { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'other turn' }, _meta: { promptIndex: 0 } });
+		pushUpdate(peer2, 'sess-prompt-error', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'ok' }, _meta: { promptIndex: 0 } });
+		pushUpdate(peer2, 'sess-prompt-error', { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'fail this' }, _meta: { promptIndex: 3 } });
+		peer2.push({ jsonrpc: '2.0', id: load.id, result: { configOptions: [] } });
+		await answerSessionList(peer2);
+		await restoring;
+		const restored = await agent.chats.getMessages(chat, context);
+		assert.deepStrictEqual(restored.map(turn => ({ text: turn.message.text, state: turn.state })), [
+			{ text: 'other turn', state: TurnState.Complete },
+			{ text: 'fail this', state: TurnState.Error },
+		]);
+	});
+
+	test('reasoning effort is a model parameter applied with session/set_config_option and reapplied after load', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		const blobs: string[] = [];
+		store.add(agent.onDidChangeChatData(event => {
+			if (event.providerData) {
+				blobs.push(event.providerData);
+			}
+		}));
+		agent.bindTestClient(client, LIVE_CAPABILITIES);
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/effort' });
+		const context = chatContext(chat);
+		const configOptions = [{
+			id: 'reasoning_effort',
+			name: 'Reasoning Effort',
+			category: 'thought_level',
+			type: 'select',
+			currentValue: 'high',
+			options: [
+				{ value: 'xhigh', name: 'Extra High' },
+				{ value: 'high', name: 'High' },
+				{ value: 'medium', name: 'Medium' },
+				{ value: 'low', name: 'Low' },
+			],
+		}];
+		const create = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp/proj')] });
+		const sessionNew = await readNextMessage(peer.outbound);
+		peer.push({
+			jsonrpc: '2.0',
+			id: sessionNew.id,
+			result: {
+				sessionId: 'sess-effort',
+				models: { currentModelId: 'grok-4.7', availableModels: [{ modelId: 'grok-4.7', name: 'Grok 4.7' }] },
+				configOptions,
+			},
+		});
+		await create;
+		const schema = agent.models.get()[0]?.configSchema?.properties[GROK_THINKING_LEVEL_KEY];
+		assert.deepStrictEqual(schema?.enum, ['xhigh', 'high', 'medium', 'low']);
+		assert.strictEqual(schema?.default, 'high');
+
+		const change = agent.chats.changeModel!(chat, { id: 'grok-4.7', config: { [GROK_THINKING_LEVEL_KEY]: 'low' } }, context);
+		const setModel = await readNextMessage(peer.outbound);
+		assert.strictEqual(setModel.method, 'session/set_model');
+		peer.push({ jsonrpc: '2.0', id: setModel.id, result: {} });
+		const setConfig = await readNextMessage(peer.outbound);
+		assert.deepStrictEqual(setConfig.params, { sessionId: 'sess-effort', configId: 'reasoning_effort', value: 'low' });
+		peer.push({ jsonrpc: '2.0', id: setConfig.id, result: {} });
+		await change;
+		const persisted = decodeGrokBuildChat(blobs.at(-1));
+		assert.strictEqual(persisted?.reasoningEffort, 'low');
+		assert.strictEqual(persisted?.model?.config?.[GROK_THINKING_LEVEL_KEY], 'low');
+
+		const peer2 = store.add(makeFakePeer());
+		const client2 = store.add(new AcpClient(peer2.transport));
+		agent.bindTestClient(client2, LIVE_CAPABILITIES);
+		const restoring = agent.getChatMetadata(chat, context, undefined, { activation: 'restore' });
+		const load = await readNextMessage(peer2.outbound);
+		assert.strictEqual(load.method, 'session/load');
+		peer2.push({
+			jsonrpc: '2.0',
+			id: load.id,
+			result: { configOptions: [{ ...configOptions[0], currentValue: 'high' }] },
+		});
+		await answerSessionList(peer2);
+		const reapply = await readNextMessage(peer2.outbound);
+		assert.deepStrictEqual(reapply.params, { sessionId: 'sess-effort', configId: 'reasoning_effort', value: 'low' });
+		peer2.push({ jsonrpc: '2.0', id: reapply.id, result: {} });
+		await restoring;
+
+		const peer3 = store.add(makeFakePeer());
+		const client3 = store.add(new AcpClient(peer3.transport));
+		agent.bindTestClient(client3, LIVE_CAPABILITIES);
+		const restoringMatch = agent.getChatMetadata(chat, context, undefined, { activation: 'restore' });
+		const loadMatch = await readNextMessage(peer3.outbound);
+		peer3.push({
+			jsonrpc: '2.0',
+			id: loadMatch.id,
+			result: { configOptions: [{ ...configOptions[0], currentValue: 'low' }] },
+		});
+		await answerSessionList(peer3);
+		assert.strictEqual(await readIfAny(peer3.outbound), undefined);
+		await restoringMatch;
+	});
+
+	test('available commands become slash skills and the selected command is prompt text', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client);
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/commands' });
+		const context = chatContext(chat);
+		const create = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp')] });
+		const sessionNew = await readNextMessage(peer.outbound);
+		peer.push({ jsonrpc: '2.0', id: sessionNew.id, result: { sessionId: 'sess-commands' } });
+		await create;
+
+		const updated = Event.toPromise(agent.onDidCustomizationsChange!);
+		pushUpdate(peer, 'sess-commands', {
+			sessionUpdate: 'available_commands_update',
+			availableCommands: [{ name: 'compact', description: 'Compact the conversation', input: { hint: 'instructions' } }],
+		});
+		await updated;
+		const customizations = await agent.getChatCustomizations(chat, context, []);
+		const directory = customizations.find(entry => entry.type === 'directory');
+		assert.ok(directory && directory.type === 'directory');
+		assert.deepStrictEqual(directory.children?.map(child => ({ name: child.name, description: child.type === CustomizationType.Skill ? child.description : undefined })), [
+			{ name: 'compact', description: 'Compact the conversation (instructions)' },
+		]);
+
+		pushUpdate(peer, 'sess-commands', {
+			sessionUpdate: 'available_commands_update',
+			availableCommands: '<redacted 63 commands>',
+		});
+		await new Promise(resolve => setTimeout(resolve, 20));
+		const afterRedaction = await agent.getChatCustomizations(chat, context, []);
+		assert.strictEqual(afterRedaction.find(entry => entry.type === 'directory')?.type, 'directory');
+
+		const send = agent.chats.sendMessage(chat, '/compact now', [URI.file('/tmp')], undefined, 'turn-cmd', undefined, context);
+		const prompt = await readNextMessage(peer.outbound);
+		assert.strictEqual(prompt.method, 'session/prompt');
+		assert.strictEqual(prompt.params.prompt[0].text, '/compact now');
+		peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
+		await send;
+	});
+
+	test('ACP plan updates become todo tool calls and plan mode uses session/set_mode', async () => {
+		const configEmitter = store.add(new Emitter<IAgentChatConfigurationChangeEvent>());
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent(new NullLogService(), { onDidChatConfigChange: configEmitter.event });
+		agent.bindTestClient(client);
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/plan' });
+		const context = chatContext(chat);
+		const signals: AgentSignal[] = [];
+		store.add(agent.onDidChatProgress(signal => signals.push(signal)));
+		const create = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp')] });
+		const sessionNew = await readNextMessage(peer.outbound);
+		peer.push({ jsonrpc: '2.0', id: sessionNew.id, result: { sessionId: 'sess-plan' } });
+		await create;
+
+		const send = agent.chats.sendMessage(chat, 'plan this', [URI.file('/tmp')], undefined, 'turn-plan', undefined, context);
+		const prompt = await readNextMessage(peer.outbound);
+		pushUpdate(peer, 'sess-plan', {
+			sessionUpdate: 'plan',
+			entries: [
+				{ content: 'Write tests', priority: 'high', status: 'in_progress' },
+				{ content: 'Ship it', priority: 'low', status: 'pending' },
+			],
+		});
+		peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
+		await send;
+		const start = signals.find(signal => signal.kind === 'action' && signal.action.type === ActionType.ChatToolCallStart && signal.action.toolName === 'manage_todo_list');
+		if (!(start && start.kind === 'action' && start.action.type === ActionType.ChatToolCallStart)) {
+			assert.fail('missing todo tool call');
+		}
+		const startAction = start.action;
+		const ready = signals.find(signal => signal.kind === 'action' && signal.action.type === ActionType.ChatToolCallReady && signal.action.toolCallId === startAction.toolCallId);
+		if (!(ready && ready.kind === 'action' && ready.action.type === ActionType.ChatToolCallReady)) {
+			assert.fail('missing todo tool input');
+		}
+		assert.deepStrictEqual(JSON.parse(String(ready.action.toolInput)), {
+			todoList: [
+				{ id: '1', title: 'Write tests', status: 'in-progress' },
+				{ id: '2', title: 'Ship it', status: 'not-started' },
+			],
+		});
+
+		const owner = context.owner.get().toString();
+		configEmitter.fire({ session: owner, chat: chat.toString(), config: { [SessionConfigKey.Mode]: 'plan' }, origin: undefined });
+		const setMode = await readNextMessage(peer.outbound);
+		assert.deepStrictEqual({ method: setMode.method, params: setMode.params }, {
+			method: 'session/set_mode',
+			params: { sessionId: 'sess-plan', modeId: 'plan' },
+		});
+		peer.push({ jsonrpc: '2.0', id: setMode.id, result: {} });
+		configEmitter.fire({ session: owner, chat: chat.toString(), config: { [SessionConfigKey.Mode]: 'interactive' }, origin: undefined });
+		const leave = await readNextMessage(peer.outbound);
+		assert.deepStrictEqual(leave.params, { sessionId: 'sess-plan', modeId: 'default' });
+		peer.push({ jsonrpc: '2.0', id: leave.id, result: {} });
+	});
+
+	test('subagent tool kinds render as task calls and shell does not', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client);
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/sub' });
+		const context = chatContext(chat);
+		const signals: AgentSignal[] = [];
+		store.add(agent.onDidChatProgress(signal => signals.push(signal)));
+		const create = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp')] });
+		const sessionNew = await readNextMessage(peer.outbound);
+		peer.push({ jsonrpc: '2.0', id: sessionNew.id, result: { sessionId: 'sess-sub' } });
+		await create;
+		const send = agent.chats.sendMessage(chat, 'delegate', [URI.file('/tmp')], undefined, 'turn-sub', undefined, context);
+		const prompt = await readNextMessage(peer.outbound);
+		pushUpdate(peer, 'sess-sub', {
+			sessionUpdate: 'tool_call',
+			toolCallId: 'sub-1',
+			status: 'completed',
+			title: 'Research',
+			rawInput: { prompt: 'look around' },
+			_meta: { 'x.ai/tool': { name: 'spawn_subagent', kind: 'subagent', label: 'Research' } },
+		});
+		pushUpdate(peer, 'sess-sub', {
+			sessionUpdate: 'tool_call',
+			toolCallId: 'shell-1',
+			status: 'completed',
+			title: 'Run',
+			kind: 'execute',
+			_meta: { 'x.ai/tool': { name: 'bash', kind: 'execute', label: 'Run' } },
+		});
+		peer.push({ jsonrpc: '2.0', method: '_x.ai/hook', params: { hookEventName: 'subagent_stop' } });
+		peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
+		await send;
+		const starts = signals.filter(signal => signal.kind === 'action' && signal.action.type === ActionType.ChatToolCallStart);
+		assert.deepStrictEqual(starts.map(signal => {
+			const action = signal.kind === 'action' && signal.action.type === ActionType.ChatToolCallStart ? signal.action : undefined;
+			return { toolName: action?.toolName, toolKind: action?._meta?.toolKind };
+		}), [
+			{ toolName: 'task', toolKind: 'subagent' },
+			{ toolName: 'shell', toolKind: undefined },
+		]);
+	});
+
+	test('the default permission preset never auto-answers and allow-edits is edit-only', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client);
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/preset-ask' });
+		const context = chatContext(chat);
+		const create = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp')] });
+		const sessionNew = await readNextMessage(peer.outbound);
+		peer.push({ jsonrpc: '2.0', id: sessionNew.id, result: { sessionId: 'sess-ask' } });
+		await create;
+		const send = agent.chats.sendMessage(chat, 'edit', [URI.file('/tmp')], undefined, 'turn-ask', undefined, context);
+		const prompt = await readNextMessage(peer.outbound);
+		peer.push({
+			jsonrpc: '2.0',
+			id: 7,
+			method: 'session/request_permission',
+			params: {
+				sessionId: 'sess-ask',
+				toolCall: { toolCallId: 'edit-1', kind: 'edit', _meta: { 'x.ai/tool': { name: 'search_replace', kind: 'edit' } } },
+				options: LIVE_PERMISSION_OPTIONS,
+			},
+		});
+		assert.strictEqual(await readIfAny(peer.outbound), undefined);
+		agent.respondToPermissionRequest('edit-1', true);
+		const decision = await readNextMessage(peer.outbound);
+		assert.deepStrictEqual(decision.result, { outcome: { outcome: 'selected', optionId: 'allow-once' } });
+		peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
+		await send;
+
+		const allowPeer = store.add(makeFakePeer());
+		const allowClient = store.add(new AcpClient(allowPeer.transport));
+		const allowAgent = createAgent(new NullLogService(), {
+			getChatConfigValues: () => ({ [GROK_PERMISSION_PRESET_KEY]: GROK_PERMISSION_PRESET_ALLOW_EDITS }),
+		});
+		allowAgent.bindTestClient(allowClient);
+		const allowChat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/preset-edits' });
+		const allowContext = chatContext(allowChat);
+		const allowCreate = allowAgent.chats.createChat(allowChat, allowContext, { workingDirectories: [URI.file('/tmp')] });
+		const allowNew = await readNextMessage(allowPeer.outbound);
+		allowPeer.push({ jsonrpc: '2.0', id: allowNew.id, result: { sessionId: 'sess-edits' } });
+		await allowCreate;
+		const allowSend = allowAgent.chats.sendMessage(allowChat, 'edit', [URI.file('/tmp')], undefined, 'turn-edits', undefined, allowContext);
+		const allowPrompt = await readNextMessage(allowPeer.outbound);
+		allowPeer.push({
+			jsonrpc: '2.0',
+			id: 8,
+			method: 'session/request_permission',
+			params: {
+				sessionId: 'sess-edits',
+				toolCall: { toolCallId: 'edit-2', kind: 'edit', _meta: { 'x.ai/tool': { name: 'search_replace', kind: 'edit' } } },
+				options: LIVE_PERMISSION_OPTIONS,
+			},
+		});
+		const auto = await readNextMessage(allowPeer.outbound);
+		assert.deepStrictEqual(auto.result, { outcome: { outcome: 'selected', optionId: 'allow-edits-session' } });
+		allowPeer.push({
+			jsonrpc: '2.0',
+			id: 9,
+			method: 'session/request_permission',
+			params: {
+				sessionId: 'sess-edits',
+				toolCall: { toolCallId: 'shell-2', kind: 'execute', _meta: { 'x.ai/tool': { name: 'bash', kind: 'execute' } } },
+				options: [
+					{ optionId: 'always-allow', name: 'Always allow', kind: 'allow_always' },
+					{ optionId: 'allow-once', name: 'Yes', kind: 'allow_once' },
+					{ optionId: 'reject-once', name: 'No', kind: 'reject_once' },
+				],
+			},
+		});
+		assert.strictEqual(await readIfAny(allowPeer.outbound), undefined);
+		allowAgent.respondToPermissionRequest('shell-2', false);
+		const shellDecision = await readNextMessage(allowPeer.outbound);
+		assert.deepStrictEqual(shellDecision.result, { outcome: { outcome: 'selected', optionId: 'reject-once' } });
+		allowPeer.push({ jsonrpc: '2.0', id: allowPrompt.id, result: { stopReason: 'end_turn' } });
+		await allowSend;
+	});
 });
 
 async function answerSessionList(peer: IFakePeer, sessions: readonly object[] = []): Promise<void> {
@@ -1351,13 +1728,26 @@ function restoreEnv(key: string, value: string | undefined): void {
 	}
 }
 
-async function nextPeer(peers: readonly IFakePeer[], index: number): Promise<IFakePeer> {
-	const start = Date.now();
-	while (peers.length <= index) {
-		if (Date.now() - start > 2_000) {
-			throw new Error(`timed out waiting for grok spawn ${index}`);
-		}
-		await new Promise(resolve => setTimeout(resolve, 5));
-	}
-	return peers[index];
+function createPeerQueue(): { push(peer: IFakePeer): void; next(): Promise<IFakePeer> } {
+	const queued: IFakePeer[] = [];
+	const waiters: DeferredPromise<IFakePeer>[] = [];
+	return {
+		push(peer) {
+			const waiter = waiters.shift();
+			if (waiter) {
+				waiter.complete(peer);
+			} else {
+				queued.push(peer);
+			}
+		},
+		next() {
+			const peer = queued.shift();
+			if (peer) {
+				return Promise.resolve(peer);
+			}
+			const waiter = new DeferredPromise<IFakePeer>();
+			waiters.push(waiter);
+			return waiter.p;
+		},
+	};
 }

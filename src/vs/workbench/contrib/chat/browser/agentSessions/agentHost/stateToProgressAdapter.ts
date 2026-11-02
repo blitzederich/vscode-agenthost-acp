@@ -48,7 +48,7 @@ import { normalizeFileEdit } from '../../../../../../platform/agentHost/common/f
 import { AgentSession } from '../../../../../../platform/agentHost/common/agentService.js';
 import product from '../../../../../../platform/product/common/product.js';
 import { ConfigureAutomationToolReferenceName } from '../../../common/automations/automationService.js';
-import { formatCopilotCreditsLabel, getSubagentIsActive, ElicitationState, type ChatExternalEditKind, type ChatMcpAppData, type IChatAgentFeedbackReviewConfirmationData, type IChatAutomationConfiguredData, type IChatAutoModeResolutionPart, type IChatExternalEdit, type IChatGeneratedImageData, type IChatMcpAuthenticationRequiredServer, type IChatModifiedFilesConfirmationData, type IChatProgress, type IChatQuestion, type IChatQuestionAnswerValue, type IChatQuestionAnswers, type IChatResponseErrorDetails, type IChatSearchToolInvocationData, type IChatSessionTargetData, type IChatSubagentToolInvocationData, type IChatTerminalToolInvocationData, type IChatThinkingPart, type IChatToolInputInvocationData, type IChatToolInvocationSerialized, type IChatUsage, type IChatUsagePromptTokenDetail, ToolConfirmKind, AgentFeedbackReviewCommandId } from '../../../common/chatService/chatService.js';
+import { formatCopilotCreditsLabel, getSubagentIsActive, ElicitationState, type ChatExternalEditKind, type ChatMcpAppData, type IChatAgentFeedbackReviewConfirmationData, type IChatAutomationConfiguredData, type IChatAutoModeResolutionPart, type IChatExternalEdit, type IChatGeneratedImageData, type IChatMcpAuthenticationRequiredServer, type IChatModifiedFilesConfirmationData, type IChatProgress, type IChatQuestion, type IChatQuestionAnswerValue, type IChatQuestionAnswers, type IChatResponseErrorDetails, type IChatSearchToolInvocationData, type IChatSessionTargetData, type IChatSubagentToolInvocationData, type IChatTerminalToolInvocationData, type IChatThinkingPart, type IChatTodoListContent, type IChatToolInputInvocationData, type IChatToolInvocationSerialized, type IChatUsage, type IChatUsagePromptTokenDetail, ToolConfirmKind, AgentFeedbackReviewCommandId } from '../../../common/chatService/chatService.js';
 import { isTerminalCommandPrompt, type IChatSessionHistoryItem } from '../../../common/chatSessionsService.js';
 import { type IQuotaSnapshot, type IRateLimitSnapshot } from '../../../../../services/chat/common/chatEntitlementService.js';
 import { ChatToolInvocation } from '../../../common/model/chatProgressTypes/chatToolInvocation.js';
@@ -2228,6 +2228,41 @@ function completedToolCallConfirmedReason(tc: ICompletedToolCall): NonNullable<I
 	return { type: tc.reason === ToolCallCancellationReason.Skipped ? ToolConfirmKind.Skipped : ToolConfirmKind.Denied };
 }
 
+function buildTodoListToolData(toolName: string, toolInput: Parameters<typeof getInlineToolInput>[0]): IChatTodoListContent | undefined {
+	if (toolName !== 'manage_todo_list') {
+		return undefined;
+	}
+	const raw = getInlineToolInput(toolInput);
+	if (!raw) {
+		return undefined;
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		return undefined;
+	}
+	if (!parsed || typeof parsed !== 'object' || !Array.isArray((parsed as { todoList?: unknown }).todoList)) {
+		return undefined;
+	}
+	const todoList: IChatTodoListContent['todoList'] = [];
+	for (const item of (parsed as { todoList: unknown[] }).todoList) {
+		if (!item || typeof item !== 'object') {
+			continue;
+		}
+		const record = item as { id?: unknown; title?: unknown; status?: unknown };
+		if (typeof record.title !== 'string' || record.title.length === 0) {
+			continue;
+		}
+		const status = record.status === 'in-progress' || record.status === 'completed' || record.status === 'not-started'
+			? record.status
+			: 'not-started';
+		const id = typeof record.id === 'number' || typeof record.id === 'string' ? String(record.id) : String(todoList.length + 1);
+		todoList.push({ id, title: record.title, status });
+	}
+	return { kind: 'todoList', todoList };
+}
+
 function getImageGenerationTerminalMessage(tc: ToolCallState): string | undefined {
 	const imageModel = readImageGenerationToolMetadata(tc)?.requestedModel;
 	if (!isImageGenerationTool(tc)) {
@@ -2291,8 +2326,11 @@ export function completedToolCallToSerialized(tc: ICompletedToolCall, subAgentIn
 		};
 	}
 
-	let toolSpecificData: IChatTerminalToolInvocationData | IChatSearchToolInvocationData | IChatToolInputInvocationData | IChatSessionTargetData | IChatGeneratedImageData | IChatAutomationConfiguredData | undefined;
-	if (isTerminal) {
+	const todoListData = buildTodoListToolData(tc.toolName, tc.toolInput);
+	let toolSpecificData: IChatTerminalToolInvocationData | IChatSearchToolInvocationData | IChatToolInputInvocationData | IChatSessionTargetData | IChatGeneratedImageData | IChatAutomationConfiguredData | IChatTodoListContent | undefined;
+	if (todoListData) {
+		toolSpecificData = todoListData;
+	} else if (isTerminal) {
 		toolSpecificData = {
 			...buildTerminalToolSpecificData(tc, sessionResource),
 			terminalCommandState: getTerminalCommandState(tc, isSuccess),
@@ -2865,7 +2903,10 @@ export function toolCallStateToInvocation(tc: ToolCallState, subAgentInvocationI
 		invocation.invocationMessage = addCommentReference(tc, resourceUris) ?? invocation.invocationMessage;
 	}
 
-	if (isTerminalToolCall(tc)) {
+	const todoListData = tc.status === ToolCallStatus.Streaming ? undefined : buildTodoListToolData(tc.toolName, tc.toolInput);
+	if (todoListData) {
+		invocation.toolSpecificData = todoListData;
+	} else if (isTerminalToolCall(tc)) {
 		// Set terminal toolSpecificData eagerly so the renderer shows a
 		// terminal pill (expandable command + output area) from the start,
 		// instead of falling back to the generic tool widget that only

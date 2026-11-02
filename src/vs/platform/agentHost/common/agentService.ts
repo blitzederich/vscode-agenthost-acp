@@ -317,11 +317,18 @@ export function isAgentEnabled(envValue: string | undefined, defaultEnabled: boo
  */
 export const CodexPreferAgentHostEditorSettingId = 'chat.editor.codex.preferAgentHost';
 
+/**
+ * Selects whether the regular workbench surfaces Grok Build from the agent host.
+ * The Agents window surfaces it whenever the provider is enabled.
+ */
+export const GrokBuildPreferAgentHostEditorSettingId = 'chat.editor.grokBuild.preferAgentHost';
+
 export function affectsAgentHostProviderPreference(event: IConfigurationChangeEvent, isSessionsWindow: boolean): boolean {
 	return event.affectsConfiguration(AgentHostClaudeAgentEnabledSettingId)
 		|| event.affectsConfiguration(AgentHostCodexAgentEnabledSettingId)
 		|| event.affectsConfiguration(AgentHostGrokBuildAgentEnabledSettingId)
-		|| (!isSessionsWindow && event.affectsConfiguration(CodexPreferAgentHostEditorSettingId));
+		|| (!isSessionsWindow && event.affectsConfiguration(CodexPreferAgentHostEditorSettingId))
+		|| (!isSessionsWindow && event.affectsConfiguration(GrokBuildPreferAgentHostEditorSettingId));
 }
 
 export function shouldSurfaceLocalAgentHostProvider(provider: AgentProvider, configurationService: IConfigurationService, isSessionsWindow: boolean): boolean {
@@ -332,7 +339,8 @@ export function shouldSurfaceLocalAgentHostProvider(provider: AgentProvider, con
 			return configurationService.getValue<boolean>(AgentHostCodexAgentEnabledSettingId) === true
 				&& (isSessionsWindow || configurationService.getValue<boolean>(CodexPreferAgentHostEditorSettingId) === true);
 		case GROK_BUILD_AGENT_PROVIDER_ID:
-			return configurationService.getValue<boolean>(AgentHostGrokBuildAgentEnabledSettingId) === true;
+			return configurationService.getValue<boolean>(AgentHostGrokBuildAgentEnabledSettingId) === true
+				&& (isSessionsWindow || configurationService.getValue<boolean>(GrokBuildPreferAgentHostEditorSettingId) === true);
 		default:
 			return true;
 	}
@@ -350,7 +358,8 @@ export function isLocalAgentHostProviderDisabledByPolicy(provider: AgentProvider
 export function getPolicyUnavailableLocalAgentHostProviders(configurationService: IConfigurationService, isSessionsWindow: boolean): readonly AgentProvider[] {
 	return [CLAUDE_AGENT_PROVIDER_ID, CODEX_AGENT_PROVIDER_ID, GROK_BUILD_AGENT_PROVIDER_ID].filter(provider =>
 		isLocalAgentHostProviderDisabledByPolicy(provider, configurationService)
-		&& (provider !== CODEX_AGENT_PROVIDER_ID || isSessionsWindow || configurationService.getValue<boolean>(CodexPreferAgentHostEditorSettingId) === true));
+		&& (provider !== CODEX_AGENT_PROVIDER_ID || isSessionsWindow || configurationService.getValue<boolean>(CodexPreferAgentHostEditorSettingId) === true)
+		&& (provider !== GROK_BUILD_AGENT_PROVIDER_ID || isSessionsWindow || configurationService.getValue<boolean>(GrokBuildPreferAgentHostEditorSettingId) === true));
 }
 
 // -- Codex agent settings --------------------------------------------------------

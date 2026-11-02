@@ -5,7 +5,7 @@
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
 import { raceTimeout } from '../../../../base/common/async.js';
-import { Emitter } from '../../../../base/common/event.js';
+import { Emitter, Event } from '../../../../base/common/event.js';
 import { Disposable, DisposableStore, toDisposable } from '../../../../base/common/lifecycle.js';
 import { type IObservable, observableValue } from '../../../../base/common/observable.js';
 import { extUri } from '../../../../base/common/resources.js';
@@ -14,7 +14,6 @@ import { generateUuid } from '../../../../base/common/uuid.js';
 import { localize } from '../../../../nls.js';
 import { ILogService } from '../../../log/common/log.js';
 import { IProductService } from '../../../product/common/productService.js';
-import { createSchema } from '../../common/agentHostSchema.js';
 import { deriveLegacyDefaultChat } from '../../common/agentHostLegacyDefaultChat.js';
 import {
 	AgentChatMigrationResult,
@@ -40,12 +39,15 @@ import {
 	type IAgentSpawnChatEvent,
 	type IAgentToolPendingConfirmationSignal,
 	type IAgentPermissionResponseContext,
+	type IAgentChatOwnerRef,
 	AgentSignal,
 	resolveAgentChatContext,
 } from '../../common/agent.js';
 import { AgentHostGrokBuildBinaryPathEnvVar } from '../../common/agentService.js';
-import type { ChatInputAnswer, ChatInputResponseKind, ClientPluginCustomization, Customization, ModelSelection, ToolCallResult, Turn, UsageInfo } from '../../common/state/sessionState.js';
-import { createErrorResponsePart, MessageKind, ResponsePartKind, TurnState } from '../../common/state/sessionState.js';
+import { SessionConfigKey } from '../../common/sessionConfigKeys.js';
+import type { ConfigSchema } from '../../common/state/protocol/common/state.js';
+import { IAgentConfigurationService, type IAgentChatConfigurationChangeEvent } from '../agentConfigurationService.js';
+import { createErrorResponsePart, MessageKind, ResponsePartKind, TurnState, type ChatInputAnswer, type ChatInputResponseKind, type ClientPluginCustomization, type Customization, type ModelSelection, type ToolCallResult, type Turn, type UsageInfo } from '../../common/state/sessionState.js';
 import type { ProtectedResourceMetadata, ToolDefinition } from '../../common/state/protocol/state.js';
 import type { ResolveSessionConfigResult, SessionConfigCompletionsResult } from '../../common/state/protocol/commands.js';
 import type { SessionAction, ChatAction } from '../../common/state/sessionActions.js';
@@ -96,7 +98,24 @@ import {
 	type IGrokReplayedTurn,
 } from './grokBuildSessionReplay.js';
 import {
+	allowEditsSessionOptionId,
+	buildGrokCommandCustomizations,
+	grokBuildSessionSchema,
+	GROK_PERMISSION_PRESET_ALLOW_EDITS,
+	GROK_REASONING_CONFIG_ID,
+	modeIdForSessionMode,
+	modelWithThinkingLevel,
+	readAvailableCommands,
+	readPermissionPreset,
+	readReasoningEffortOption,
+	reasoningEffortConfigSchema,
+	sameCommands,
+	thinkingLevelOf,
+	type IGrokAvailableCommand,
+} from './grokBuildUx.js';
+import {
 	type AcpAgentCapabilities,
+	type AcpConfigOption,
 	type AcpModelState,
 	type AcpRequestPermissionParams,
 	type AcpRequestPermissionResult,
@@ -108,7 +127,6 @@ import {
 	ACP_PROTOCOL_VERSION,
 } from './protocol/acpTypes.js';
 
-const emptySessionSchema = createSchema({});
 const HANDSHAKE_TIMEOUT_MS = 30_000;
 const GROK_SESSION_LIST_MAX_PAGES = 20;
 
@@ -148,6 +166,14 @@ interface IGrokBuildChatBacking {
 	turnUserText?: string;
 	/** Prompt index of the in-flight turn. Stored on the turn record when it finishes. */
 	turnPromptIndex?: number;
+	/** Reasoning effort last applied or adopted from grok. Persisted in provider data. */
+	reasoningEffort?: string;
+	/** ACP available commands for this session. Exact live payload is to verify. */
+	commands?: readonly IGrokAvailableCommand[];
+	/** Read at use. Not the URI `get()` returned earlier. */
+	ownerRef?: IAgentChatOwnerRef;
+	/** Last `session/set_mode` id accepted for this chat. */
+	appliedModeId?: string;
 	/**
 	 * Cwd to try on the next `session/load` when the backing has none yet.
 	 * Not copied into providerData until that load succeeds.
@@ -202,12 +228,19 @@ function isGrokFsNotFound(error: unknown): boolean {
 	return !!data && typeof data === 'object' && (data as { code?: unknown }).code === 'FS_NOT_FOUND';
 }
 
+function promptIndexUserTextConflicts(previous: IGrokBuildTurnRecord, turn: IGrokReplayedTurn): boolean {
+	return previous.userText.length > 0 && turn.userText.length > 0 && previous.userText !== turn.userText;
+}
+
 /**
- * Replay replaces in-memory turns, but a turn killed mid-reply comes back as
- * a user message only. Keep a local `TurnState.Error` (and its message) when
- * `promptIndex` matches, and never mark a user-only replayed turn complete.
+ * Replay replaces in-memory turns. A user-only replay stays `Cancelled`
+ * (or `Error` when a local error matches) and is never marked complete.
+ * A `promptIndex` match also requires the user text to match when both
+ * sides have text, so a synthesized index cannot attach a failure to a
+ * different turn. A local error with no index, or an index that does not
+ * match this replay row, adopts grok's index when the user text matches.
  */
-function mergeRestoredTurns(local: readonly IGrokBuildTurnRecord[], replayed: readonly IGrokReplayedTurn[]): IGrokBuildTurnRecord[] {
+export function mergeRestoredTurns(local: readonly IGrokBuildTurnRecord[], replayed: readonly IGrokReplayedTurn[]): IGrokBuildTurnRecord[] {
 	const byPrompt = new Map<number, IGrokBuildTurnRecord>();
 	for (const turn of local) {
 		if (typeof turn.promptIndex === 'number') {
@@ -217,16 +250,18 @@ function mergeRestoredTurns(local: readonly IGrokBuildTurnRecord[], replayed: re
 	const consumed = new Set<IGrokBuildTurnRecord>();
 	return replayed.map(turn => {
 		let previous = typeof turn.promptIndex === 'number' ? byPrompt.get(turn.promptIndex) : undefined;
+		if (previous && promptIndexUserTextConflicts(previous, turn)) {
+			previous = undefined;
+		}
 		if (previous) {
 			consumed.add(previous);
 		} else {
-			// A prompt that died before grok assigned an index has none locally.
-			// Match it to grok's replayed turn by the user text and adopt that index.
 			previous = local.find(candidate =>
 				!consumed.has(candidate)
 				&& candidate.state === TurnState.Error
-				&& candidate.promptIndex === undefined
+				&& candidate.userText.length > 0
 				&& candidate.userText === turn.userText
+				&& (candidate.promptIndex === undefined || candidate.promptIndex !== turn.promptIndex)
 			);
 			if (previous) {
 				consumed.add(previous);
@@ -303,12 +338,13 @@ function rethrowAcpFailure(error: unknown): never {
 	throw formatAcpError(error);
 }
 
-function toAgentModelInfo(model: { modelId: string; name?: string }, provider: AgentProvider): IAgentModelInfo {
+function toAgentModelInfo(model: { modelId: string; name?: string }, provider: AgentProvider, schema: ConfigSchema | undefined): IAgentModelInfo {
 	return {
 		provider,
 		id: model.modelId,
 		name: model.name ?? model.modelId,
 		supportsVision: false,
+		...(schema ? { configSchema: schema } : {}),
 	};
 }
 
@@ -331,12 +367,13 @@ function applyModelState(
 	setModels: (models: readonly IAgentModelInfo[]) => void,
 	provider: AgentProvider,
 	state: AcpModelState | undefined,
+	schema: ConfigSchema | undefined,
 ): void {
 	const available = state?.availableModels;
 	if (!available?.length) {
 		return;
 	}
-	setModels(available.map(m => toAgentModelInfo(m, provider)));
+	setModels(available.map(m => toAgentModelInfo(m, provider, schema)));
 }
 
 function textFromSessionUpdate(params: AcpSessionUpdateParams): string | undefined {
@@ -423,15 +460,21 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 	private readonly _listedSessions = new Map<string, AcpSessionInfo>();
 	private _discoveryPromise: Promise<void> | undefined;
 	private _testClient: IAcpClient | undefined;
+	private _reasoningOption: AcpConfigOption | undefined;
 	private _spawn: GrokBuildTestSpawn = spawnGrokBuildProcess;
 	private _resolveBinary: (configuredPath: string | undefined) => Promise<IGrokBuildResolvedBinary> = configuredPath => resolveGrokBinary(configuredPath);
 	private _binaryResolverOverridden = false;
 
+	private readonly _onDidCustomizationsChange = this._register(new Emitter<void>());
+	readonly onDidCustomizationsChange: Event<void> = this._onDidCustomizationsChange.event;
+
 	constructor(
 		@ILogService private readonly _logService: ILogService,
 		@IProductService private readonly _productService: IProductService,
+		@IAgentConfigurationService private readonly _configurationService: IAgentConfigurationService,
 	) {
 		super();
+		this._register(this._configurationService.onDidChatConfigChange(event => this._onChatConfigChanged(event)));
 	}
 
 	getDescriptor(): IAgentDescriptor {
@@ -505,6 +548,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		}
 		const workingDirectories = decoded.cwd ? [URI.file(decoded.cwd)] : undefined;
 		const backing = this._storeBacking(chat, decoded, workingDirectories);
+		this._rememberOwner(backing, context);
 		try {
 			await this._ensureSessionAttached(backing);
 		} catch (err) {
@@ -600,7 +644,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 
 	resolveChatConfig(params: IAgentResolveChatConfigParams): Promise<ResolveSessionConfigResult> {
 		return Promise.resolve({
-			schema: emptySessionSchema.toProtocol(),
+			schema: grokBuildSessionSchema.toProtocol(),
 			values: params.config ?? {},
 		});
 	}
@@ -613,8 +657,11 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		return Promise.resolve({ items: [] });
 	}
 
-	async getChatCustomizations(_chat: URI, _context: URI | IAgentChatContext, hostCustomizations?: readonly Customization[]): Promise<readonly Customization[]> {
-		return hostCustomizations ?? [];
+	async getChatCustomizations(chat: URI, context: URI | IAgentChatContext, hostCustomizations?: readonly Customization[]): Promise<readonly Customization[]> {
+		this._rememberOwner(this._backings.get(chatKey(chat)), context);
+		const commands = this._backings.get(chatKey(chat))?.commands;
+		const container = commands ? buildGrokCommandCustomizations(commands) : undefined;
+		return container ? [...(hostCustomizations ?? []), container] : (hostCustomizations ?? []);
 	}
 
 	getProtectedResources(): ProtectedResourceMetadata[] {
@@ -628,6 +675,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 	async getChatMetadata(chat: URI, context: URI | IAgentChatContext, providerData?: string, options?: IAgentChatMetadataOptions): Promise<IAgentChatMetadata | undefined> {
 		resolveAgentChatContext(context, chat);
 		let backing = this._backings.get(chatKey(chat));
+		this._rememberOwner(backing, context);
 		if (!backing && providerData) {
 			const decoded = decodeGrokBuildChat(providerData);
 			if (!decoded) {
@@ -635,6 +683,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			}
 			if (options?.activation === 'restore') {
 				backing = this._storeBacking(chat, decoded, decoded.cwd ? [URI.file(decoded.cwd)] : undefined);
+				this._rememberOwner(backing, context);
 				await this._ensureSessionAttached(backing);
 			} else {
 				const now = Date.now();
@@ -705,13 +754,17 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		const backing: IGrokBuildChatBacking = {
 			chat,
 			sessionId: persisted.sessionId,
-			model: persisted.model ?? (sameSession ? existing?.model : undefined),
+			model: modelWithThinkingLevel(persisted.model ?? (sameSession ? existing?.model : undefined), persisted.reasoningEffort ?? (sameSession ? existing?.reasoningEffort : undefined)),
 			summary: sameSession ? existing?.summary : undefined,
 			startTime: sameSession && existing ? existing.startTime : now,
 			modifiedTime: now,
 			workingDirectories: directories,
 			turns: sameSession && existing ? existing.turns : [],
 			loadedGeneration: sameSession ? existing?.loadedGeneration : undefined,
+			reasoningEffort: persisted.reasoningEffort ?? (sameSession ? existing?.reasoningEffort : undefined),
+			commands: sameSession ? existing?.commands : undefined,
+			ownerRef: sameSession ? existing?.ownerRef : undefined,
+			appliedModeId: sameSession ? existing?.appliedModeId : undefined,
 		};
 		this._backings.set(chatKey(chat), backing);
 		this._sessionToChat.set(persisted.sessionId, chat);
@@ -723,6 +776,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			sessionId: backing.sessionId,
 			model: backing.model,
 			cwd: backing.workingDirectories?.[0]?.fsPath,
+			reasoningEffort: backing.reasoningEffort,
 		});
 	}
 
@@ -762,7 +816,8 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			rethrowAcpFailure(err);
 		}
 
-		applyModelState(models => this._models.set(models, undefined), this.id, sessionNew.models);
+		this._rememberReasoningOption(readReasoningEffortOption(sessionNew.configOptions));
+		this._publishModels(sessionNew.models);
 
 		let model = options?.model;
 		if (options?.model?.id) {
@@ -779,8 +834,29 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			}
 		}
 
-		const backing = this._storeBacking(chat, { sessionId: sessionNew.sessionId, model }, workingDirectories);
+		const requestedEffort = thinkingLevelOf(options?.model);
+		let reasoningEffort = requestedEffort ?? this._reasoningOption?.currentValue;
+		if (requestedEffort) {
+			try {
+				await client.request('session/set_config_option', {
+					sessionId: sessionNew.sessionId,
+					configId: GROK_REASONING_CONFIG_ID,
+					value: requestedEffort,
+				});
+			} catch (err) {
+				const formatted = formatAcpError(err);
+				this._logService.warn(`[GrokBuild] session/set_config_option failed; keeping grok's reasoning effort: ${formatted.message}`);
+				reasoningEffort = this._reasoningOption?.currentValue;
+			}
+		}
+
+		const backing = this._storeBacking(chat, { sessionId: sessionNew.sessionId, model: modelWithThinkingLevel(model, reasoningEffort), reasoningEffort }, workingDirectories);
+		this._rememberOwner(backing, context);
 		backing.loadedGeneration = this._connectionGeneration;
+		const modeId = modeIdForSessionMode(options?.config?.[SessionConfigKey.Mode]);
+		if (modeId) {
+			await this._applySessionMode(backing, modeId);
+		}
 		const providerData = this._persistProviderData(backing);
 		const result: IAgentCreateChatResult = {
 			providerData,
@@ -809,6 +885,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			resolveAgentChatContext(context, chat);
 		}
 		const backing = this._requireBacking(chat);
+		this._rememberOwner(backing, context);
 		const workingDirectories = this._resolveWorkingDirectories(workingDirectoriesOrDirectory);
 		if (workingDirectories && workingDirectories.length > 0) {
 			const next = workingDirectories[0];
@@ -838,8 +915,9 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 				sessionId: backing.sessionId,
 				prompt: [{ type: 'text', text: prompt }],
 			});
-			const usage = toUsageInfo(result._meta?.usage);
-			for (const action of mapUsage(turn, result._meta?.usage)) {
+			const promptMeta = result._meta;
+			const usage = toUsageInfo(promptMeta?.usage);
+			for (const action of mapUsage(turn, promptMeta?.usage)) {
 				this._fireAction(chat, action);
 			}
 			for (const action of mapTurnCompleted(turn, result.stopReason)) {
@@ -847,7 +925,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			}
 			// The prompt result means grok recorded the turn. Number it only then,
 			// unless an update already carried grok's own promptIndex.
-			this._notePromptAccepted(backing, result._meta);
+			this._notePromptAccepted(backing, promptMeta);
 			this._finalizeTurn(backing, turn, result.stopReason === 'cancelled' ? TurnState.Cancelled : TurnState.Complete, usage);
 		} catch (err) {
 			// A dead grok process records the turn before this rejection is delivered.
@@ -858,6 +936,14 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			const recorded = backing.turns.find(record => record.id === turn)?.errorMessage;
 			if (recorded) {
 				throw new Error(recorded);
+			}
+			// The process is still alive, so grok did not accept the prompt.
+			// Leave promptIndex unset and let the next session/load adopt grok's index.
+			if (this._connection?.client) {
+				backing.turnPromptIndex = undefined;
+				const formatted = formatAcpError(err);
+				this._finalizeTurn(backing, turn, TurnState.Error, undefined, formatted.message);
+				throw formatted;
 			}
 			rethrowAcpFailure(err);
 		} finally {
@@ -901,7 +987,21 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		} catch (err) {
 			rethrowAcpFailure(err);
 		}
-		backing.model = model;
+		const requestedEffort = thinkingLevelOf(model);
+		if (requestedEffort && requestedEffort !== backing.reasoningEffort) {
+			try {
+				await client.request('session/set_config_option', {
+					sessionId: backing.sessionId,
+					configId: GROK_REASONING_CONFIG_ID,
+					value: requestedEffort,
+				});
+			} catch (err) {
+				rethrowAcpFailure(err);
+			}
+			backing.reasoningEffort = requestedEffort;
+		}
+		const effort = backing.reasoningEffort;
+		backing.model = modelWithThinkingLevel(model, effort);
 		backing.modifiedTime = Date.now();
 		this._emitProviderDataChange(chat, backing);
 	}
@@ -1091,7 +1191,8 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 					cwd,
 					mcpServers: [],
 				});
-				applyModelState(models => this._models.set(models, undefined), this.id, result.models);
+				this._rememberReasoningOption(readReasoningEffortOption(result.configOptions));
+				this._publishModels(result.models);
 				const modelId = result.models?.currentModelId;
 				if (typeof modelId === 'string' && modelId.length > 0 && !backing.model) {
 					backing.model = { id: modelId };
@@ -1104,6 +1205,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 				} else if (history.title) {
 					backing.summary = history.title;
 				}
+				await this._reapplyReasoningEffort(client, backing);
 				backing.modifiedTime = Date.now();
 			} catch (err) {
 				if (isGrokFsNotFound(err)) {
@@ -1123,7 +1225,9 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 					cwd,
 					mcpServers: [],
 				});
-				applyModelState(models => this._models.set(models, undefined), this.id, result.models);
+				this._rememberReasoningOption(readReasoningEffortOption(result.configOptions));
+				this._publishModels(result.models);
+				await this._reapplyReasoningEffort(client, backing);
 			} catch (err) {
 				rethrowAcpFailure(err);
 			}
@@ -1170,6 +1274,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			throw grokSessionMissingError();
 		}
 		const backing = this._storeBacking(chat, { sessionId }, undefined);
+		this._rememberOwner(backing, context);
 		backing.pendingLoadCwd = cwd;
 		try {
 			await this._ensureSessionAttached(backing);
@@ -1383,7 +1488,8 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 				throw grokHandshakeTimeoutError('initialize');
 			}
 			capabilities = readGrokCapabilities(init.agentCapabilities);
-			applyModelState(models => this._models.set(models, undefined), this.id, init._meta?.modelState);
+			const initMeta = init._meta;
+			this._publishModels(initMeta?.modelState);
 
 			// Do not log the authenticate result — `_meta` includes email / team / tier.
 			const auth = await raceTimeout(
@@ -1475,6 +1581,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 	}
 
 	private _handleSessionUpdate(params: AcpSessionUpdateParams): void {
+		this._captureSessionSideChannel(params);
 		const replay = this._historyReplays.get(params.sessionId);
 		if (replay) {
 			applyGrokHistoryUpdate(replay, params.update);
@@ -1526,6 +1633,11 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			});
 		}
 
+		const autoOptionId = this._autoEditOptionId(backing, params);
+		if (autoOptionId) {
+			return Promise.resolve({ result: { outcome: { outcome: 'selected', optionId: autoOptionId } } });
+		}
+
 		return new Promise<AcpServerRequestHandlerResult<AcpRequestPermissionResult>>(resolve => {
 			this._pendingPermissions.set(mapped.toolCallId, {
 				chat,
@@ -1544,6 +1656,150 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			} catch {
 				// already dead
 			}
+		}
+	}
+
+	private _rememberOwner(backing: IGrokBuildChatBacking | undefined, context: URI | IAgentChatContext | undefined): void {
+		if (!backing || !context || URI.isUri(context)) {
+			return;
+		}
+		backing.ownerRef = context.owner;
+	}
+
+	private _chatConfig(backing: IGrokBuildChatBacking): Record<string, unknown> | undefined {
+		const owner = backing.ownerRef?.get();
+		if (!owner) {
+			return undefined;
+		}
+		return this._configurationService.getChatConfigValues({ session: owner.toString(), chat: backing.chat.toString() });
+	}
+
+	private _reasoningSchema(): ConfigSchema | undefined {
+		return reasoningEffortConfigSchema(this._reasoningOption);
+	}
+
+	private _rememberReasoningOption(option: AcpConfigOption | undefined): void {
+		if (option) {
+			this._reasoningOption = option;
+		}
+	}
+
+	private _publishModels(state: AcpModelState | undefined): void {
+		const schema = this._reasoningSchema();
+		const before = this._models.get();
+		applyModelState(models => this._models.set(models, undefined), this.id, state, schema);
+		if (state?.availableModels?.length || before.length === 0 || !schema) {
+			return;
+		}
+		this._models.set(before.map(model => ({ ...model, configSchema: schema })), undefined);
+	}
+
+	private async _reapplyReasoningEffort(client: IAcpClient, backing: IGrokBuildChatBacking): Promise<void> {
+		const current = typeof this._reasoningOption?.currentValue === 'string' ? this._reasoningOption.currentValue : undefined;
+		const wanted = backing.reasoningEffort;
+		if (wanted && wanted !== current) {
+			try {
+				await client.request('session/set_config_option', {
+					sessionId: backing.sessionId,
+					configId: GROK_REASONING_CONFIG_ID,
+					value: wanted,
+				});
+			} catch (err) {
+				const formatted = formatAcpError(err);
+				this._logService.warn(`[GrokBuild] session/set_config_option failed after load: ${formatted.message}`);
+				return;
+			}
+		} else if (!wanted && current) {
+			backing.reasoningEffort = current;
+			backing.model = modelWithThinkingLevel(backing.model, current);
+			this._emitProviderDataChange(backing.chat, backing);
+			return;
+		}
+		if (wanted) {
+			backing.model = modelWithThinkingLevel(backing.model, wanted);
+		}
+	}
+
+	private _captureSessionSideChannel(params: AcpSessionUpdateParams): void {
+		const update = params.update;
+		if (!update || typeof update.sessionUpdate !== 'string') {
+			return;
+		}
+		const chat = this._sessionToChat.get(params.sessionId);
+		const backing = chat ? this._backings.get(chatKey(chat)) : undefined;
+		if (!backing) {
+			return;
+		}
+		if (update.sessionUpdate === 'available_commands_update') {
+			const commands = readAvailableCommands(update);
+			if (!commands || sameCommands(backing.commands, commands)) {
+				return;
+			}
+			backing.commands = commands;
+			this._onDidCustomizationsChange.fire();
+			return;
+		}
+		if (update.sessionUpdate === 'config_option_update') {
+			const raw = (update as { configOptions?: unknown }).configOptions;
+			const option = Array.isArray(raw) ? readReasoningEffortOption(raw) : undefined;
+			if (option) {
+				this._rememberReasoningOption(option);
+				this._publishModels(undefined);
+			}
+		}
+	}
+
+	private _autoEditOptionId(backing: IGrokBuildChatBacking | undefined, params: AcpRequestPermissionParams): string | undefined {
+		if (!backing || readPermissionPreset(this._chatConfig(backing)) !== GROK_PERMISSION_PRESET_ALLOW_EDITS) {
+			return undefined;
+		}
+		const toolCallId = params.toolCall?.toolCallId;
+		const entry = toolCallId ? backing.mapState?.toolCalls.get(toolCallId) : undefined;
+		const toolMeta = params.toolCall?._meta;
+		const xai = toolMeta?.['x.ai/tool'];
+		const xaiRecord = xai && typeof xai === 'object' ? xai as { kind?: unknown; name?: unknown } : undefined;
+		return allowEditsSessionOptionId(params.options ?? [], {
+			kind: typeof xaiRecord?.kind === 'string' ? xaiRecord.kind : params.toolCall?.kind,
+			name: typeof xaiRecord?.name === 'string' ? xaiRecord.name : undefined,
+			permissionKind: entry?.permissionKind,
+		});
+	}
+
+	private async _applySessionMode(backing: IGrokBuildChatBacking, modeId: string): Promise<void> {
+		if (backing.appliedModeId === modeId) {
+			return;
+		}
+		try {
+			await this._ensureSessionAttached(backing);
+			const client = this._connection?.client;
+			if (!client || backing.loadedGeneration !== this._connectionGeneration) {
+				return;
+			}
+			await client.request('session/set_mode', { sessionId: backing.sessionId, modeId });
+			backing.appliedModeId = modeId;
+		} catch (err) {
+			const formatted = formatAcpError(err);
+			this._logService.warn(`[GrokBuild] session/set_mode ${modeId} failed: ${formatted.message}`);
+		}
+	}
+
+	private _onChatConfigChanged(event: IAgentChatConfigurationChangeEvent): void {
+		if (!Object.hasOwn(event.config, SessionConfigKey.Mode)) {
+			return;
+		}
+		const modeId = modeIdForSessionMode(event.config[SessionConfigKey.Mode]);
+		if (!modeId) {
+			return;
+		}
+		for (const backing of this._backings.values()) {
+			if (backing.chat.toString() !== event.chat) {
+				continue;
+			}
+			const owner = backing.ownerRef?.get().toString();
+			if (owner && owner !== event.session) {
+				continue;
+			}
+			void this._applySessionMode(backing, modeId);
 		}
 	}
 

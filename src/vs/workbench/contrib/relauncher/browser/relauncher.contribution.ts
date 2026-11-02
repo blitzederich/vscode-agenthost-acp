@@ -47,7 +47,7 @@ interface IConfiguration extends IWindowsConfiguration {
 				dbSpanExporter?: { enabled?: boolean };
 			};
 		};
-		editor?: { codex?: { preferAgentHost?: boolean } };
+		editor?: { codex?: { preferAgentHost?: boolean }; grokBuild?: { preferAgentHost?: boolean } };
 	};
 	_extensionsGallery?: { enablePPE?: boolean };
 	accessibility?: { verbosity?: { debug?: boolean } };
@@ -74,6 +74,7 @@ export class SettingsChangeRelauncher extends Disposable implements IWorkbenchCo
 		'chat.agentHost.claudeAgent.enabled',
 		'chat.agentHost.computerUse.enabled',
 		'chat.editor.codex.preferAgentHost',
+		'chat.editor.grokBuild.preferAgentHost',
 		'chat.agentHost.otel.enabled',
 		'chat.agentHost.otel.exporterType',
 		'chat.agentHost.otel.otlpEndpoint',
@@ -100,6 +101,7 @@ export class SettingsChangeRelauncher extends Disposable implements IWorkbenchCo
 	private readonly agentHostClaudeAgentEnabled = new ChangeObserver('boolean');
 	private readonly agentHostComputerUseEnabled = new ChangeObserver('boolean');
 	private readonly editorCodexPreferAgentHost = new ChangeObserver('boolean');
+	private readonly editorGrokBuildPreferAgentHost = new ChangeObserver('boolean');
 	private readonly agentHostOTelEnabled = new ChangeObserver('boolean');
 	private readonly agentHostOTelExporterType = new ChangeObserver('string');
 	private readonly agentHostOTelOtlpEndpoint = new ChangeObserver('string');
@@ -201,6 +203,7 @@ export class SettingsChangeRelauncher extends Disposable implements IWorkbenchCo
 		// Agent provider registration and implementation preferences are read at spawn.
 		processChanged(this.agentHostClaudeAgentEnabled.handleChange(config.chat?.agentHost?.claudeAgent?.enabled));
 		processChanged(this.editorCodexPreferAgentHost.handleChange(config.chat?.editor?.codex?.preferAgentHost));
+		processChanged(this.editorGrokBuildPreferAgentHost.handleChange(config.chat?.editor?.grokBuild?.preferAgentHost));
 
 		// The Copilot runtime registers its Computer Use plugin when it starts, and chats keep the tools they started with.
 		processChanged(this.agentHostComputerUseEnabled.handleChange(config.chat?.agentHost?.computerUse?.enabled));

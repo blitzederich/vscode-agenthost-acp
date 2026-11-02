@@ -17,6 +17,12 @@ export interface IGrokBuildPersistedChat {
 	readonly sessionId: string;
 	readonly model?: ModelSelection;
 	readonly cwd?: string;
+	/**
+	 * Last reasoning effort applied with `session/set_config_option`, or the
+	 * value grok reported when the user has not chosen one. Re-applied after
+	 * `session/load` when grok's `currentValue` differs.
+	 */
+	readonly reasoningEffort?: string;
 }
 
 export function encodeGrokBuildChat(chat: IGrokBuildPersistedChat): string {
@@ -31,10 +37,15 @@ export function decodeGrokBuildChat(data: string | undefined): IGrokBuildPersist
 		const parsed = JSON.parse(data);
 		if (parsed && typeof parsed.sessionId === 'string') {
 			const cwd = typeof parsed.cwd === 'string' && parsed.cwd.length > 0 ? parsed.cwd : undefined;
+			const fromModel = parsed.model?.config?.thinkingLevel;
+			const reasoningEffort = typeof parsed.reasoningEffort === 'string' && parsed.reasoningEffort.length > 0
+				? parsed.reasoningEffort
+				: typeof fromModel === 'string' && fromModel.length > 0 ? fromModel : undefined;
 			return {
 				sessionId: parsed.sessionId,
 				model: parsed.model,
 				cwd,
+				reasoningEffort,
 			};
 		}
 	} catch {
