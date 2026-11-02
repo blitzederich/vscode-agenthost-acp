@@ -139,10 +139,16 @@ import {
 	type AcpSessionInfo,
 	type AcpSessionListParams,
 	type AcpSessionListResult,
+	type AcpSessionUpdate,
 	type AcpSessionUpdateParams,
+	type AcpToolCallUpdate,
 	type AcpUsage,
 	ACP_PROTOCOL_VERSION,
 } from './protocol/acpTypes.js';
+
+function isAcpToolCallUpdate(update: AcpSessionUpdate): update is AcpToolCallUpdate {
+	return update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update';
+}
 
 /** Plan-review action: approve and leave plan mode so grok can execute. */
 const GROK_PLAN_REVIEW_APPROVE_ID = 'approve';
@@ -2133,7 +2139,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			this._fireAction(chat, action);
 		}
 		const update = params.update;
-		if (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') {
+		if (isAcpToolCallUpdate(update)) {
 			const status = (update.status ?? '').toLowerCase();
 			if (status === 'completed' || status === 'failed' || status === 'cancelled') {
 				// Grok finished the card (e.g. ask timeout) without waiting for our reply.

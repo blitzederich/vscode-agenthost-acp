@@ -728,7 +728,6 @@ export function mapPendingRequestCancelled(
 	}];
 }
 
-
 export function mapUsage(turnId: string, usage: AcpUsage | undefined): (SessionAction | ChatAction)[] {
 	if (!usage) {
 		return [];
