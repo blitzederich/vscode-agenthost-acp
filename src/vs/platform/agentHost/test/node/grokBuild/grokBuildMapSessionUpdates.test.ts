@@ -10,9 +10,11 @@ import { AgentPermissionKind } from '../../../common/agent.js';
 import { grokBuildTodoListMetaKey } from '../../../common/meta/agentToolCallMeta.js';
 import { chatReducer } from '../../../common/state/protocol/reducers.js';
 import { ActionType, type ChatAction } from '../../../common/state/sessionActions.js';
-import { ChatOriginKind, ResponsePartKind, SessionStatus, type ChatState } from '../../../common/state/sessionState.js';
+import { ChatOriginKind, ResponsePartKind, SessionStatus, ToolResultContentType, type ChatState } from '../../../common/state/sessionState.js';
 import {
 	createGrokBuildMapState,
+	GROK_PRESENT_PLAN_DISPLAY_NAME,
+	mapExitPlanContent,
 	mapPermissionRequest,
 	mapSessionUpdate,
 	mapTurnCompleted,
@@ -346,5 +348,109 @@ suite('GrokBuild mapSessionUpdates', () => {
 		assert.strictEqual(start.toolName, 'task');
 		assert.strictEqual(start._meta?.toolKind, 'subagent');
 		assert.strictEqual(start._meta?.subagentDescription, 'List current directory');
+	});
+
+	test('exit_plan tool cards use Present plan and hide placeholder input', () => {
+		const state = createGrokBuildMapState('turn-1');
+		const start = mapSessionUpdate(state, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'tool_call',
+				toolCallId: 'call-exit',
+				title: 'exit_plan_mode',
+				rawInput: {},
+				_meta: { 'x.ai/tool': { name: 'exit_plan_mode', kind: 'exit_plan', label: 'Exit Plan Mode', read_only: true } },
+			},
+		});
+		const startAction = start.find(action => action.type === ActionType.ChatToolCallStart);
+		assert.ok(startAction && startAction.type === ActionType.ChatToolCallStart);
+		assert.strictEqual(startAction.displayName, GROK_PRESENT_PLAN_DISPLAY_NAME);
+		const ready = start.find(action => action.type === ActionType.ChatToolCallReady);
+		assert.ok(ready && ready.type === ActionType.ChatToolCallReady);
+		assert.strictEqual(ready.toolInput, '');
+		assert.ok(!start.some(action => action.type === ActionType.ChatToolCallDelta && (action as { content?: string }).content === '{}'));
+
+		const update = mapSessionUpdate(state, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'tool_call_update',
+				toolCallId: 'call-exit',
+				title: 'Plan: Exit',
+				rawInput: { variant: 'ExitPlanMode' },
+				_meta: { 'x.ai/tool': { name: 'exit_plan_mode', kind: 'exit_plan', label: 'Exit Plan Mode', read_only: true } },
+			},
+		});
+		assert.ok(!update.some(action => {
+			if (action.type !== ActionType.ChatToolCallDelta) {
+				return false;
+			}
+			const content = action.content ?? '';
+			return content.includes('ExitPlanMode') || content === '{}';
+		}));
+
+		const planActions = mapExitPlanContent(state, 'call-exit', '# Ship it');
+		assert.ok(planActions.some(action => action.type === ActionType.ChatToolCallContentChanged));
+		assert.ok(!planActions.some(action => action.type === ActionType.ChatToolCallDelta), 'plan should render once via content, not also as tool input delta');
+		const content = planActions.find(action => action.type === ActionType.ChatToolCallContentChanged);
+		assert.ok(content && content.type === ActionType.ChatToolCallContentChanged);
+		assert.deepStrictEqual(content.content, [{ type: ToolResultContentType.Text, text: '# Ship it' }]);
+	});
+
+	test('nested text content blocks become tool result and failure text', () => {
+		const state = createGrokBuildMapState('turn-1');
+		mapSessionUpdate(state, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'tool_call',
+				toolCallId: 'call-fail',
+				title: 'search_replace',
+				kind: 'edit',
+				rawInput: { file_path: '/tmp/a.txt' },
+				_meta: { 'x.ai/tool': { name: 'search_replace', kind: 'edit', label: 'Edit' } },
+			},
+		});
+		const failed = mapSessionUpdate(state, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'tool_call_update',
+				toolCallId: 'call-fail',
+				status: 'failed',
+				content: [{ type: 'content', content: { type: 'text', text: 'User rejected the execution for tool `search_replace`' } }],
+			},
+		});
+		const complete = failed.find(action => action.type === ActionType.ChatToolCallComplete);
+		assert.ok(complete && complete.type === ActionType.ChatToolCallComplete);
+		assert.strictEqual(complete.result.success, false);
+		assert.strictEqual(complete.result.error?.message, 'User rejected the execution for tool `search_replace`');
+		assert.ok(complete.result.content?.some(block => block.type === ToolResultContentType.Text && block.text.includes('User rejected')));
+	});
+
+	test('normal tools prefer rawOutput over ACP content text', () => {
+		const state = createGrokBuildMapState('turn-1');
+		mapSessionUpdate(state, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'tool_call',
+				toolCallId: 'call-grep',
+				title: 'grep',
+				rawInput: { pattern: 'foo' },
+				_meta: { 'x.ai/tool': { name: 'grep', kind: 'search', label: 'Grep' } },
+			},
+		});
+		const completed = mapSessionUpdate(state, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'tool_call_update',
+				toolCallId: 'call-grep',
+				status: 'completed',
+				content: [{ type: 'content', content: { type: 'text', text: 'found 40 matches' } }],
+				rawOutput: 'src/a.ts:1:foo\nsrc/b.ts:2:foo\n',
+			},
+		});
+		const complete = completed.find(action => action.type === ActionType.ChatToolCallComplete);
+		assert.ok(complete && complete.type === ActionType.ChatToolCallComplete);
+		assert.strictEqual(complete.result.success, true);
+		assert.ok(complete.result.content?.some(block => block.type === ToolResultContentType.Text && block.text === 'src/a.ts:1:foo\nsrc/b.ts:2:foo\n'));
+		assert.ok(!complete.result.content?.some(block => block.type === ToolResultContentType.Text && block.text === 'found 40 matches'));
 	});
 });

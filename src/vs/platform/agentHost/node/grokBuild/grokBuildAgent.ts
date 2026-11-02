@@ -42,14 +42,16 @@ import {
 	AgentSignal,
 	resolveAgentChatContext,
 } from '../../common/agent.js';
+import { type ChatInputRequestWithPlanReview, type IAgentHostPlanReviewAction } from '../../common/agentHostPlanReview.js';
 import { AgentHostGrokBuildBinaryPathEnvVar } from '../../common/agentService.js';
+import { ChatInputRequestPurpose, withChatInputRequestPurpose } from '../../common/meta/agentChatInputRequestMeta.js';
 import { SessionConfigKey } from '../../common/sessionConfigKeys.js';
 import type { ConfigSchema } from '../../common/state/protocol/common/state.js';
 import { IAgentConfigurationService, type IAgentChatConfigurationChangeEvent } from '../agentConfigurationService.js';
-import { createErrorResponsePart, MessageKind, ResponsePartKind, TurnState, type ChatInputAnswer, type ChatInputResponseKind, type ClientPluginCustomization, type Customization, type ModelSelection, type ToolCallResult, type Turn, type UsageInfo } from '../../common/state/sessionState.js';
+import { ActionType, type ChatAction, type SessionAction } from '../../common/state/sessionActions.js';
+import { ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, ChatInputResponseKind, createErrorResponsePart, MessageKind, ResponsePartKind, TurnState, type ChatInputAnswer, type ClientPluginCustomization, type Customization, type ModelSelection, type ToolCallResult, type Turn, type UsageInfo } from '../../common/state/sessionState.js';
 import type { ProtectedResourceMetadata, ToolDefinition } from '../../common/state/protocol/state.js';
 import type { ResolveSessionConfigResult, SessionConfigCompletionsResult } from '../../common/state/protocol/commands.js';
-import type { SessionAction, ChatAction } from '../../common/state/sessionActions.js';
 import {
 	AcpClient,
 	AcpJsonRpcErrorCode,
@@ -84,6 +86,8 @@ import {
 } from './grokBuildLaunchConfig.js';
 import {
 	createGrokBuildMapState,
+	mapExitPlanCancelled,
+	mapExitPlanContent,
 	mapPermissionRequest,
 	mapSessionUpdate,
 	mapTurnCompleted,
@@ -105,6 +109,7 @@ import {
 	buildGrokCommandCustomizations,
 	grokBuildSessionSchema,
 	grokPlanModeFailedError,
+	GROK_DEFAULT_MODE_ID,
 	GROK_PERMISSION_PRESET_ALLOW_EDITS,
 	GROK_PLAN_MODE_ID,
 	GROK_REASONING_CONFIG_ID,
@@ -122,6 +127,8 @@ import {
 import {
 	type AcpAgentCapabilities,
 	type AcpConfigOption,
+	type AcpExitPlanModeParams,
+	type AcpExitPlanModeResult,
 	type AcpModelState,
 	type AcpRequestPermissionParams,
 	type AcpRequestPermissionResult,
@@ -132,6 +139,11 @@ import {
 	type AcpUsage,
 	ACP_PROTOCOL_VERSION,
 } from './protocol/acpTypes.js';
+
+/** Plan-review action: approve and leave plan mode so grok can execute. */
+const GROK_PLAN_REVIEW_APPROVE_ID = 'approve';
+/** Plan-review action: leave plan mode without executing. */
+const GROK_PLAN_REVIEW_ABANDON_ID = 'abandon';
 
 const HANDSHAKE_TIMEOUT_MS = 30_000;
 const GROK_SESSION_LIST_MAX_PAGES = 20;
@@ -238,6 +250,15 @@ interface IPendingPermission {
 	readonly turnId: string;
 	readonly options: AcpRequestPermissionParams['options'];
 	resolve(result: AcpServerRequestHandlerResult<AcpRequestPermissionResult>): void;
+}
+
+interface IPendingPlanReview {
+	readonly chat: URI;
+	readonly sessionId: string;
+	readonly turnId: string;
+	readonly toolCallId: string;
+	readonly questionId: string;
+	resolve(result: AcpServerRequestHandlerResult<AcpExitPlanModeResult>): void;
 }
 
 interface IConnection {
@@ -497,6 +518,13 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 	private readonly _backings = new Map<string, IGrokBuildChatBacking>();
 	private readonly _sessionToChat = new Map<string, URI>();
 	private readonly _pendingPermissions = new Map<string, IPendingPermission>();
+	/** Pending `_x.ai/exit_plan_mode` reviews, keyed by chat-input request id. */
+	private readonly _pendingPlanReviews = new Map<string, IPendingPlanReview>();
+	/**
+	 * ACP session ids that left plan via approve/abandon and are waiting for
+	 * `current_mode_update` `default` so chat config can move to interactive.
+	 */
+	private readonly _sessionsExitingPlanMode = new Set<string>();
 	private readonly _activeClients = new Map<string, Map<string, IActiveClient>>();
 	private readonly _restoreInFlight = new Map<string, Promise<void>>();
 	private readonly _tornDown = new WeakSet<IAcpClient>();
@@ -693,8 +721,13 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		this._pendingPermissions.delete(requestId);
 	}
 
-	respondToUserInputRequest(_requestId: string, _response: ChatInputResponseKind, _answers?: Record<string, ChatInputAnswer>): void {
-		// No ask_user bridge.
+	respondToUserInputRequest(requestId: string, response: ChatInputResponseKind, answers?: Record<string, ChatInputAnswer>): void {
+		const pending = this._pendingPlanReviews.get(requestId);
+		if (!pending) {
+			return;
+		}
+		const result = this._resolveExitPlanMode(pending, response, answers);
+		this._completePlanReview(requestId, { result });
 	}
 
 	async setWorkingDirectory(chat: URI, context: URI | IAgentChatContext, workingDirectory: URI): Promise<void> {
@@ -801,6 +834,8 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		this._backings.clear();
 		this._sessionToChat.clear();
 		this._pendingPermissions.clear();
+		this._pendingPlanReviews.clear();
+		this._sessionsExitingPlanMode.clear();
 		this._activeClients.clear();
 		super.dispose();
 	}
@@ -1178,6 +1213,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			pending.resolve({ result: { outcome: { outcome: 'cancelled' } } });
 			this._pendingPermissions.delete(toolCallId);
 		}
+		this._cancelPendingPlanReviewsForChat(chat);
 	}
 
 	private _cancelAllPendingPermissions(): void {
@@ -1185,6 +1221,104 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			pending.resolve({ result: { outcome: { outcome: 'cancelled' } } });
 			this._pendingPermissions.delete(toolCallId);
 		}
+		this._cancelAllPendingPlanReviews();
+	}
+
+	private _cancelPendingPlanReviewsForChat(chat: URI): void {
+		for (const [requestId, pending] of [...this._pendingPlanReviews]) {
+			if (pending.chat.toString() !== chat.toString()) {
+				continue;
+			}
+			this._dismissPlanReview(requestId, pending, { result: { outcome: 'revise' } });
+		}
+	}
+
+	private _cancelAllPendingPlanReviews(): void {
+		for (const [requestId, pending] of [...this._pendingPlanReviews]) {
+			this._dismissPlanReview(requestId, pending, { result: { outcome: 'revise' } });
+		}
+	}
+
+	/**
+	 * Resolve a parked plan review without approving, dismiss the review UI, and
+	 * mark the exit_plan_mode tool card cancelled (grok sends no update for it).
+	 */
+	private _dismissPlanReview(
+		requestId: string,
+		pending: IPendingPlanReview,
+		result: AcpServerRequestHandlerResult<AcpExitPlanModeResult>,
+	): void {
+		if (!this._pendingPlanReviews.has(requestId)) {
+			return;
+		}
+		this._pendingPlanReviews.delete(requestId);
+		this._sessionsExitingPlanMode.delete(pending.sessionId);
+		pending.resolve(result);
+		this._fireAction(pending.chat, {
+			type: ActionType.ChatInputCompleted,
+			requestId,
+			response: ChatInputResponseKind.Cancel,
+		});
+		const backing = this._backings.get(chatKey(pending.chat));
+		if (backing?.mapState) {
+			for (const action of mapExitPlanCancelled(backing.mapState, pending.toolCallId)) {
+				this._fireAction(pending.chat, action);
+			}
+		}
+	}
+
+	private _completePlanReview(requestId: string, result: AcpServerRequestHandlerResult<AcpExitPlanModeResult>): void {
+		const pending = this._pendingPlanReviews.get(requestId);
+		if (!pending) {
+			return;
+		}
+		this._pendingPlanReviews.delete(requestId);
+		const outcome = result.result?.outcome;
+		if (outcome === 'approved' || outcome === 'abandoned') {
+			this._sessionsExitingPlanMode.add(pending.sessionId);
+		} else {
+			this._sessionsExitingPlanMode.delete(pending.sessionId);
+		}
+		pending.resolve(result);
+	}
+
+	/**
+	 * Maps a plan-review input response to `_x.ai/exit_plan_mode` outcome.
+	 * Never defaults to `approved`: decline / skip / cancel / unknown → `revise`.
+	 */
+	private _resolveExitPlanMode(
+		pending: IPendingPlanReview,
+		response: ChatInputResponseKind,
+		answers?: Record<string, ChatInputAnswer>,
+	): AcpExitPlanModeResult {
+		if (response !== ChatInputResponseKind.Accept) {
+			return { outcome: 'revise' };
+		}
+		const answer = answers?.[pending.questionId];
+		if (!answer || answer.state === ChatInputAnswerState.Skipped) {
+			return { outcome: 'revise' };
+		}
+		const value = answer.value;
+		let actionId: string | undefined;
+		let feedback: string | undefined;
+		if (value.kind === ChatInputAnswerValueKind.Selected) {
+			actionId = value.value;
+			feedback = value.freeformValues?.find(s => s.trim().length > 0)?.trim();
+		} else if (value.kind === ChatInputAnswerValueKind.Text) {
+			feedback = value.value.trim() || undefined;
+		} else {
+			return { outcome: 'revise' };
+		}
+		if (feedback) {
+			return { outcome: 'revise', feedback };
+		}
+		if (actionId === GROK_PLAN_REVIEW_APPROVE_ID) {
+			return { outcome: 'approved' };
+		}
+		if (actionId === GROK_PLAN_REVIEW_ABANDON_ID) {
+			return { outcome: 'abandoned' };
+		}
+		return { outcome: 'revise' };
 	}
 
 	private _failActiveTurns(error: Error): void {
@@ -1585,7 +1719,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			const transportExit = grokExitFromTransportError(err);
 			const exitError = transportExit
 				? grokExitStatusError(transportExit.code, transportExit.signal, this._stderrTail)
-					?? grokProcessExitedError(transportExit.code, transportExit.signal, this._stderrTail)
+				?? grokProcessExitedError(transportExit.code, transportExit.signal, this._stderrTail)
 				: undefined;
 			const error = isGrokAuthError(err)
 				? new Error(withStderrTail(grokNotLoggedInError().message, this._stderrTail))
@@ -1663,6 +1797,9 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		store.add(client.onRequest('session/request_permission', params => {
 			return this._handlePermissionRequest(params as AcpRequestPermissionParams);
 		}));
+		store.add(client.onRequest('_x.ai/exit_plan_mode', params => {
+			return this._handleExitPlanModeRequest(params as AcpExitPlanModeParams);
+		}));
 		store.add(client.onUnhandledNotification((method, _params) => {
 			this._logService.trace(`[GrokBuild] ignored notification ${method}`);
 		}));
@@ -1734,6 +1871,89 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 				resolve,
 			});
 			this._onDidChatProgress.fire(mapped.signal as IAgentToolPendingConfirmationSignal);
+		});
+	}
+
+	/**
+	 * grok 1.0.70 presents the plan via `_x.ai/exit_plan_mode` (not
+	 * `session/request_permission`). Reuses the Copilot plan-review UI
+	 * ({@link ChatInputRequestPurpose.PlanReview}) with approve / abandon only —
+	 * never autopilot / allow-all. Fail closed to `revise` when there is no
+	 * active turn or the session is unknown.
+	 */
+	private _handleExitPlanModeRequest(params: AcpExitPlanModeParams): Promise<AcpServerRequestHandlerResult<AcpExitPlanModeResult>> {
+		const chat = this._sessionToChat.get(params.sessionId);
+		if (!chat) {
+			this._logService.trace('[GrokBuild] exit_plan_mode for unknown session → revise');
+			return Promise.resolve({ result: { outcome: 'revise' } });
+		}
+		const backing = this._backings.get(chatKey(chat));
+		if (!backing?.activeTurnId) {
+			this._logService.trace('[GrokBuild] exit_plan_mode without active turn → revise');
+			return Promise.resolve({ result: { outcome: 'revise' } });
+		}
+		this._notePromptAccepted(backing);
+		const planContent = typeof params.planContent === 'string' ? params.planContent : '';
+		this._logService.trace(`[GrokBuild] exit_plan_mode toolCallId=${params.toolCallId} planChars=${planContent.length}`);
+		if (backing.mapState && params.toolCallId) {
+			for (const action of mapExitPlanContent(backing.mapState, params.toolCallId, planContent)) {
+				this._fireAction(chat, action);
+			}
+		}
+
+		const requestId = generateUuid();
+		const questionId = generateUuid();
+		const actions: IAgentHostPlanReviewAction[] = [
+			{
+				id: GROK_PLAN_REVIEW_APPROVE_ID,
+				label: localize('grokBuild.planReview.approve.label', "Implement plan"),
+				description: localize('grokBuild.planReview.approve.description', "Leave plan mode and start implementing the plan."),
+				default: true,
+			},
+			{
+				id: GROK_PLAN_REVIEW_ABANDON_ID,
+				label: localize('grokBuild.planReview.abandon.label', "Abandon"),
+				description: localize('grokBuild.planReview.abandon.description', "Leave plan mode without implementing the plan."),
+			},
+		];
+		const inputRequest: ChatInputRequestWithPlanReview = withChatInputRequestPurpose({
+			id: requestId,
+			planReview: {
+				title: localize('agentHost.planReview.title', "Review Plan"),
+				content: planContent || localize('agentHost.planReview.fallbackSummary', "A plan is ready for review."),
+				actions,
+				canProvideFeedback: true,
+				answerQuestionId: questionId,
+			},
+			questions: [{
+				kind: ChatInputQuestionKind.SingleSelect,
+				id: questionId,
+				title: localize('agentHost.planReview.title', "Review Plan"),
+				message: localize('agentHost.planReview.questionMessage', "How would you like to proceed?"),
+				required: true,
+				options: actions.map(action => ({
+					id: action.id,
+					label: action.label,
+					...(action.description ? { description: action.description } : {}),
+					...(action.default ? { recommended: true } : {}),
+				})),
+				allowFreeformInput: true,
+			}],
+		}, ChatInputRequestPurpose.PlanReview);
+
+		return new Promise<AcpServerRequestHandlerResult<AcpExitPlanModeResult>>(resolve => {
+			this._pendingPlanReviews.set(requestId, {
+				chat,
+				sessionId: params.sessionId,
+				turnId: backing.activeTurnId!,
+				toolCallId: params.toolCallId,
+				questionId,
+				resolve,
+			});
+			this._fireAction(chat, {
+				type: ActionType.ChatInputRequested,
+				request: inputRequest,
+			});
 		});
 	}
 
@@ -1834,7 +2054,41 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 				this._rememberReasoningOption(option);
 				this._publishModels(undefined);
 			}
+			return;
 		}
+		if (update.sessionUpdate === 'current_mode_update') {
+			this._onCurrentModeUpdate(backing, (update as { currentModeId?: unknown }).currentModeId);
+		}
+	}
+
+	/**
+	 * After approve/abandon, grok emits `current_mode_update` `default`. Mirror
+	 * that onto `appliedModeId` and chat config `interactive` so the next
+	 * prompt does not force plan mode back on.
+	 */
+	private _onCurrentModeUpdate(backing: IGrokBuildChatBacking, currentModeId: unknown): void {
+		if (typeof currentModeId !== 'string') {
+			return;
+		}
+		if (currentModeId === GROK_PLAN_MODE_ID) {
+			backing.appliedModeId = GROK_PLAN_MODE_ID;
+			return;
+		}
+		if (currentModeId !== GROK_DEFAULT_MODE_ID) {
+			return;
+		}
+		backing.appliedModeId = GROK_DEFAULT_MODE_ID;
+		if (!this._sessionsExitingPlanMode.delete(backing.sessionId)) {
+			return;
+		}
+		const owner = backing.ownerRef?.get();
+		if (!owner) {
+			return;
+		}
+		this._configurationService.updateChatConfig(
+			{ session: owner.toString(), chat: backing.chat.toString() },
+			{ [SessionConfigKey.Mode]: 'interactive' },
+		);
 	}
 
 	private _autoEditOptionId(backing: IGrokBuildChatBacking | undefined, params: AcpRequestPermissionParams): string | undefined {
@@ -1933,6 +2187,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 	}
 
 	private _disposeConnection(): void {
+		this._cancelAllPendingPermissions();
 		const connection = this._connection;
 		this._connection = undefined;
 		this._invalidateLoadedSessions();

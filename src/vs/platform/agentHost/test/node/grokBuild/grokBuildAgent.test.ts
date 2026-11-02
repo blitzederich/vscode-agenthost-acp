@@ -14,8 +14,10 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/tes
 import { NullLogService } from '../../../../log/common/log.js';
 import type { IProductService } from '../../../../product/common/productService.js';
 import { AgentSession, fixedChatOwnerRef, GROK_BUILD_AGENT_PROVIDER_ID, type AgentSignal, type IAgentChatContext, type IAgentDiscoveredChat } from '../../../common/agent.js';
+import type { ChatInputRequestWithPlanReview } from '../../../common/agentHostPlanReview.js';
+import { ChatInputRequestPurpose, readChatInputRequestPurpose } from '../../../common/meta/agentChatInputRequestMeta.js';
 import { ActionType } from '../../../common/state/sessionActions.js';
-import { CustomizationType, ResponsePartKind, TurnState, type Turn } from '../../../common/state/sessionState.js';
+import { ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputResponseKind, CustomizationType, ResponsePartKind, TurnState, type ChatInputAnswer, type Turn } from '../../../common/state/sessionState.js';
 import {
 	AcpClient,
 	type IAcpTransport,
@@ -23,7 +25,7 @@ import {
 import { decodeGrokBuildChat, encodeGrokBuildChat } from '../../../node/grokBuild/grokBuildChatBacking.js';
 import { GrokBuildAgent, mergeRestoredTurns } from '../../../node/grokBuild/grokBuildAgent.js';
 import { GROK_PERMISSION_PRESET_ALLOW_EDITS, GROK_PERMISSION_PRESET_ASK, GROK_PERMISSION_PRESET_KEY, GROK_THINKING_LEVEL_KEY, grokPathPrefixRejectedError, grokPlanModeFailedError, grokSlashCommandRejectedError, grokSlashCommandsUnavailableError } from '../../../node/grokBuild/grokBuildUx.js';
-import { IAgentConfigurationService, type IAgentChatConfigurationChangeEvent } from '../../../node/agentConfigurationService.js';
+import { IAgentConfigurationService, type IAgentChatConfigurationChangeEvent, type IAgentChatConfigurationTarget } from '../../../node/agentConfigurationService.js';
 import { SessionConfigKey } from '../../../common/sessionConfigKeys.js';
 import { GROK_BUILD_ACP_ARGV, grokCannotRestoreSessionError, grokCliMissingError, grokCliNotExecutableError, grokHandshakeTimeoutError, grokNotLoggedInError, grokSessionMissingError, grokUnreadableVersionWarning, grokVersionTooOldError, grokWorkingDirectoryRejectedError } from '../../../node/grokBuild/grokBuildLaunchConfig.js';
 import type { AcpAgentCapabilities } from '../../../node/grokBuild/protocol/acpTypes.js';
@@ -295,10 +297,15 @@ suite('GrokBuildAgent', () => {
 	function createAgent(log: NullLogService = new NullLogService(), configuration?: {
 		readonly onDidChatConfigChange?: Event<IAgentChatConfigurationChangeEvent>;
 		readonly getChatConfigValues?: () => Record<string, unknown> | undefined;
+		readonly updateChatConfig?: (target: IAgentChatConfigurationTarget, patch: Record<string, unknown>) => void;
+		readonly configPatches?: Array<{ target: IAgentChatConfigurationTarget; patch: Record<string, unknown> }>;
 	}): GrokBuildAgent {
 		const configurationService = {
 			onDidChatConfigChange: configuration?.onDidChatConfigChange ?? Event.None,
 			getChatConfigValues: configuration?.getChatConfigValues ?? (() => undefined),
+			updateChatConfig: configuration?.updateChatConfig ?? ((target, patch) => {
+				configuration?.configPatches?.push({ target, patch });
+			}),
 		} as unknown as IAgentConfigurationService;
 		return store.add(new GrokBuildAgent(log, new TestProductService() as unknown as IProductService, configurationService));
 	}
@@ -2022,6 +2029,338 @@ suite('GrokBuildAgent', () => {
 		assert.deepStrictEqual(asked.result, { outcome: { outcome: 'selected', optionId: 'allow-once' } });
 		allowPeer.push({ jsonrpc: '2.0', id: allowPrompt.id, result: { stopReason: 'end_turn' } });
 		await allowSend;
+	});
+
+	test('exit_plan_mode review content matches planContent; approve/feedback/abandon map correctly', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client);
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/exit-plan' });
+		const context = chatContext(chat);
+		const signals: AgentSignal[] = [];
+		store.add(agent.onDidChatProgress(signal => signals.push(signal)));
+
+		const create = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp/plan-cwd')] });
+		const sessionNew = await readNextMessage(peer.outbound);
+		peer.push({ jsonrpc: '2.0', id: sessionNew.id, result: { sessionId: 'sess-exit-plan', models: { currentModelId: 'm', availableModels: [{ modelId: 'm', name: 'm' }] } } });
+		await create;
+
+		const send = agent.chats.sendMessage(chat, 'make a plan', [URI.file('/tmp/plan-cwd')], undefined, 'turn-exit-plan', undefined, context);
+		const prompt = await readNextMessage(peer.outbound);
+		assert.strictEqual(prompt.method, 'session/prompt');
+
+		pushUpdate(peer, 'sess-exit-plan', {
+			sessionUpdate: 'tool_call',
+			toolCallId: 'call-exit-1',
+			title: 'exit_plan_mode',
+			rawInput: {},
+			_meta: { 'x.ai/tool': { name: 'exit_plan_mode', kind: 'exit_plan', label: 'Exit Plan Mode', read_only: true } },
+		});
+		const planContent = '# Add README\n\n- append README\n';
+		peer.push({
+			jsonrpc: '2.0',
+			id: 50,
+			method: '_x.ai/exit_plan_mode',
+			params: { sessionId: 'sess-exit-plan', toolCallId: 'call-exit-1', planContent },
+		});
+		await new Promise(r => setTimeout(r, 30));
+
+		const requested = signals.find(signal => signal.kind === 'action' && signal.action.type === ActionType.ChatInputRequested);
+		assert.ok(requested && requested.kind === 'action' && requested.action.type === ActionType.ChatInputRequested);
+		const request = requested.action.request as ChatInputRequestWithPlanReview;
+		assert.strictEqual(readChatInputRequestPurpose(request), ChatInputRequestPurpose.PlanReview);
+		assert.strictEqual(request.planReview?.content, planContent);
+		assert.ok(request.planReview?.actions.every(action => action.permissionLevel !== 'autopilot'));
+		assert.ok(request.planReview?.actions.some(action => action.id === 'approve' && /implement plan/i.test(action.label)));
+		assert.ok(request.planReview?.actions.some(action => action.id === 'abandon'));
+		assert.ok(!request.planReview?.actions.some(action => /autopilot|allow.?all|always/i.test(action.id + action.label)));
+
+		const questionId = request.planReview!.answerQuestionId;
+		agent.respondToUserInputRequest(request.id, ChatInputResponseKind.Accept, {
+			[questionId]: {
+				state: ChatInputAnswerState.Submitted,
+				value: { kind: ChatInputAnswerValueKind.Selected, value: 'approve' },
+			},
+		});
+		const approved = await readNextMessage(peer.outbound);
+		assert.strictEqual(approved.id, 50);
+		assert.deepStrictEqual(approved.result, { outcome: 'approved' });
+
+		peer.push({
+			jsonrpc: '2.0',
+			id: 51,
+			method: '_x.ai/exit_plan_mode',
+			params: { sessionId: 'sess-exit-plan', toolCallId: 'call-exit-2', planContent: '# revised' },
+		});
+		await new Promise(r => setTimeout(r, 30));
+		const reviseRequest = signals.map(s => s.kind === 'action' && s.action.type === ActionType.ChatInputRequested ? s.action.request as ChatInputRequestWithPlanReview : undefined)
+			.filter((r): r is ChatInputRequestWithPlanReview => !!r)
+			.at(-1)!;
+		agent.respondToUserInputRequest(reviseRequest.id, ChatInputResponseKind.Accept, {
+			[reviseRequest.planReview!.answerQuestionId]: {
+				state: ChatInputAnswerState.Submitted,
+				value: { kind: ChatInputAnswerValueKind.Selected, value: 'approve', freeformValues: ['Use DOCS'] },
+			},
+		});
+		const revised = await readNextMessage(peer.outbound);
+		assert.strictEqual(revised.id, 51);
+		assert.deepStrictEqual(revised.result, { outcome: 'revise', feedback: 'Use DOCS' });
+
+		peer.push({
+			jsonrpc: '2.0',
+			id: 52,
+			method: '_x.ai/exit_plan_mode',
+			params: { sessionId: 'sess-exit-plan', toolCallId: 'call-exit-3', planContent: '# abandon me' },
+		});
+		await new Promise(r => setTimeout(r, 30));
+		const abandonRequest = signals.map(s => s.kind === 'action' && s.action.type === ActionType.ChatInputRequested ? s.action.request as ChatInputRequestWithPlanReview : undefined)
+			.filter((r): r is ChatInputRequestWithPlanReview => !!r)
+			.at(-1)!;
+		agent.respondToUserInputRequest(abandonRequest.id, ChatInputResponseKind.Accept, {
+			[abandonRequest.planReview!.answerQuestionId]: {
+				state: ChatInputAnswerState.Submitted,
+				value: { kind: ChatInputAnswerValueKind.Selected, value: 'abandon' },
+			},
+		});
+		const abandoned = await readNextMessage(peer.outbound);
+		assert.strictEqual(abandoned.id, 52);
+		assert.deepStrictEqual(abandoned.result, { outcome: 'abandoned' });
+
+		peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
+		await send;
+	});
+
+	test('exit_plan_mode decline/skip/unknown/no turn/unknown session never approve', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client);
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/exit-plan-failclosed' });
+		const context = chatContext(chat);
+		const signals: AgentSignal[] = [];
+		store.add(agent.onDidChatProgress(signal => signals.push(signal)));
+
+		const create = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp')] });
+		const sessionNew = await readNextMessage(peer.outbound);
+		peer.push({ jsonrpc: '2.0', id: sessionNew.id, result: { sessionId: 'sess-failclosed', models: { currentModelId: 'm', availableModels: [{ modelId: 'm', name: 'm' }] } } });
+		await create;
+
+		peer.push({
+			jsonrpc: '2.0',
+			id: 60,
+			method: '_x.ai/exit_plan_mode',
+			params: { sessionId: 'unknown-session', toolCallId: 'c', planContent: '# x' },
+		});
+		const unknownSession = await readNextMessage(peer.outbound);
+		assert.deepStrictEqual(unknownSession.result, { outcome: 'revise' });
+
+		peer.push({
+			jsonrpc: '2.0',
+			id: 61,
+			method: '_x.ai/exit_plan_mode',
+			params: { sessionId: 'sess-failclosed', toolCallId: 'c', planContent: '# x' },
+		});
+		const noTurn = await readNextMessage(peer.outbound);
+		assert.deepStrictEqual(noTurn.result, { outcome: 'revise' });
+
+		const send = agent.chats.sendMessage(chat, 'plan', [URI.file('/tmp')], undefined, 'turn-failclosed', undefined, context);
+		const prompt = await readNextMessage(peer.outbound);
+		pushUpdate(peer, 'sess-failclosed', {
+			sessionUpdate: 'tool_call',
+			toolCallId: 'call-fc',
+			rawInput: {},
+			_meta: { 'x.ai/tool': { name: 'exit_plan_mode', kind: 'exit_plan' } },
+		});
+
+		const cases: Array<{ id: number; response: ChatInputResponseKind; answers?: Record<string, ChatInputAnswer> }> = [
+			{ id: 62, response: ChatInputResponseKind.Decline },
+			{ id: 63, response: ChatInputResponseKind.Cancel },
+			{ id: 64, response: ChatInputResponseKind.Accept, answers: undefined },
+			{
+				id: 65,
+				response: ChatInputResponseKind.Accept,
+				answers: {
+					placeholder: {
+						state: ChatInputAnswerState.Skipped,
+					},
+				},
+			},
+			{
+				id: 66,
+				response: ChatInputResponseKind.Accept,
+				answers: {
+					placeholder: {
+						state: ChatInputAnswerState.Submitted,
+						value: { kind: ChatInputAnswerValueKind.Selected, value: 'mystery' },
+					},
+				},
+			},
+		];
+
+		for (const testCase of cases) {
+			peer.push({
+				jsonrpc: '2.0',
+				id: testCase.id,
+				method: '_x.ai/exit_plan_mode',
+				params: { sessionId: 'sess-failclosed', toolCallId: `call-${testCase.id}`, planContent: '# x' },
+			});
+			await new Promise(r => setTimeout(r, 20));
+			const request = signals.map(s => s.kind === 'action' && s.action.type === ActionType.ChatInputRequested ? s.action.request as ChatInputRequestWithPlanReview : undefined)
+				.filter((r): r is ChatInputRequestWithPlanReview => !!r)
+				.at(-1)!;
+			const answers = testCase.answers
+				? Object.fromEntries(Object.entries(testCase.answers).map(([, answer]) => [request.planReview!.answerQuestionId, answer]))
+				: testCase.response === ChatInputResponseKind.Accept && testCase.id === 64
+					? undefined
+					: testCase.answers;
+			agent.respondToUserInputRequest(request.id, testCase.response, answers);
+			const reply = await readNextMessage(peer.outbound);
+			assert.strictEqual(reply.id, testCase.id);
+			assert.deepStrictEqual(reply.result, { outcome: 'revise' }, `case ${testCase.id}`);
+		}
+
+		peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'cancelled' } });
+		await send;
+	});
+
+	test('cancel/dispose while exit_plan_mode pending resolves revise and closes the tool card', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client);
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/exit-plan-cancel' });
+		const context = chatContext(chat);
+		const signals: AgentSignal[] = [];
+		store.add(agent.onDidChatProgress(signal => signals.push(signal)));
+
+		const create = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp')] });
+		const sessionNew = await readNextMessage(peer.outbound);
+		peer.push({ jsonrpc: '2.0', id: sessionNew.id, result: { sessionId: 'sess-exit-cancel', models: { currentModelId: 'm', availableModels: [{ modelId: 'm', name: 'm' }] } } });
+		await create;
+
+		const send = agent.chats.sendMessage(chat, 'plan', [URI.file('/tmp')], undefined, 'turn-exit-cancel', undefined, context);
+		const prompt = await readNextMessage(peer.outbound);
+		pushUpdate(peer, 'sess-exit-cancel', {
+			sessionUpdate: 'tool_call',
+			toolCallId: 'call-cancel-exit',
+			rawInput: {},
+			_meta: { 'x.ai/tool': { name: 'exit_plan_mode', kind: 'exit_plan' } },
+		});
+		peer.push({
+			jsonrpc: '2.0',
+			id: 70,
+			method: '_x.ai/exit_plan_mode',
+			params: { sessionId: 'sess-exit-cancel', toolCallId: 'call-cancel-exit', planContent: '# cancel me' },
+		});
+		await new Promise(r => setTimeout(r, 30));
+		assert.ok(signals.some(signal => signal.kind === 'action' && signal.action.type === ActionType.ChatInputRequested));
+
+		const outbound: any[] = [];
+		const onOutbound = (chunk: Buffer | string) => {
+			const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+			for (const line of text.split('\n')) {
+				const trimmed = line.trim();
+				if (!trimmed) {
+					continue;
+				}
+				try {
+					outbound.push(JSON.parse(trimmed));
+				} catch {
+					outbound.push({ raw: trimmed });
+				}
+			}
+		};
+		peer.outbound.on('data', onOutbound);
+		try {
+			await agent.chats.abort(chat, context);
+			await new Promise(r => setTimeout(r, 20));
+		} finally {
+			peer.outbound.off('data', onOutbound);
+		}
+		assert.ok(signals.some(signal =>
+			signal.kind === 'action'
+			&& signal.action.type === ActionType.ChatInputCompleted
+			&& signal.action.response === ChatInputResponseKind.Cancel
+		), 'expected plan review UI dismissal');
+		assert.ok(signals.some(signal =>
+			signal.kind === 'action'
+			&& signal.action.type === ActionType.ChatToolCallComplete
+			&& signal.action.toolCallId === 'call-cancel-exit'
+			&& signal.action.result.success === false
+		), 'expected local exit_plan tool card cancellation');
+		assert.ok(
+			outbound.some(message => message.method === 'session/cancel'),
+			`expected session/cancel among ${JSON.stringify(outbound)}`,
+		);
+		assert.ok(
+			outbound.some(message => message.id === 70 && message.result?.outcome === 'revise'),
+			`expected revise reply among ${JSON.stringify(outbound)}`,
+		);
+
+		peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'cancelled' } });
+		await send;
+	});
+
+	test('approved exit_plan_mode + current_mode_update default writes interactive chat mode', async () => {
+		const patches: Array<{ target: IAgentChatConfigurationTarget; patch: Record<string, unknown> }> = [];
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent(new NullLogService(), {
+			getChatConfigValues: () => ({ [SessionConfigKey.Mode]: 'plan' }),
+			configPatches: patches,
+		});
+		agent.bindTestClient(client);
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/exit-plan-mode-sync' });
+		const context = chatContext(chat);
+		const signals: AgentSignal[] = [];
+		store.add(agent.onDidChatProgress(signal => signals.push(signal)));
+
+		const create = agent.chats.createChat(chat, context, {
+			workingDirectories: [URI.file('/tmp')],
+			config: { [SessionConfigKey.Mode]: 'plan' },
+		});
+		const sessionNew = await readNextMessage(peer.outbound);
+		peer.push({ jsonrpc: '2.0', id: sessionNew.id, result: { sessionId: 'sess-mode-sync', models: { currentModelId: 'm', availableModels: [{ modelId: 'm', name: 'm' }] } } });
+		const setMode = await readNextMessage(peer.outbound);
+		assert.deepStrictEqual(setMode.params, { sessionId: 'sess-mode-sync', modeId: 'plan' });
+		peer.push({ jsonrpc: '2.0', id: setMode.id, result: {} });
+		await create;
+
+		const send = agent.chats.sendMessage(chat, 'plan', [URI.file('/tmp')], undefined, 'turn-mode-sync', undefined, context);
+		const prompt = await readNextMessage(peer.outbound);
+		assert.strictEqual(prompt.method, 'session/prompt');
+		pushUpdate(peer, 'sess-mode-sync', {
+			sessionUpdate: 'tool_call',
+			toolCallId: 'call-mode-sync',
+			rawInput: {},
+			_meta: { 'x.ai/tool': { name: 'exit_plan_mode', kind: 'exit_plan' } },
+		});
+		peer.push({
+			jsonrpc: '2.0',
+			id: 80,
+			method: '_x.ai/exit_plan_mode',
+			params: { sessionId: 'sess-mode-sync', toolCallId: 'call-mode-sync', planContent: '# sync' },
+		});
+		await new Promise(r => setTimeout(r, 30));
+		const request = signals.map(s => s.kind === 'action' && s.action.type === ActionType.ChatInputRequested ? s.action.request as ChatInputRequestWithPlanReview : undefined)
+			.filter((r): r is ChatInputRequestWithPlanReview => !!r)
+			.at(-1)!;
+		agent.respondToUserInputRequest(request.id, ChatInputResponseKind.Accept, {
+			[request.planReview!.answerQuestionId]: {
+				state: ChatInputAnswerState.Submitted,
+				value: { kind: ChatInputAnswerValueKind.Selected, value: 'approve' },
+			},
+		});
+		const approved = await readNextMessage(peer.outbound);
+		assert.deepStrictEqual(approved.result, { outcome: 'approved' });
+		pushUpdate(peer, 'sess-mode-sync', { sessionUpdate: 'current_mode_update', currentModeId: 'default' });
+		await new Promise(r => setTimeout(r, 20));
+		assert.ok(patches.some(entry => entry.patch[SessionConfigKey.Mode] === 'interactive'));
+		assert.deepStrictEqual([...GROK_BUILD_ACP_ARGV], ['--no-auto-update', '--permission-mode', 'default', 'agent', '--no-leader', 'stdio']);
+
+		peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
+		await send;
 	});
 });
 

@@ -352,6 +352,30 @@ export interface AcpRequestPermissionResult {
 	readonly _meta?: Record<string, unknown>;
 }
 
+/**
+ * Agent → client `_x.ai/exit_plan_mode` params (grok 1.0.70). Sent regardless
+ * of clientCapabilities. The plan body is also written earlier to
+ * `~/.grok/sessions/<urlenc cwd>/<sessionId>/plan.md`.
+ */
+export interface AcpExitPlanModeParams {
+	readonly sessionId: string;
+	readonly toolCallId: string;
+	readonly planContent: string;
+	readonly _meta?: Record<string, unknown>;
+}
+
+/**
+ * Client → agent `_x.ai/exit_plan_mode` result. Exact `"approved"` exits plan
+ * and continues; `"abandoned"` exits without executing; `"revise"` (with
+ * optional feedback) stays in plan mode. Any other value / `{}` is treated as
+ * revise (fail closed). A JSON-RPC error fails the tool as "client disconnected".
+ */
+export interface AcpExitPlanModeResult {
+	readonly outcome: 'approved' | 'abandoned' | 'revise';
+	readonly feedback?: string;
+	readonly _meta?: Record<string, unknown>;
+}
+
 export type AcpSessionUpdateKind =
 	| 'agent_message_chunk'
 	| 'agent_thought_chunk'
@@ -475,8 +499,8 @@ export type AcpClientRequestMethod =
 /** Client → agent notification methods used by the MVP. */
 export type AcpClientNotificationMethod = 'session/cancel';
 
-/** Agent → client request methods handled by the MVP. */
-export type AcpServerRequestMethod = 'session/request_permission';
+/** Agent → client request methods handled by this provider. */
+export type AcpServerRequestMethod = 'session/request_permission' | '_x.ai/exit_plan_mode';
 
 /** Agent → client notification methods. Unknown methods are ignored. */
 export type AcpServerNotificationMethod = 'session/update' | string;
@@ -515,10 +539,12 @@ export type AcpClientNotificationParams = {
 
 export type AcpServerRequestParams = {
 	'session/request_permission': AcpRequestPermissionParams;
+	'_x.ai/exit_plan_mode': AcpExitPlanModeParams;
 };
 
 export type AcpServerRequestResult = {
 	'session/request_permission': AcpRequestPermissionResult;
+	'_x.ai/exit_plan_mode': AcpExitPlanModeResult;
 };
 
 export type AcpServerNotificationParams = {

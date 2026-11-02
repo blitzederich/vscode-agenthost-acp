@@ -18,33 +18,52 @@
 import assert from 'assert';
 import { chmod, mkdtemp, readFile, rm, stat, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
+import { Event } from '../../../../../base/common/event.js';
 import { join } from '../../../../../base/common/path.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../../log/common/log.js';
 import type { IProductService } from '../../../../product/common/productService.js';
-import { fixedChatOwnerRef, GROK_BUILD_AGENT_PROVIDER_ID, type IAgentChatContext } from '../../../common/agent.js';
-import { ResponsePartKind, type Turn } from '../../../common/state/sessionState.js';
+import { fixedChatOwnerRef, GROK_BUILD_AGENT_PROVIDER_ID, type AgentSignal, type IAgentChatContext } from '../../../common/agent.js';
+import type { ChatInputRequestWithPlanReview } from '../../../common/agentHostPlanReview.js';
+import { ActionType } from '../../../common/state/sessionActions.js';
+import { ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputResponseKind, ResponsePartKind, type Turn } from '../../../common/state/sessionState.js';
+import { SessionConfigKey } from '../../../common/sessionConfigKeys.js';
 import { GrokBuildAgent } from '../../../node/grokBuild/grokBuildAgent.js';
 import { GROK_BUILD_ACP_ARGV } from '../../../node/grokBuild/grokBuildLaunchConfig.js';
 import { IAgentConfigurationService } from '../../../node/agentConfigurationService.js';
-import { Event } from '../../../../../base/common/event.js';
 
 const FAKE_ACP_AGENT = `#!/usr/bin/env node
 import { createInterface } from 'node:readline';
 import { writeFileSync } from 'node:fs';
 
 const report = process.env.GROK_E2E_REPORT;
+const events = [];
+const note = (event) => {
+	events.push(event);
+	if (report) {
+		writeFileSync(report, JSON.stringify({
+			home: process.env.HOME ?? null,
+			argv: process.argv.slice(2),
+			events,
+		}));
+	}
+};
 if (report) {
-	writeFileSync(report, JSON.stringify({
-		home: process.env.HOME ?? null,
-		argv: process.argv.slice(2),
-	}));
+	note({ type: 'boot' });
 }
 
 const reply = (id, result) => {
 	process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\\n');
 };
+const notify = (method, params) => {
+	process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method, params }) + '\\n');
+};
+
+let nextServerId = 1000;
+let pendingPromptId = undefined;
+let modeId = 'default';
+let expectPermissionAfterApprove = false;
 
 const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
 rl.on('line', line => {
@@ -74,20 +93,128 @@ rl.on('line', line => {
 				availableModels: [{ modelId: 'replay-model', name: 'Replay' }],
 			},
 		});
+	} else if (msg.method === 'session/set_mode') {
+		modeId = msg.params?.modeId ?? modeId;
+		note({ type: 'set_mode', modeId });
+		reply(msg.id, {});
+		notify('session/update', {
+			sessionId: msg.params.sessionId,
+			update: { sessionUpdate: 'current_mode_update', currentModeId: modeId },
+		});
 	} else if (msg.method === 'session/prompt') {
-		process.stdout.write(JSON.stringify({
-			jsonrpc: '2.0',
-			method: 'session/update',
-			params: {
+		pendingPromptId = msg.id;
+		const text = Array.isArray(msg.params?.prompt)
+			? msg.params.prompt.map(block => block?.text ?? '').join('')
+			: '';
+		if (modeId === 'plan' || /\\bplan\\b/i.test(text)) {
+			notify('session/update', {
+				sessionId: msg.params.sessionId,
+				update: {
+					sessionUpdate: 'tool_call',
+					toolCallId: 'call-e2e-exit',
+					title: 'exit_plan_mode',
+					rawInput: {},
+					_meta: { 'x.ai/tool': { name: 'exit_plan_mode', kind: 'exit_plan', label: 'Exit Plan Mode', read_only: true } },
+				},
+			});
+			notify('session/update', {
+				sessionId: msg.params.sessionId,
+				update: {
+					sessionUpdate: 'tool_call_update',
+					toolCallId: 'call-e2e-exit',
+					title: 'Plan: Exit',
+					rawInput: { variant: 'ExitPlanMode' },
+					_meta: { 'x.ai/tool': { name: 'exit_plan_mode', kind: 'exit_plan', label: 'Exit Plan Mode', read_only: true } },
+				},
+			});
+			const id = nextServerId++;
+			note({ type: 'exit_plan_mode_request', id });
+			process.stdout.write(JSON.stringify({
+				jsonrpc: '2.0',
+				id,
+				method: '_x.ai/exit_plan_mode',
+				params: {
+					sessionId: msg.params.sessionId,
+					toolCallId: 'call-e2e-exit',
+					planContent: '# E2E plan\\n\\n- write REPLAY-OK\\n',
+				},
+			}) + '\\n');
+		} else {
+			notify('session/update', {
 				sessionId: msg.params.sessionId,
 				update: {
 					sessionUpdate: 'agent_message_chunk',
 					content: { type: 'text', text: 'REPLAY-OK' },
 				},
-			},
-		}) + '\\n');
-		reply(msg.id, { stopReason: 'end_turn' });
-	} else if (msg.id !== undefined) {
+			});
+			reply(msg.id, { stopReason: 'end_turn' });
+			pendingPromptId = undefined;
+		}
+	} else if (msg.method === undefined && msg.id !== undefined && Object.prototype.hasOwnProperty.call(msg, 'result')) {
+		note({ type: 'client_result', id: msg.id, result: msg.result });
+		if (msg.result?.outcome === 'approved') {
+			expectPermissionAfterApprove = true;
+			modeId = 'default';
+			notify('session/update', {
+				sessionId: 'e2e-session',
+				update: { sessionUpdate: 'current_mode_update', currentModeId: 'default' },
+			});
+			notify('session/update', {
+				sessionId: 'e2e-session',
+				update: {
+					sessionUpdate: 'tool_call_update',
+					toolCallId: 'call-e2e-exit',
+					status: 'completed',
+					title: 'Plan mode exited',
+					content: [{ type: 'content', content: { type: 'text', text: 'Plan file: /tmp/plan.md' } }],
+				},
+			});
+			notify('session/update', {
+				sessionId: 'e2e-session',
+				update: {
+					sessionUpdate: 'tool_call',
+					toolCallId: 'call-e2e-edit',
+					title: 'Edit hello.txt',
+					kind: 'edit',
+					rawInput: { file_path: '/tmp/hello.txt', new_string: 'ok' },
+					_meta: { 'x.ai/tool': { name: 'search_replace', kind: 'edit', label: 'Edit' } },
+				},
+			});
+			const permId = nextServerId++;
+			note({ type: 'permission_request', id: permId });
+			process.stdout.write(JSON.stringify({
+				jsonrpc: '2.0',
+				id: permId,
+				method: 'session/request_permission',
+				params: {
+					sessionId: 'e2e-session',
+					toolCall: {
+						toolCallId: 'call-e2e-edit',
+						kind: 'edit',
+						title: 'Edit hello.txt',
+						rawInput: { file_path: '/tmp/hello.txt', new_string: 'ok' },
+						_meta: { 'x.ai/tool': { name: 'search_replace', kind: 'edit', label: 'Edit' } },
+					},
+					options: [
+						{ optionId: 'allow-once', name: 'Yes', kind: 'allow_once' },
+						{ optionId: 'reject-once', name: 'No', kind: 'reject_once' },
+					],
+				},
+			}) + '\\n');
+		} else if (msg.result?.outcome?.outcome === 'selected' && expectPermissionAfterApprove && pendingPromptId !== undefined) {
+			note({ type: 'permission_result', result: msg.result });
+			notify('session/update', {
+				sessionId: 'e2e-session',
+				update: {
+					sessionUpdate: 'agent_message_chunk',
+					content: { type: 'text', text: 'REPLAY-OK' },
+				},
+			});
+			reply(pendingPromptId, { stopReason: 'end_turn' });
+			pendingPromptId = undefined;
+			expectPermissionAfterApprove = false;
+		}
+	} else if (msg.id !== undefined && msg.method) {
 		reply(msg.id, {});
 	}
 });
@@ -131,7 +258,14 @@ suite('Grok Build e2e', () => {
 
 	const store = ensureNoDisposablesAreLeakedInTestSuite();
 
-	test('fake ACP process replays a recorded turn without credentials or the real grok home', async () => {
+	async function withFakeGrokHome<T>(options: {
+		readonly getChatConfigValues?: () => Record<string, unknown> | undefined;
+	}, run: (args: {
+		readonly agent: GrokBuildAgent;
+		readonly home: string;
+		readonly root: string;
+		readonly reportPath: string;
+	}) => Promise<T>): Promise<T> {
 		const root = await mkdtemp(join(tmpdir(), 'grok-build-e2e-'));
 		const home = join(root, 'home');
 		const reportPath = join(root, 'report.json');
@@ -148,27 +282,13 @@ suite('Grok Build e2e', () => {
 		delete process.env.XAI_API_KEY;
 		const configurationService = {
 			onDidChatConfigChange: Event.None,
-			getChatConfigValues: () => undefined,
+			getChatConfigValues: options.getChatConfigValues ?? (() => undefined),
+			updateChatConfig: () => undefined,
 		} as unknown as IAgentConfigurationService;
 		const agent = store.add(new GrokBuildAgent(new NullLogService(), new TestProductService() as unknown as IProductService, configurationService));
 		agent.bindTestBinaryResolver(async () => ({ path: binaryPath, version: '1.0.70' }));
 		try {
-			const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/e2e' });
-			const context = chatContext(chat);
-			const created = await agent.chats.createChat(chat, context, { workingDirectories: [URI.file(root)] });
-			assert.ok(created?.providerData);
-			await agent.chats.sendMessage(chat, 'replay please', [URI.file(root)], undefined, 'turn-e2e', undefined, context);
-			const messages = await agent.chats.getMessages(chat, context);
-			assert.strictEqual(messages.length, 1);
-			assert.strictEqual(markdownOf(messages[0]), 'REPLAY-OK');
-
-			const report = JSON.parse(await readFile(reportPath, 'utf8')) as { home: string; argv: string[] };
-			assert.strictEqual(report.home, home);
-			assert.ok(report.argv.includes('--permission-mode'));
-			assert.strictEqual(report.argv[report.argv.indexOf('--permission-mode') + 1], 'default');
-			assert.ok(!report.argv.includes('--always-approve'));
-			assert.deepStrictEqual(report.argv, [...GROK_BUILD_ACP_ARGV]);
-			await assert.rejects(stat(join(home, '.grok', 'auth.json')));
+			return await run({ agent, home, root, reportPath });
 		} finally {
 			agent.dispose();
 			if (previousHome === undefined) {
@@ -193,5 +313,92 @@ suite('Grok Build e2e', () => {
 			}
 			await rm(root, { recursive: true, force: true });
 		}
+	}
+
+	test('fake ACP process replays a recorded turn without credentials or the real grok home', async () => {
+		await withFakeGrokHome({}, async ({ agent, home, root, reportPath }) => {
+			const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/e2e' });
+			const context = chatContext(chat);
+			const created = await agent.chats.createChat(chat, context, { workingDirectories: [URI.file(root)] });
+			assert.ok(created?.providerData);
+			await agent.chats.sendMessage(chat, 'replay please', [URI.file(root)], undefined, 'turn-e2e', undefined, context);
+			const messages = await agent.chats.getMessages(chat, context);
+			assert.strictEqual(messages.length, 1);
+			assert.strictEqual(markdownOf(messages[0]), 'REPLAY-OK');
+
+			const report = JSON.parse(await readFile(reportPath, 'utf8')) as { home: string; argv: string[] };
+			assert.strictEqual(report.home, home);
+			assert.ok(report.argv.includes('--permission-mode'));
+			assert.strictEqual(report.argv[report.argv.indexOf('--permission-mode') + 1], 'default');
+			assert.ok(!report.argv.includes('--always-approve'));
+			assert.deepStrictEqual(report.argv, [...GROK_BUILD_ACP_ARGV]);
+			await assert.rejects(stat(join(home, '.grok', 'auth.json')));
+		});
+	});
+
+	test('plan mode exit_plan_mode approve then permission still reaches the UI', async () => {
+		await withFakeGrokHome({
+			getChatConfigValues: () => ({ [SessionConfigKey.Mode]: 'plan' }),
+		}, async ({ agent, root, reportPath }) => {
+			const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/e2e-plan' });
+			const context = chatContext(chat);
+			const signals: AgentSignal[] = [];
+			store.add(agent.onDidChatProgress(signal => signals.push(signal)));
+
+			const created = await agent.chats.createChat(chat, context, {
+				workingDirectories: [URI.file(root)],
+				config: { [SessionConfigKey.Mode]: 'plan' },
+			});
+			assert.ok(created?.providerData);
+
+			const send = agent.chats.sendMessage(chat, 'please plan', [URI.file(root)], undefined, 'turn-e2e-plan', undefined, context);
+			const review = await new Promise<ChatInputRequestWithPlanReview>((resolve, reject) => {
+				const timer = setTimeout(() => reject(new Error('timeout waiting for plan review')), 5_000);
+				const check = () => {
+					const found = signals.map(signal => signal.kind === 'action' && signal.action.type === ActionType.ChatInputRequested
+						? signal.action.request as ChatInputRequestWithPlanReview
+						: undefined).find(request => request?.planReview);
+					if (found) {
+						clearTimeout(timer);
+						resolve(found);
+					}
+				};
+				store.add(agent.onDidChatProgress(() => check()));
+				check();
+			});
+			assert.match(review.planReview!.content, /E2E plan/);
+			agent.respondToUserInputRequest(review.id, ChatInputResponseKind.Accept, {
+				[review.planReview!.answerQuestionId]: {
+					state: ChatInputAnswerState.Submitted,
+					value: { kind: ChatInputAnswerValueKind.Selected, value: 'approve' },
+				},
+			});
+
+			const pending = await new Promise<Extract<AgentSignal, { kind: 'pending_confirmation' }>>((resolve, reject) => {
+				const timer = setTimeout(() => reject(new Error('timeout waiting for permission')), 5_000);
+				const check = () => {
+					const found = signals.find(signal => signal.kind === 'pending_confirmation');
+					if (found && found.kind === 'pending_confirmation') {
+						clearTimeout(timer);
+						resolve(found);
+					}
+				};
+				store.add(agent.onDidChatProgress(() => check()));
+				check();
+			});
+			agent.respondToPermissionRequest(pending.state.toolCallId, true);
+
+			await send;
+			const messages = await agent.chats.getMessages(chat, context);
+			assert.strictEqual(markdownOf(messages[0]), 'REPLAY-OK');
+
+			const report = JSON.parse(await readFile(reportPath, 'utf8')) as {
+				argv: string[];
+				events: Array<{ type: string; result?: { outcome?: unknown } }>;
+			};
+			assert.deepStrictEqual(report.argv, [...GROK_BUILD_ACP_ARGV]);
+			assert.ok(report.events.some(event => event.type === 'client_result' && event.result?.outcome === 'approved'));
+			assert.ok(report.events.some(event => event.type === 'permission_request'));
+		});
 	});
 });
