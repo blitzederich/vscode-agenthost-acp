@@ -3181,7 +3181,7 @@ suite('AgentSessions', () => {
 
 		test('should return correct icon for AgentHostGrokBuild provider', () => {
 			const icon = getAgentSessionProviderIcon(AgentSessionProviders.AgentHostGrokBuild);
-			assert.strictEqual(icon.id, Codicon.xai.id);
+			assert.strictEqual(icon.id, 'grok-build');
 		});
 
 		test('should return detailed AgentHostGrokBuild provider description', () => {

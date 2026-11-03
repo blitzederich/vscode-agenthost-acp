@@ -1669,7 +1669,7 @@ suite('LocalAgentHostSessionsProvider', () => {
 				{ id: 'copilotcli', icon: 'copilot', supportsWorktreeConfiguration: true },
 				{ id: 'claude', icon: 'claude', supportsWorktreeConfiguration: true },
 				{ id: 'openai', icon: 'openai', supportsWorktreeConfiguration: true },
-				{ id: 'grokBuild', icon: 'xai', supportsWorktreeConfiguration: true },
+				{ id: 'grokBuild', icon: 'grok-build', supportsWorktreeConfiguration: true },
 				{ id: 'unknown-agent', icon: 'vm', supportsWorktreeConfiguration: true },
 				{ id: 'not-grokBuild-extra', icon: 'vm', supportsWorktreeConfiguration: true },
 			],
