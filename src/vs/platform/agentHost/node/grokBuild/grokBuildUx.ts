@@ -7,6 +7,7 @@ import { URI } from '../../../../base/common/uri.js';
 import { localize } from '../../../../nls.js';
 import { createSchema, platformSessionSchema, schemaProperty, type ISchemaProperty, type SessionMode } from '../../common/agentHostSchema.js';
 import { AGENT_BUILTIN_CUSTOMIZATION_SCHEME } from '../../common/agentHostCustomizationUri.js';
+import { ContextSizeConfigKey } from '../../common/agentModelConfiguration.js';
 import { ReasoningEffortConfigKey, getReasoningEffortDescription, getReasoningEffortLabel } from '../../common/reasoningEffort.js';
 import { SessionConfigKey } from '../../common/sessionConfigKeys.js';
 import { CustomizationLoadStatus, CustomizationType, customizationId, type DirectoryCustomization, type ModelSelection } from '../../common/state/sessionState.js';
@@ -129,6 +130,17 @@ export function modelWithThinkingLevel(model: ModelSelection | undefined, effort
 	return {
 		...model,
 		config: { ...model.config, [GROK_THINKING_LEVEL_KEY]: effort },
+	};
+}
+
+/** Stamp the selected context-window size onto the chat's model config (picker + tokenLimit). */
+export function modelWithContextSize(model: ModelSelection | undefined, contextSize: number | undefined): ModelSelection | undefined {
+	if (!model || contextSize === undefined) {
+		return model;
+	}
+	return {
+		...model,
+		config: { ...model.config, [ContextSizeConfigKey]: contextSize },
 	};
 }
 

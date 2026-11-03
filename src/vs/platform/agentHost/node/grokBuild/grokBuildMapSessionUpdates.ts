@@ -7,7 +7,9 @@ import { generateUuid } from '../../../../base/common/uuid.js';
 import { URI } from '../../../../base/common/uri.js';
 import { localize } from '../../../../nls.js';
 import { AgentPermissionKind, type IAgentToolPendingConfirmationSignal } from '../../common/agent.js';
+import { ContextSizeConfigKey, createContextSizeConfigSchemaPropertyFromLimits } from '../../common/agentModelConfiguration.js';
 import { grokBuildTodoListMetaKey, toToolCallMeta } from '../../common/meta/agentToolCallMeta.js';
+import type { ConfigPropertySchema, ConfigSchema } from '../../common/state/protocol/common/state.js';
 import { ActionType, type ChatAction, type SessionAction } from '../../common/state/sessionActions.js';
 import { createErrorResponsePart, MessageKind, ResponsePartKind, ToolCallConfirmationReason, ToolCallStatus, ToolResultContentType, type ToolCallPendingConfirmationState, type ToolCallResult, type UsageInfo } from '../../common/state/sessionState.js';
 import {
@@ -19,6 +21,7 @@ import {
 	type IGrokTodoItem,
 } from './grokBuildUx.js';
 import type {
+	AcpModelState,
 	AcpPermissionOption,
 	AcpRequestPermissionParams,
 	AcpSessionUpdate,
@@ -768,11 +771,82 @@ function readTokenCount(value: unknown): number | undefined {
 }
 
 /**
- * Model context window: `_meta.contextWindow` when a non-default window is
- * selected (e.g. 500000), else `_meta.totalContextTokens` (default 256000).
+ * Published model `maxContextWindow`: the model default from
+ * `_meta.totalContextTokens`. Per-session `_meta.contextWindow` on a model
+ * entry (e.g. a restored 500k selection) must not change the shared list.
  */
 export function readGrokMaxContextWindow(meta: Record<string, unknown> | undefined): number | undefined {
-	return readGrokPositiveInt(meta?.contextWindow) ?? readGrokPositiveInt(meta?.totalContextTokens);
+	return readGrokPositiveInt(meta?.totalContextTokens);
+}
+
+/**
+ * Selected window on the current model entry in a `session/load` or
+ * `session/resume` models payload. Live grok puts it at
+ * `availableModels[i]._meta.contextWindow` where `modelId === currentModelId`;
+ * result `_meta` does not carry `contextWindow`.
+ */
+export function readGrokCurrentModelContextWindow(models: AcpModelState | undefined): number | undefined {
+	if (!models) {
+		return undefined;
+	}
+	const currentId = models.currentModelId;
+	if (typeof currentId !== 'string' || currentId.length === 0) {
+		return undefined;
+	}
+	const entry = models.availableModels?.find(model => model.modelId === currentId);
+	return readGrokPositiveInt(entry?._meta?.contextWindow);
+}
+
+/**
+ * Offered context-window sizes from model `_meta.contextWindows` (e.g.
+ * `[256000, 500000]`). Empty / malformed arrays yield `undefined`.
+ */
+export function readGrokContextWindows(meta: Record<string, unknown> | undefined): readonly number[] | undefined {
+	const raw = meta?.contextWindows;
+	if (!Array.isArray(raw) || raw.length === 0) {
+		return undefined;
+	}
+	const windows: number[] = [];
+	for (const entry of raw) {
+		const size = readGrokPositiveInt(entry);
+		if (size !== undefined && !windows.includes(size)) {
+			windows.push(size);
+		}
+	}
+	return windows.length > 0 ? windows : undefined;
+}
+
+/**
+ * Model-picker Context Size property when grok advertises more than one
+ * window. Uses {@link createContextSizeConfigSchemaPropertyFromLimits} with
+ * `totalContextTokens` as the default and `max(contextWindows)` as the long
+ * tier (Codex pattern).
+ */
+export function createGrokContextSizeConfigSchemaProperty(meta: Record<string, unknown> | undefined): ConfigPropertySchema | undefined {
+	const windows = readGrokContextWindows(meta);
+	if (!windows || windows.length < 2) {
+		return undefined;
+	}
+	return createContextSizeConfigSchemaPropertyFromLimits(
+		readGrokPositiveInt(meta?.totalContextTokens),
+		Math.max(...windows),
+	);
+}
+
+/** Merge model config schemas (reasoning effort + context size) without dropping properties. */
+export function mergeGrokModelConfigSchema(...parts: readonly (ConfigSchema | undefined)[]): ConfigSchema | undefined {
+	const properties: ConfigSchema['properties'] = {};
+	for (const part of parts) {
+		if (part?.properties) {
+			Object.assign(properties, part.properties);
+		}
+	}
+	return Object.keys(properties).length > 0 ? { type: 'object', properties } : undefined;
+}
+
+/** Wrap a single Context Size property as a model config schema. */
+export function contextSizeConfigSchema(property: ConfigPropertySchema | undefined): ConfigSchema | undefined {
+	return property ? { type: 'object', properties: { [ContextSizeConfigKey]: property } } : undefined;
 }
 
 /**
