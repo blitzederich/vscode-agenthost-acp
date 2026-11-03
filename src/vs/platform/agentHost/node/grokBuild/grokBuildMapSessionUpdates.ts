@@ -36,7 +36,7 @@ export interface IGrokBuildToolCallEntry {
 	displayName: string;
 	readonly permissionKind: AgentPermissionKind;
 	readonly permissionPath?: string;
-	readonly toolKind?: 'subagent' | 'exit_plan';
+	readonly toolKind?: 'subagent' | 'exit_plan' | 'ask_user';
 	readonly subagentDescription?: string;
 	/** Plan markdown attached when `_x.ai/exit_plan_mode` arrives. */
 	planContent?: string;
@@ -59,6 +59,8 @@ export interface IGrokBuildMapState {
 
 /** Host display title for grok's `exit_plan_mode` / `_x.ai/exit_plan_mode` tool card. */
 export const GROK_PRESENT_PLAN_DISPLAY_NAME = localize('grokBuild.tool.presentPlan', "Present plan");
+/** Host display title for grok's `ask_user_question` / `_x.ai/ask_user_question` tool card. */
+export const GROK_ASK_USER_DISPLAY_NAME = localize('grokBuild.tool.askUser', "Ask User");
 
 export function createGrokBuildMapState(turnId: string): IGrokBuildMapState {
 	return {
@@ -198,7 +200,7 @@ function resolveToolIdentity(update: AcpToolCallUpdate): {
 	permissionKind: AgentPermissionKind;
 	permissionPath?: string;
 	isEdit: boolean;
-	toolKind?: 'subagent' | 'exit_plan';
+	toolKind?: 'subagent' | 'exit_plan' | 'ask_user';
 	subagentDescription?: string;
 } {
 	const xai = xaiToolMeta(update);
@@ -215,6 +217,17 @@ function resolveToolIdentity(update: AcpToolCallUpdate): {
 			permissionPath: path,
 			isEdit: false,
 			toolKind: 'exit_plan',
+		};
+	}
+
+	if (kind === 'ask_user' || name === 'ask_user_question') {
+		return {
+			toolName: 'ask_user_question',
+			displayName: GROK_ASK_USER_DISPLAY_NAME,
+			permissionKind: AgentPermissionKind.Read,
+			permissionPath: path,
+			isEdit: false,
+			toolKind: 'ask_user',
 		};
 	}
 
@@ -281,11 +294,28 @@ function subagentDescription(update: AcpToolCallUpdate): string | undefined {
 	return undefined;
 }
 
-function toolCallMeta(entry: { readonly toolKind?: 'subagent' | 'exit_plan'; readonly subagentDescription?: string }): Record<string, unknown> | undefined {
+function toolCallMeta(entry: { readonly toolKind?: 'subagent' | 'exit_plan' | 'ask_user'; readonly subagentDescription?: string }): Record<string, unknown> | undefined {
 	if (entry.toolKind === 'subagent') {
 		return toToolCallMeta({ toolKind: 'subagent', subagentDescription: entry.subagentDescription });
 	}
 	return undefined;
+}
+
+function isStickyToolKind(kind: IGrokBuildToolCallEntry['toolKind'] | undefined): kind is 'exit_plan' | 'ask_user' {
+	return kind === 'exit_plan' || kind === 'ask_user';
+}
+
+function stickyDisplayName(kind: 'exit_plan' | 'ask_user'): string {
+	return kind === 'ask_user' ? GROK_ASK_USER_DISPLAY_NAME : GROK_PRESENT_PLAN_DISPLAY_NAME;
+}
+
+/** Prefer `UserAnswered.message` from ask_user_question rawOutput over the raw JSON object. */
+function askUserAnsweredMessage(rawOutput: unknown): string | undefined {
+	if (!rawOutput || typeof rawOutput !== 'object') {
+		return undefined;
+	}
+	const answered = (rawOutput as { UserAnswered?: { message?: unknown } }).UserAnswered;
+	return answered && typeof answered.message === 'string' ? answered.message : undefined;
 }
 
 /** Nested ACP `{ type: 'content', content: { type: 'text', text } }` blocks become tool result text. */
@@ -493,15 +523,17 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 		};
 		state.toolCalls.set(toolCallId, entry);
 	} else if (update.title || identity.displayName !== entry.displayName || identity.toolKind) {
-		const keepPresentPlanTitle = entry.toolKind === 'exit_plan' || identity.toolKind === 'exit_plan';
+		const stickyKind = isStickyToolKind(entry.toolKind)
+			? entry.toolKind
+			: (isStickyToolKind(identity.toolKind) ? identity.toolKind : undefined);
 		entry = {
 			...entry,
-			displayName: keepPresentPlanTitle
-				? GROK_PRESENT_PLAN_DISPLAY_NAME
+			displayName: stickyKind
+				? stickyDisplayName(stickyKind)
 				: (update.title ?? identity.displayName),
 			permissionPath: identity.permissionPath ?? entry.permissionPath,
 			permissionKind: identity.permissionKind,
-			toolName: identity.toolKind === 'subagent' || identity.toolKind === 'exit_plan'
+			toolName: identity.toolKind === 'subagent' || isStickyToolKind(identity.toolKind)
 				? identity.toolName
 				: identity.isEdit ? 'file_edit' : entry.toolName,
 			toolKind: identity.toolKind ?? entry.toolKind,
@@ -542,7 +574,7 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 				...(callMeta ? { _meta: callMeta } : {}),
 			},
 		);
-	} else if (update.title && update.sessionUpdate === 'tool_call_update' && entry.toolKind !== 'exit_plan') {
+	} else if (update.title && update.sessionUpdate === 'tool_call_update' && !isStickyToolKind(entry.toolKind)) {
 		// Refresh invocation presentation when Grok upgrades the title (e.g. edit path).
 		const input = toolInputText(update, entry);
 		if (input) {
@@ -559,14 +591,14 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 	const contentText = textFromToolCallContent(update.content);
 	const contentBlocks: { type: ToolResultContentType.Text; text: string }[] = [
 		...diffContent,
-		...(contentText && entry.toolKind === 'exit_plan'
+		...(contentText && isStickyToolKind(entry.toolKind)
 			? [{ type: ToolResultContentType.Text as const, text: contentText }]
 			: []),
 		...(entry.planContent && entry.toolKind === 'exit_plan' && !contentText
 			? [{ type: ToolResultContentType.Text as const, text: entry.planContent }]
 			: []),
 	];
-	if (contentBlocks.length > 0 && (diffContent.length > 0 || (entry.toolKind === 'exit_plan' && (contentText || entry.planContent) && !entry.completed))) {
+	if (contentBlocks.length > 0 && (diffContent.length > 0 || (isStickyToolKind(entry.toolKind) && (contentText || entry.planContent) && !entry.completed))) {
 		actions.push({
 			type: ActionType.ChatToolCallContentChanged,
 			turnId: state.turnId,
@@ -580,12 +612,15 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 		entry.completed = true;
 		const contentMessage = textFromToolCallContent(update.content);
 		const rawOutputText = rawOutputAsText(update.rawOutput);
-		// Prefer ACP content text only for exit_plan cards. Other tools keep
-		// rawOutput (e.g. grep stdout) and fall back to content when absent so
-		// failures still show the nested rejection text instead of "Tool call failed".
-		const outputText = entry.toolKind === 'exit_plan'
-			? (contentMessage ?? rawOutputText)
-			: (rawOutputText ?? contentMessage);
+		// Prefer ACP content text for exit_plan / ask_user cards. Ask cards also
+		// accept rawOutput.UserAnswered.message when content is absent — never the
+		// raw JSON object. Other tools keep rawOutput (e.g. grep stdout) and fall
+		// back to content when absent so failures still show nested rejection text.
+		const outputText = entry.toolKind === 'ask_user'
+			? (contentMessage ?? askUserAnsweredMessage(update.rawOutput))
+			: entry.toolKind === 'exit_plan'
+				? (contentMessage ?? rawOutputText)
+				: (rawOutputText ?? contentMessage);
 		const success = status === 'completed';
 		const failureMessage = outputText || 'Tool call failed';
 		const resultContent: { type: ToolResultContentType.Text; text: string }[] = [
@@ -600,7 +635,7 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 		const result: ToolCallResult = {
 			success,
 			pastTenseMessage: success
-				? (entry.toolKind === 'exit_plan' ? GROK_PRESENT_PLAN_DISPLAY_NAME : entry.displayName)
+				? (isStickyToolKind(entry.toolKind) ? stickyDisplayName(entry.toolKind) : entry.displayName)
 				: (status === 'cancelled'
 					? cancelledToolMessage(entry.displayName)
 					: `${entry.displayName} failed`),
@@ -665,10 +700,11 @@ export function mapExitPlanContent(
 }
 
 /**
- * Locally complete an `exit_plan_mode` tool card as cancelled. grok sends no
- * `tool_call_update` for that card when the client cancels while the review is pending.
+ * Locally complete a tool card as cancelled when grok abandons a pending
+ * agent→client request without a `tool_call_update` (`exit_plan_mode` review
+ * or `ask_user_question`). Preserves any attached plan markdown on the card.
  */
-export function mapExitPlanCancelled(
+export function mapPendingRequestCancelled(
 	state: IGrokBuildMapState,
 	toolCallId: string,
 ): (SessionAction | ChatAction)[] {

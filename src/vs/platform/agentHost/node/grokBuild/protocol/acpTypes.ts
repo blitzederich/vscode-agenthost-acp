@@ -376,6 +376,58 @@ export interface AcpExitPlanModeResult {
 	readonly _meta?: Record<string, unknown>;
 }
 
+/**
+ * One option on a grok `_x.ai/ask_user_question` question (grok 1.0.70).
+ * Only fields observed on the wire; binary may carry more that stay unset.
+ */
+export interface AcpAskUserQuestionOption {
+	readonly label: string;
+	readonly description: string;
+}
+
+/**
+ * One question in `_x.ai/ask_user_question` params. `multiSelect` is `null`
+ * when the model omitted it (treat as single-select).
+ */
+export interface AcpAskUserQuestion {
+	readonly question: string;
+	readonly options: readonly AcpAskUserQuestionOption[];
+	readonly multiSelect: boolean | null;
+}
+
+/**
+ * Agent → client `_x.ai/ask_user_question` params (grok 1.0.70). The tool card
+ * arrives first; this request blocks until the client replies. `mode` mirrors
+ * the session's current mode.
+ */
+export interface AcpAskUserQuestionParams {
+	readonly sessionId: string;
+	readonly toolCallId: string;
+	readonly questions: readonly AcpAskUserQuestion[];
+	readonly mode: 'default' | 'plan';
+	readonly _meta?: Record<string, unknown>;
+}
+
+/**
+ * Client → agent `_x.ai/ask_user_question` result. Internally tagged on
+ * `outcome`. `answers` keys are the exact question text; multi-select values
+ * are string arrays; free-text answers that do not match an option label are
+ * accepted as-is. A JSON-RPC error fails the tool as "Failed to reach the
+ * client for user question".
+ */
+export type AcpAskUserQuestionResult =
+	| {
+		readonly outcome: 'accepted';
+		readonly answers: Readonly<Record<string, string | readonly string[]>>;
+		readonly annotations?: Readonly<Record<string, { readonly notes?: string; readonly preview?: string }>>;
+	}
+	| {
+		readonly outcome: 'chat_about_this';
+		readonly partial_answers?: Readonly<Record<string, string | readonly string[]>>;
+	}
+	| { readonly outcome: 'skip_interview' }
+	| { readonly outcome: 'cancelled' };
+
 export type AcpSessionUpdateKind =
 	| 'agent_message_chunk'
 	| 'agent_thought_chunk'
@@ -500,7 +552,7 @@ export type AcpClientRequestMethod =
 export type AcpClientNotificationMethod = 'session/cancel';
 
 /** Agent → client request methods handled by this provider. */
-export type AcpServerRequestMethod = 'session/request_permission' | '_x.ai/exit_plan_mode';
+export type AcpServerRequestMethod = 'session/request_permission' | '_x.ai/exit_plan_mode' | '_x.ai/ask_user_question';
 
 /** Agent → client notification methods. Unknown methods are ignored. */
 export type AcpServerNotificationMethod = 'session/update' | string;
@@ -540,11 +592,13 @@ export type AcpClientNotificationParams = {
 export type AcpServerRequestParams = {
 	'session/request_permission': AcpRequestPermissionParams;
 	'_x.ai/exit_plan_mode': AcpExitPlanModeParams;
+	'_x.ai/ask_user_question': AcpAskUserQuestionParams;
 };
 
 export type AcpServerRequestResult = {
 	'session/request_permission': AcpRequestPermissionResult;
 	'_x.ai/exit_plan_mode': AcpExitPlanModeResult;
+	'_x.ai/ask_user_question': AcpAskUserQuestionResult;
 };
 
 export type AcpServerNotificationParams = {

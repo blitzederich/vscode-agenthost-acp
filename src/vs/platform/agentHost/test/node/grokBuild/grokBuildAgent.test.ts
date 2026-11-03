@@ -17,7 +17,7 @@ import { AgentSession, fixedChatOwnerRef, GROK_BUILD_AGENT_PROVIDER_ID, type Age
 import type { ChatInputRequestWithPlanReview } from '../../../common/agentHostPlanReview.js';
 import { ChatInputRequestPurpose, readChatInputRequestPurpose } from '../../../common/meta/agentChatInputRequestMeta.js';
 import { ActionType } from '../../../common/state/sessionActions.js';
-import { ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputResponseKind, CustomizationType, ResponsePartKind, TurnState, type ChatInputAnswer, type Turn } from '../../../common/state/sessionState.js';
+import { ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, ChatInputResponseKind, CustomizationType, ResponsePartKind, TurnState, type ChatInputAnswer, type ChatInputRequest, type Turn } from '../../../common/state/sessionState.js';
 import {
 	AcpClient,
 	type IAcpTransport,
@@ -2361,6 +2361,636 @@ suite('GrokBuildAgent', () => {
 
 		peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
 		await send;
+	});
+
+	test('ask_user_question accepted single / multi-select / free text map by question text', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client);
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/ask-user' });
+		const context = chatContext(chat);
+		const signals: AgentSignal[] = [];
+		store.add(agent.onDidChatProgress(signal => signals.push(signal)));
+
+		const create = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp/ask-cwd')] });
+		const sessionNew = await readNextMessage(peer.outbound);
+		peer.push({ jsonrpc: '2.0', id: sessionNew.id, result: { sessionId: 'sess-ask', models: { currentModelId: 'm', availableModels: [{ modelId: 'm', name: 'm' }] } } });
+		await create;
+
+		const send = agent.chats.sendMessage(chat, 'ask me', [URI.file('/tmp/ask-cwd')], undefined, 'turn-ask', undefined, context);
+		const prompt = await readNextMessage(peer.outbound);
+		assert.strictEqual(prompt.method, 'session/prompt');
+		pushUpdate(peer, 'sess-ask', {
+			sessionUpdate: 'tool_call',
+			toolCallId: 'call-ask-1',
+			title: 'ask_user_question',
+			rawInput: { questions: [] },
+			_meta: { 'x.ai/tool': { name: 'ask_user_question', kind: 'ask_user', label: 'Ask User', read_only: true } },
+		});
+
+		const qSingle = 'Which of the two options do you prefer?';
+		const qMulti = 'Pick any that apply';
+		const qFree = 'Anything else?';
+		peer.push({
+			jsonrpc: '2.0',
+			id: 90,
+			method: '_x.ai/ask_user_question',
+			params: {
+				sessionId: 'sess-ask',
+				toolCallId: 'call-ask-1',
+				mode: 'default',
+				questions: [
+					{
+						question: qSingle,
+						options: [{ label: 'A', description: 'Option A' }, { label: 'B', description: 'Option B' }],
+						multiSelect: null,
+					},
+					{
+						question: qMulti,
+						options: [{ label: 'X', description: 'ex' }, { label: 'Y', description: 'why' }],
+						multiSelect: true,
+					},
+					{
+						question: qFree,
+						options: [{ label: 'None', description: 'nothing' }],
+						multiSelect: false,
+					},
+				],
+			},
+		});
+		await new Promise(r => setTimeout(r, 30));
+
+		const requested = signals.find(signal => signal.kind === 'action' && signal.action.type === ActionType.ChatInputRequested);
+		assert.ok(requested && requested.kind === 'action' && requested.action.type === ActionType.ChatInputRequested);
+		const request = requested.action.request as ChatInputRequest;
+		assert.strictEqual(readChatInputRequestPurpose(request), ChatInputRequestPurpose.AskUser);
+		assert.strictEqual(request.questions?.length, 4);
+		assert.strictEqual(request.questions?.[0].kind, ChatInputQuestionKind.SingleSelect);
+		assert.strictEqual(request.questions?.[0].message, qSingle);
+		assert.ok(request.questions?.[0].kind === ChatInputQuestionKind.SingleSelect && request.questions[0].allowFreeformInput);
+		assert.strictEqual(request.questions?.[1].kind, ChatInputQuestionKind.MultiSelect);
+		assert.strictEqual(request.questions?.[2].kind, ChatInputQuestionKind.SingleSelect);
+		assert.strictEqual(request.questions?.[3].id, 'grok-ask-user-skip');
+
+		agent.respondToUserInputRequest(request.id, ChatInputResponseKind.Accept, {
+			'q-0': {
+				state: ChatInputAnswerState.Submitted,
+				value: { kind: ChatInputAnswerValueKind.Selected, value: 'B' },
+			},
+			'q-1': {
+				state: ChatInputAnswerState.Submitted,
+				value: { kind: ChatInputAnswerValueKind.SelectedMany, value: ['X', 'Y'] },
+			},
+			'q-2': {
+				state: ChatInputAnswerState.Submitted,
+				value: { kind: ChatInputAnswerValueKind.Selected, value: 'None', freeformValues: ['Ship it tomorrow'] },
+			},
+		});
+		const accepted = await readNextMessage(peer.outbound);
+		assert.strictEqual(accepted.id, 90);
+		assert.deepStrictEqual(accepted.result, {
+			outcome: 'accepted',
+			answers: {
+				[qSingle]: 'B',
+				[qMulti]: ['X', 'Y'],
+				[qFree]: 'Ship it tomorrow',
+			},
+		});
+
+		peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
+		await send;
+	});
+
+	test('ask_user_question skip_interview and decline/cancel map correctly', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client);
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/ask-user-skip' });
+		const context = chatContext(chat);
+		const signals: AgentSignal[] = [];
+		store.add(agent.onDidChatProgress(signal => signals.push(signal)));
+
+		const create = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp')] });
+		const sessionNew = await readNextMessage(peer.outbound);
+		peer.push({ jsonrpc: '2.0', id: sessionNew.id, result: { sessionId: 'sess-ask-skip', models: { currentModelId: 'm', availableModels: [{ modelId: 'm', name: 'm' }] } } });
+		await create;
+
+		const send = agent.chats.sendMessage(chat, 'ask', [URI.file('/tmp')], undefined, 'turn-ask-skip', undefined, context);
+		const prompt = await readNextMessage(peer.outbound);
+		pushUpdate(peer, 'sess-ask-skip', {
+			sessionUpdate: 'tool_call',
+			toolCallId: 'call-ask-skip',
+			rawInput: {},
+			_meta: { 'x.ai/tool': { name: 'ask_user_question', kind: 'ask_user' } },
+		});
+
+		const askParams = {
+			sessionId: 'sess-ask-skip',
+			toolCallId: 'call-ask-skip',
+			mode: 'plan',
+			questions: [{
+				question: 'Ready?',
+				options: [{ label: 'Yes', description: 'y' }, { label: 'No', description: 'n' }],
+				multiSelect: null,
+			}],
+		};
+
+		peer.push({ jsonrpc: '2.0', id: 91, method: '_x.ai/ask_user_question', params: askParams });
+		await new Promise(r => setTimeout(r, 20));
+		let request = signals.map(s => s.kind === 'action' && s.action.type === ActionType.ChatInputRequested ? s.action.request as ChatInputRequest : undefined)
+			.filter((r): r is ChatInputRequest => !!r)
+			.at(-1)!;
+		agent.respondToUserInputRequest(request.id, ChatInputResponseKind.Accept, {
+			'grok-ask-user-skip': {
+				state: ChatInputAnswerState.Submitted,
+				value: { kind: ChatInputAnswerValueKind.Selected, value: 'skip' },
+			},
+		});
+		const skipped = await readNextMessage(peer.outbound);
+		assert.deepStrictEqual(skipped.result, { outcome: 'skip_interview' });
+
+		peer.push({ jsonrpc: '2.0', id: 92, method: '_x.ai/ask_user_question', params: { ...askParams, toolCallId: 'call-ask-empty' } });
+		await new Promise(r => setTimeout(r, 20));
+		request = signals.map(s => s.kind === 'action' && s.action.type === ActionType.ChatInputRequested ? s.action.request as ChatInputRequest : undefined)
+			.filter((r): r is ChatInputRequest => !!r)
+			.at(-1)!;
+		agent.respondToUserInputRequest(request.id, ChatInputResponseKind.Accept, {});
+		const emptySkip = await readNextMessage(peer.outbound);
+		assert.deepStrictEqual(emptySkip.result, { outcome: 'skip_interview' });
+
+		peer.push({ jsonrpc: '2.0', id: 93, method: '_x.ai/ask_user_question', params: { ...askParams, toolCallId: 'call-ask-decline' } });
+		await new Promise(r => setTimeout(r, 20));
+		request = signals.map(s => s.kind === 'action' && s.action.type === ActionType.ChatInputRequested ? s.action.request as ChatInputRequest : undefined)
+			.filter((r): r is ChatInputRequest => !!r)
+			.at(-1)!;
+		agent.respondToUserInputRequest(request.id, ChatInputResponseKind.Decline);
+		const declined = await readNextMessage(peer.outbound);
+		assert.deepStrictEqual(declined.result, { outcome: 'cancelled' });
+
+		peer.push({ jsonrpc: '2.0', id: 94, method: '_x.ai/ask_user_question', params: { ...askParams, toolCallId: 'call-ask-cancel' } });
+		await new Promise(r => setTimeout(r, 20));
+		request = signals.map(s => s.kind === 'action' && s.action.type === ActionType.ChatInputRequested ? s.action.request as ChatInputRequest : undefined)
+			.filter((r): r is ChatInputRequest => !!r)
+			.at(-1)!;
+		agent.respondToUserInputRequest(request.id, ChatInputResponseKind.Cancel);
+		const cancelled = await readNextMessage(peer.outbound);
+		assert.deepStrictEqual(cancelled.result, { outcome: 'cancelled' });
+
+		peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
+		await send;
+	});
+
+	test('ask_user_question malformed / unknown session / no turn fail closed; cancel-while-pending cleans up', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client);
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/ask-user-fail' });
+		const context = chatContext(chat);
+		const signals: AgentSignal[] = [];
+		store.add(agent.onDidChatProgress(signal => signals.push(signal)));
+
+		const create = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp')] });
+		const sessionNew = await readNextMessage(peer.outbound);
+		peer.push({ jsonrpc: '2.0', id: sessionNew.id, result: { sessionId: 'sess-ask-fail', models: { currentModelId: 'm', availableModels: [{ modelId: 'm', name: 'm' }] } } });
+		await create;
+
+		peer.push({
+			jsonrpc: '2.0',
+			id: 100,
+			method: '_x.ai/ask_user_question',
+			params: { sessionId: 'sess-ask-fail', toolCallId: 'c', mode: 'default', questions: 'nope' },
+		});
+		const malformed = await readNextMessage(peer.outbound);
+		assert.strictEqual(malformed.id, 100);
+		assert.strictEqual(malformed.error?.code, -32602);
+
+		peer.push({
+			jsonrpc: '2.0',
+			id: 101,
+			method: '_x.ai/ask_user_question',
+			params: {
+				sessionId: 'unknown',
+				toolCallId: 'c',
+				mode: 'default',
+				questions: [{ question: 'Q?', options: [{ label: 'A', description: 'a' }], multiSelect: null }],
+			},
+		});
+		const unknownSession = await readNextMessage(peer.outbound);
+		assert.deepStrictEqual(unknownSession.result, { outcome: 'cancelled' });
+
+		peer.push({
+			jsonrpc: '2.0',
+			id: 102,
+			method: '_x.ai/ask_user_question',
+			params: {
+				sessionId: 'sess-ask-fail',
+				toolCallId: 'c',
+				mode: 'default',
+				questions: [{ question: 'Q?', options: [{ label: 'A', description: 'a' }], multiSelect: null }],
+			},
+		});
+		const noTurn = await readNextMessage(peer.outbound);
+		assert.deepStrictEqual(noTurn.result, { outcome: 'cancelled' });
+
+		const send = agent.chats.sendMessage(chat, 'ask', [URI.file('/tmp')], undefined, 'turn-ask-fail', undefined, context);
+		const prompt = await readNextMessage(peer.outbound);
+		pushUpdate(peer, 'sess-ask-fail', {
+			sessionUpdate: 'tool_call',
+			toolCallId: 'call-ask-pending',
+			rawInput: {},
+			_meta: { 'x.ai/tool': { name: 'ask_user_question', kind: 'ask_user' } },
+		});
+		peer.push({
+			jsonrpc: '2.0',
+			id: 103,
+			method: '_x.ai/ask_user_question',
+			params: {
+				sessionId: 'sess-ask-fail',
+				toolCallId: 'call-ask-pending',
+				mode: 'default',
+				questions: [{ question: 'Pending?', options: [{ label: 'A', description: 'a' }], multiSelect: null }],
+			},
+		});
+		await new Promise(r => setTimeout(r, 30));
+		assert.ok(signals.some(signal => signal.kind === 'action' && signal.action.type === ActionType.ChatInputRequested));
+
+		const outbound: any[] = [];
+		const onOutbound = (chunk: Buffer | string) => {
+			const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+			for (const line of text.split('\n')) {
+				const trimmed = line.trim();
+				if (!trimmed) {
+					continue;
+				}
+				try {
+					outbound.push(JSON.parse(trimmed));
+				} catch {
+					outbound.push({ raw: trimmed });
+				}
+			}
+		};
+		peer.outbound.on('data', onOutbound);
+		try {
+			await agent.chats.abort(chat, context);
+			await new Promise(r => setTimeout(r, 20));
+		} finally {
+			peer.outbound.off('data', onOutbound);
+		}
+		assert.ok(signals.some(signal =>
+			signal.kind === 'action'
+			&& signal.action.type === ActionType.ChatInputCompleted
+			&& signal.action.response === ChatInputResponseKind.Cancel
+		), 'expected ask-user UI dismissal');
+		assert.ok(signals.some(signal =>
+			signal.kind === 'action'
+			&& signal.action.type === ActionType.ChatToolCallComplete
+			&& signal.action.toolCallId === 'call-ask-pending'
+			&& signal.action.result.success === false
+		), 'expected local ask_user tool card cancellation');
+		assert.ok(outbound.some(message => message.method === 'session/cancel'));
+		assert.ok(
+			outbound.some(message => message.id === 103 && message.result?.outcome === 'cancelled'),
+			`expected cancelled reply among ${JSON.stringify(outbound)}`,
+		);
+
+		// Late reply after cleanup must not throw.
+		const request = signals.map(s => s.kind === 'action' && s.action.type === ActionType.ChatInputRequested ? s.action.request as ChatInputRequest : undefined)
+			.filter((r): r is ChatInputRequest => !!r)
+			.at(-1)!;
+		agent.respondToUserInputRequest(request.id, ChatInputResponseKind.Accept, {
+			'q-0': {
+				state: ChatInputAnswerState.Submitted,
+				value: { kind: ChatInputAnswerValueKind.Selected, value: 'A' },
+			},
+		});
+
+		peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'cancelled' } });
+		await send;
+	});
+
+	test('ask_user_question terminal tool_call_update abandons UI without ACP reply', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client);
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/ask-timeout' });
+		const context = chatContext(chat);
+		const signals: AgentSignal[] = [];
+		store.add(agent.onDidChatProgress(signal => signals.push(signal)));
+
+		const create = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp')] });
+		const sessionNew = await readNextMessage(peer.outbound);
+		peer.push({ jsonrpc: '2.0', id: sessionNew.id, result: { sessionId: 'sess-ask-timeout', models: { currentModelId: 'm', availableModels: [{ modelId: 'm', name: 'm' }] } } });
+		await create;
+
+		const send = agent.chats.sendMessage(chat, 'ask', [URI.file('/tmp')], undefined, 'turn-ask-timeout', undefined, context);
+		const prompt = await readNextMessage(peer.outbound);
+		pushUpdate(peer, 'sess-ask-timeout', {
+			sessionUpdate: 'tool_call',
+			toolCallId: 'call-ask-timeout',
+			title: 'ask_user_question',
+			rawInput: { questions: [{ question: 'Timeout?', options: [{ label: 'A', description: 'a' }], multiSelect: null }] },
+			_meta: { 'x.ai/tool': { name: 'ask_user_question', kind: 'ask_user', label: 'Ask User', read_only: true } },
+		});
+		peer.push({
+			jsonrpc: '2.0',
+			id: 110,
+			method: '_x.ai/ask_user_question',
+			params: {
+				sessionId: 'sess-ask-timeout',
+				toolCallId: 'call-ask-timeout',
+				mode: 'default',
+				questions: [{ question: 'Timeout?', options: [{ label: 'A', description: 'a' }], multiSelect: null }],
+			},
+		});
+		await new Promise(r => setTimeout(r, 30));
+		const request = signals.map(s => s.kind === 'action' && s.action.type === ActionType.ChatInputRequested ? s.action.request as ChatInputRequest : undefined)
+			.filter((r): r is ChatInputRequest => !!r)
+			.at(-1)!;
+		assert.ok(request);
+
+		const outbound: any[] = [];
+		const onOutbound = (chunk: Buffer | string) => {
+			const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+			for (const line of text.split('\n')) {
+				const trimmed = line.trim();
+				if (!trimmed) {
+					continue;
+				}
+				try {
+					outbound.push(JSON.parse(trimmed));
+				} catch {
+					outbound.push({ raw: trimmed });
+				}
+			}
+		};
+		peer.outbound.on('data', onOutbound);
+		try {
+			pushUpdate(peer, 'sess-ask-timeout', {
+				sessionUpdate: 'tool_call_update',
+				toolCallId: 'call-ask-timeout',
+				status: 'completed',
+				content: [{ type: 'content', content: { type: 'text', text: 'User declined to answer the questions. Continue with the task using your best judgment, or ask different questions.' } }],
+				rawOutput: { type: 'AskUserQuestion', UserAnswered: { message: 'User declined to answer the questions. Continue with the task using your best judgment, or ask different questions.' } },
+			});
+			await new Promise(r => setTimeout(r, 30));
+		} finally {
+			peer.outbound.off('data', onOutbound);
+		}
+
+		assert.ok(signals.some(signal =>
+			signal.kind === 'action'
+			&& signal.action.type === ActionType.ChatInputCompleted
+			&& signal.action.requestId === request.id
+			&& signal.action.response === ChatInputResponseKind.Cancel
+		), 'expected ask-user UI dismissal after timeout completion');
+		assert.ok(
+			!outbound.some(message => message.id === 110),
+			`expected no ACP reply for timed-out ask among ${JSON.stringify(outbound)}`,
+		);
+
+		agent.respondToUserInputRequest(request.id, ChatInputResponseKind.Accept, {
+			'q-0': {
+				state: ChatInputAnswerState.Submitted,
+				value: { kind: ChatInputAnswerValueKind.Selected, value: 'A' },
+			},
+		});
+		await new Promise(r => setTimeout(r, 20));
+		assert.ok(!outbound.some(message => message.id === 110), 'late accept after abandon must not write');
+
+		peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
+		await send;
+	});
+
+	test('ask_user_question and exit_plan_mode are abandoned without reply when the turn ends', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client);
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/ask-finally' });
+		const context = chatContext(chat);
+		const signals: AgentSignal[] = [];
+		store.add(agent.onDidChatProgress(signal => signals.push(signal)));
+
+		const create = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp')] });
+		const sessionNew = await readNextMessage(peer.outbound);
+		peer.push({ jsonrpc: '2.0', id: sessionNew.id, result: { sessionId: 'sess-ask-finally', models: { currentModelId: 'm', availableModels: [{ modelId: 'm', name: 'm' }] } } });
+		await create;
+
+		const send = agent.chats.sendMessage(chat, 'ask', [URI.file('/tmp')], undefined, 'turn-ask-finally', undefined, context);
+		const prompt = await readNextMessage(peer.outbound);
+		pushUpdate(peer, 'sess-ask-finally', {
+			sessionUpdate: 'tool_call',
+			toolCallId: 'call-ask-finally',
+			rawInput: {},
+			_meta: { 'x.ai/tool': { name: 'ask_user_question', kind: 'ask_user' } },
+		});
+		peer.push({
+			jsonrpc: '2.0',
+			id: 111,
+			method: '_x.ai/ask_user_question',
+			params: {
+				sessionId: 'sess-ask-finally',
+				toolCallId: 'call-ask-finally',
+				mode: 'default',
+				questions: [{ question: 'Still there?', options: [{ label: 'A', description: 'a' }], multiSelect: null }],
+			},
+		});
+		await new Promise(r => setTimeout(r, 20));
+		pushUpdate(peer, 'sess-ask-finally', {
+			sessionUpdate: 'tool_call',
+			toolCallId: 'call-exit-finally',
+			rawInput: {},
+			_meta: { 'x.ai/tool': { name: 'exit_plan_mode', kind: 'exit_plan' } },
+		});
+		peer.push({
+			jsonrpc: '2.0',
+			id: 112,
+			method: '_x.ai/exit_plan_mode',
+			params: { sessionId: 'sess-ask-finally', toolCallId: 'call-exit-finally', planContent: '# finally' },
+		});
+		await new Promise(r => setTimeout(r, 20));
+		assert.ok(signals.filter(s => s.kind === 'action' && s.action.type === ActionType.ChatInputRequested).length >= 2);
+
+		const outbound: any[] = [];
+		const onOutbound = (chunk: Buffer | string) => {
+			const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+			for (const line of text.split('\n')) {
+				const trimmed = line.trim();
+				if (!trimmed) {
+					continue;
+				}
+				try {
+					outbound.push(JSON.parse(trimmed));
+				} catch {
+					outbound.push({ raw: trimmed });
+				}
+			}
+		};
+		peer.outbound.on('data', onOutbound);
+		try {
+			peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
+			await send;
+			await new Promise(r => setTimeout(r, 20));
+		} finally {
+			peer.outbound.off('data', onOutbound);
+		}
+
+		const completed = signals.filter(s => s.kind === 'action' && s.action.type === ActionType.ChatInputCompleted);
+		assert.ok(completed.length >= 2, 'expected both ask and plan-review UIs dismissed on turn end');
+		assert.ok(!outbound.some(message => message.id === 111), `expected no ask reply among ${JSON.stringify(outbound)}`);
+		assert.ok(!outbound.some(message => message.id === 112), `expected no exit_plan reply among ${JSON.stringify(outbound)}`);
+	});
+
+	test('dispose and process exit while ask_user_question pending resolve cancelled', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client);
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/ask-dispose' });
+		const context = chatContext(chat);
+		const signals: AgentSignal[] = [];
+		store.add(agent.onDidChatProgress(signal => signals.push(signal)));
+
+		const create = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp')] });
+		const sessionNew = await readNextMessage(peer.outbound);
+		peer.push({ jsonrpc: '2.0', id: sessionNew.id, result: { sessionId: 'sess-ask-dispose', models: { currentModelId: 'm', availableModels: [{ modelId: 'm', name: 'm' }] } } });
+		await create;
+
+		const send = agent.chats.sendMessage(chat, 'ask', [URI.file('/tmp')], undefined, 'turn-ask-dispose', undefined, context);
+		const prompt = await readNextMessage(peer.outbound);
+		pushUpdate(peer, 'sess-ask-dispose', {
+			sessionUpdate: 'tool_call',
+			toolCallId: 'call-ask-dispose',
+			rawInput: {},
+			_meta: { 'x.ai/tool': { name: 'ask_user_question', kind: 'ask_user' } },
+		});
+		peer.push({
+			jsonrpc: '2.0',
+			id: 113,
+			method: '_x.ai/ask_user_question',
+			params: {
+				sessionId: 'sess-ask-dispose',
+				toolCallId: 'call-ask-dispose',
+				mode: 'default',
+				questions: [{ question: 'Dispose?', options: [{ label: 'A', description: 'a' }], multiSelect: null }],
+			},
+		});
+		await new Promise(r => setTimeout(r, 30));
+		assert.ok(signals.some(s => s.kind === 'action' && s.action.type === ActionType.ChatInputRequested));
+
+		const outbound: any[] = [];
+		const onOutbound = (chunk: Buffer | string) => {
+			const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+			for (const line of text.split('\n')) {
+				const trimmed = line.trim();
+				if (!trimmed) {
+					continue;
+				}
+				try {
+					outbound.push(JSON.parse(trimmed));
+				} catch {
+					outbound.push({ raw: trimmed });
+				}
+			}
+		};
+		peer.outbound.on('data', onOutbound);
+		try {
+			await agent.chats.disposeChat(chat, context);
+			await new Promise(r => setTimeout(r, 20));
+		} finally {
+			peer.outbound.off('data', onOutbound);
+		}
+		assert.ok(signals.some(signal =>
+			signal.kind === 'action'
+			&& signal.action.type === ActionType.ChatInputCompleted
+			&& signal.action.response === ChatInputResponseKind.Cancel
+		), 'expected ask UI dismissal on disposeChat');
+		assert.ok(
+			outbound.some(message => message.id === 113 && message.result?.outcome === 'cancelled'),
+			`expected cancelled reply on dispose among ${JSON.stringify(outbound)}`,
+		);
+
+		peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'cancelled' } });
+		await send.catch(() => undefined);
+
+		const peer2 = store.add(makeFakePeer());
+		const client2 = store.add(new AcpClient(peer2.transport));
+		const agent2 = createAgent();
+		agent2.bindTestClient(client2);
+		const chat2 = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/ask-exit' });
+		const context2 = chatContext(chat2);
+		const signals2: AgentSignal[] = [];
+		store.add(agent2.onDidChatProgress(signal => signals2.push(signal)));
+		const create2 = agent2.chats.createChat(chat2, context2, { workingDirectories: [URI.file('/tmp')] });
+		const sessionNew2 = await readNextMessage(peer2.outbound);
+		peer2.push({ jsonrpc: '2.0', id: sessionNew2.id, result: { sessionId: 'sess-ask-exit', models: { currentModelId: 'm', availableModels: [{ modelId: 'm', name: 'm' }] } } });
+		await create2;
+		const send2 = agent2.chats.sendMessage(chat2, 'ask', [URI.file('/tmp')], undefined, 'turn-ask-exit', undefined, context2);
+		const prompt2 = await readNextMessage(peer2.outbound);
+		pushUpdate(peer2, 'sess-ask-exit', {
+			sessionUpdate: 'tool_call',
+			toolCallId: 'call-ask-exit',
+			rawInput: {},
+			_meta: { 'x.ai/tool': { name: 'ask_user_question', kind: 'ask_user' } },
+		});
+		peer2.push({
+			jsonrpc: '2.0',
+			id: 114,
+			method: '_x.ai/ask_user_question',
+			params: {
+				sessionId: 'sess-ask-exit',
+				toolCallId: 'call-ask-exit',
+				mode: 'default',
+				questions: [{ question: 'Exit?', options: [{ label: 'A', description: 'a' }], multiSelect: null }],
+			},
+		});
+		await new Promise(r => setTimeout(r, 30));
+
+		const outbound2: any[] = [];
+		const onOutbound2 = (chunk: Buffer | string) => {
+			const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+			for (const line of text.split('\n')) {
+				const trimmed = line.trim();
+				if (!trimmed) {
+					continue;
+				}
+				try {
+					outbound2.push(JSON.parse(trimmed));
+				} catch {
+					outbound2.push({ raw: trimmed });
+				}
+			}
+		};
+		peer2.outbound.on('data', onOutbound2);
+		try {
+			peer2.exit(1, null);
+			await new Promise(r => setTimeout(r, 30));
+		} finally {
+			peer2.outbound.off('data', onOutbound2);
+		}
+		assert.ok(signals2.some(signal =>
+			signal.kind === 'action'
+			&& signal.action.type === ActionType.ChatInputCompleted
+			&& signal.action.response === ChatInputResponseKind.Cancel
+		), 'expected ask UI dismissal on process exit');
+		// Transport is already marked exited, so the cancelled ACP reply may not
+		// be writable; the important part is the UI/pending map were cleared.
+		const request2 = signals2.map(s => s.kind === 'action' && s.action.type === ActionType.ChatInputRequested ? s.action.request as ChatInputRequest : undefined)
+			.filter((r): r is ChatInputRequest => !!r)
+			.at(-1)!;
+		agent2.respondToUserInputRequest(request2.id, ChatInputResponseKind.Accept, {
+			'q-0': {
+				state: ChatInputAnswerState.Submitted,
+				value: { kind: ChatInputAnswerValueKind.Selected, value: 'A' },
+			},
+		});
+		assert.ok(!outbound2.some(message => message.id === 114 && message.result?.outcome === 'accepted'));
+		await send2.catch(() => undefined);
+		void prompt2;
 	});
 });
 

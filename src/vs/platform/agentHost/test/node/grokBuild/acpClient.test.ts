@@ -235,6 +235,53 @@ suite('GrokBuild AcpClient', () => {
 		assert.match(reply.error.message, /Method not found/);
 	});
 
+	test('ask_user_question server request reaches a registered handler', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		store.add(client.onRequest('_x.ai/ask_user_question', async params => {
+			assert.strictEqual(params.sessionId, 'sess-ask');
+			assert.strictEqual(params.toolCallId, 'call-ask');
+			assert.strictEqual(params.mode, 'default');
+			assert.strictEqual(params.questions.length, 1);
+			return { result: { outcome: 'cancelled' } };
+		}));
+
+		peer.push({
+			jsonrpc: '2.0',
+			id: 9,
+			method: '_x.ai/ask_user_question',
+			params: {
+				sessionId: 'sess-ask',
+				toolCallId: 'call-ask',
+				mode: 'default',
+				questions: [{ question: 'Q?', options: [{ label: 'A', description: 'a' }], multiSelect: null }],
+			},
+		});
+		const reply = await readNextMessage(peer.outbound) as { id: number; result: { outcome: string } };
+		assert.strictEqual(reply.id, 9);
+		assert.strictEqual(reply.result.outcome, 'cancelled');
+	});
+
+	test('unregistered ask_user_question still returns MethodNotFound', async () => {
+		const peer = store.add(makeFakePeer());
+		store.add(new AcpClient(peer.transport));
+		peer.push({
+			jsonrpc: '2.0',
+			id: 10,
+			method: '_x.ai/ask_user_question',
+			params: {
+				sessionId: 's',
+				toolCallId: 'c',
+				mode: 'default',
+				questions: [{ question: 'Q?', options: [{ label: 'A', description: 'a' }], multiSelect: null }],
+			},
+		});
+		const reply = await readNextMessage(peer.outbound) as { id: number; error: { code: number; message: string } };
+		assert.strictEqual(reply.id, 10);
+		assert.strictEqual(reply.error.code, AcpJsonRpcErrorCode.MethodNotFound);
+		assert.match(reply.error.message, /Method not found/);
+	});
+
 	test('session/cancel notification is written with jsonrpc', async () => {
 		const peer = store.add(makeFakePeer());
 		const client = store.add(new AcpClient(peer.transport));
