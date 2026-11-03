@@ -29,6 +29,7 @@ import { IAgentConfigurationService, type IAgentChatConfigurationChangeEvent, ty
 import { SessionConfigKey } from '../../../common/sessionConfigKeys.js';
 import { GROK_BUILD_ACP_ARGV, grokCannotRestoreSessionError, grokCliMissingError, grokCliNotExecutableError, grokHandshakeTimeoutError, grokNotLoggedInError, grokSessionMissingError, grokUnreadableVersionWarning, grokVersionTooOldError, grokWorkingDirectoryRejectedError } from '../../../node/grokBuild/grokBuildLaunchConfig.js';
 import type { AcpAgentCapabilities } from '../../../node/grokBuild/protocol/acpTypes.js';
+import { AHP_SESSION_NOT_FOUND, ProtocolError } from '../../../common/state/sessionProtocol.js';
 
 class TestProductService {
 	readonly _serviceBrand: undefined;
@@ -1457,6 +1458,82 @@ suite('GrokBuildAgent', () => {
 			return true;
 		});
 		assert.deepStrictEqual(changes, []);
+		assert.strictEqual(await agent.getChatMetadata(chat, context), undefined);
+		assert.strictEqual(await readIfAny(peer.outbound), undefined);
+	});
+
+	test('getChatMetadata restore opens a session known only from session/list at its own cwd', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client, LIVE_CAPABILITIES);
+		const sessionId = '01a19b21-3ef2-7d01-b5ea-12a2b30fa7d4';
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: `/chat/${sessionId}` });
+		const context = chatContextForSession(chat, sessionId);
+
+		const restoring = agent.getChatMetadata(chat, context, undefined, { activation: 'restore' });
+		const list = await readNextMessage(peer.outbound);
+		assert.strictEqual(list.method, 'session/list');
+		assert.deepStrictEqual(list.params, {});
+		peer.push({
+			jsonrpc: '2.0',
+			id: list.id,
+			result: {
+				sessions: [{ sessionId, cwd: '/tmp/other-cli-cwd', title: 'CLI session', updatedAt: '2026-03-01T00:00:00.000Z' }],
+			},
+		});
+		const load = await readNextMessage(peer.outbound);
+		assert.strictEqual(load.method, 'session/load');
+		assert.deepStrictEqual(load.params, { sessionId, cwd: '/tmp/other-cli-cwd', mcpServers: [] });
+		pushUpdate(peer, sessionId, { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'hello from cli' }, _meta: { promptIndex: 0 } });
+		pushUpdate(peer, sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'hi' }, _meta: { promptIndex: 0 } });
+		peer.push({
+			jsonrpc: '2.0',
+			id: load.id,
+			result: { models: { currentModelId: 'grok-4.7', availableModels: [{ modelId: 'grok-4.7', name: 'Grok 4.7' }] }, configOptions: [] },
+		});
+		const metadata = await restoring;
+		assert.strictEqual(metadata?.summary, 'CLI session');
+		assert.strictEqual(metadata?.model?.id, 'grok-4.7');
+		assert.strictEqual(metadata?.workingDirectories?.[0].fsPath, '/tmp/other-cli-cwd');
+		const history = await agent.chats.getMessages(chat, context);
+		assert.deepStrictEqual(history.map(turn => ({ text: turn.message.text, markdown: markdownOf(turn) })), [
+			{ text: 'hello from cli', markdown: 'hi' },
+		]);
+		assert.strictEqual(await readIfAny(peer.outbound), undefined);
+	});
+
+	test('getChatMetadata restore of a vanished folder is AHP_SESSION_NOT_FOUND, not a silent miss', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client, LIVE_CAPABILITIES);
+		const sessionId = 'vanished-folder-session';
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: `/chat/${sessionId}` });
+		const context = chatContextForSession(chat, sessionId);
+
+		const restoring = agent.getChatMetadata(chat, context, undefined, { activation: 'restore' });
+		const list = await readNextMessage(peer.outbound);
+		assert.strictEqual(list.method, 'session/list');
+		peer.push({
+			jsonrpc: '2.0',
+			id: list.id,
+			result: { sessions: [{ sessionId, cwd: '/tmp/gone', title: 'Gone folder' }] },
+		});
+		const load = await readNextMessage(peer.outbound);
+		assert.strictEqual(load.method, 'session/load');
+		assert.deepStrictEqual(load.params, { sessionId, cwd: '/tmp/gone', mcpServers: [] });
+		peer.push({
+			jsonrpc: '2.0',
+			id: load.id,
+			error: { code: -32603, message: 'Path not found.', data: { detail: 'No such file or directory (os error 2)', code: 'FS_NOT_FOUND' } },
+		});
+		await assert.rejects(restoring, (err: unknown) => {
+			assert.ok(err instanceof ProtocolError);
+			assert.strictEqual(err.code, AHP_SESSION_NOT_FOUND);
+			assert.strictEqual(err.message, grokSessionMissingError().message);
+			return true;
+		});
 		assert.strictEqual(await agent.getChatMetadata(chat, context), undefined);
 		assert.strictEqual(await readIfAny(peer.outbound), undefined);
 	});

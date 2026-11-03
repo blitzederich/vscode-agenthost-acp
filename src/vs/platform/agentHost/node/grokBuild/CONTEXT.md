@@ -129,7 +129,7 @@ Reject ends the prompt with `stopReason: "cancelled"`.
 | `getChatCustomizations` | **Implemented** | Host customizations plus a read-only Grok Build skill directory from `available_commands_update` |
 | `getProtectedResources` | **Implemented** | `[]` — CLI owns grok.com auth; never GitHub-gated |
 | `authenticate` | **Implemented** | No-op `false` for unknown resources (CLI auth path) |
-| `getChatMetadata` | **Implemented** | Live backing, or providerData. `activation: 'restore'` attaches the runtime; a passive read does not |
+| `getChatMetadata` | **Implemented** | Live backing, or providerData. `activation: 'restore'` attaches the runtime (including discovered/CLI sessions with no providerData, via `session/list` + `session/load`); a passive read does not. A missing session on restore is `AHP_SESSION_NOT_FOUND` with `grokSessionMissingError` (not a silent miss). |
 | `listChatsToMigrate` | **Implemented** | One unfiltered paginated `session/list`. `[]` when list is not advertised. `undefined` when the catalog cannot be read |
 | `recoverLegacyChat` | **Implemented** | Connects first (capabilities are empty before the handshake), then session id from the owner URI, cwd and title from `session/list`, then `session/load`. Provider data includes `models.currentModelId` from that load |
 | `setWorkingDirectory` | **Implemented** | Always rejects. grok cannot reload a session at a different cwd (`FS_NOT_FOUND`) |

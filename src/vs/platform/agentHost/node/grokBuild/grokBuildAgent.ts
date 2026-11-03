@@ -52,6 +52,7 @@ import { ActionType, type ChatAction, type SessionAction } from '../../common/st
 import { ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, ChatInputResponseKind, createErrorResponsePart, MessageKind, ResponsePartKind, TurnState, type ChatInputAnswer, type ChatInputQuestion, type ClientPluginCustomization, type Customization, type ModelSelection, type ToolCallResult, type Turn, type UsageInfo } from '../../common/state/sessionState.js';
 import type { ProtectedResourceMetadata, ToolDefinition } from '../../common/state/protocol/state.js';
 import type { ResolveSessionConfigResult, SessionConfigCompletionsResult } from '../../common/state/protocol/commands.js';
+import { AHP_SESSION_NOT_FOUND, ProtocolError } from '../../common/state/sessionProtocol.js';
 import {
 	AcpClient,
 	AcpJsonRpcErrorCode,
@@ -880,40 +881,58 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		resolveAgentChatContext(context, chat);
 		let backing = this._backings.get(chatKey(chat));
 		this._rememberOwner(backing, context);
-		if (!backing && providerData) {
-			const decoded = decodeGrokBuildChat(providerData);
-			if (!decoded) {
+		try {
+			if (!backing && providerData) {
+				const decoded = decodeGrokBuildChat(providerData);
+				if (!decoded) {
+					return undefined;
+				}
+				if (options?.activation === 'restore') {
+					backing = this._storeBacking(chat, decoded, decoded.cwd ? [URI.file(decoded.cwd)] : undefined);
+					this._rememberOwner(backing, context);
+					await this._ensureSessionAttached(backing);
+				} else {
+					const now = Date.now();
+					return {
+						chat,
+						startTime: now,
+						modifiedTime: now,
+						model: decoded.model,
+						workingDirectories: decoded.cwd ? [URI.file(decoded.cwd)] : undefined,
+					};
+				}
+			}
+			// CLI-created sessions are discovered via session/list with no host
+			// providerData. AgentService restore calls getChatMetadata(activation:
+			// 'restore') before materializeChat, and skips the catalog fallback for
+			// external rows — so a miss here becomes "provider not ready". Recover
+			// the same way as materializeChat(undefined) / recoverLegacyChat.
+			if (!backing && options?.activation === 'restore') {
+				await this._recoverDiscoveredChat(chat, context);
+				backing = this._backings.get(chatKey(chat));
+			}
+			if (!backing) {
 				return undefined;
 			}
 			if (options?.activation === 'restore') {
-				backing = this._storeBacking(chat, decoded, decoded.cwd ? [URI.file(decoded.cwd)] : undefined);
-				this._rememberOwner(backing, context);
 				await this._ensureSessionAttached(backing);
-			} else {
-				const now = Date.now();
-				return {
-					chat,
-					startTime: now,
-					modifiedTime: now,
-					model: decoded.model,
-					workingDirectories: decoded.cwd ? [URI.file(decoded.cwd)] : undefined,
-				};
 			}
+			return {
+				chat,
+				startTime: backing.startTime,
+				modifiedTime: backing.modifiedTime,
+				summary: backing.summary,
+				model: backing.model,
+				workingDirectories: backing.workingDirectories,
+			};
+		} catch (err) {
+			// ProtocolError so AgentService does not treat a registered external
+			// session's authoritative absence as a transient "not ready" miss.
+			if (options?.activation === 'restore' && err instanceof GrokSessionMissingError) {
+				throw new ProtocolError(AHP_SESSION_NOT_FOUND, err.message);
+			}
+			throw err;
 		}
-		if (!backing) {
-			return undefined;
-		}
-		if (options?.activation === 'restore') {
-			await this._ensureSessionAttached(backing);
-		}
-		return {
-			chat,
-			startTime: backing.startTime,
-			modifiedTime: backing.modifiedTime,
-			summary: backing.summary,
-			model: backing.model,
-			workingDirectories: backing.workingDirectories,
-		};
 	}
 
 	async listChatsToMigrate(): Promise<AgentChatMigrationResult> {
