@@ -11,7 +11,7 @@ import { readUsageInfoMeta } from '../../../common/meta/agentUsageMeta.js';
 import { grokBuildTodoListMetaKey } from '../../../common/meta/agentToolCallMeta.js';
 import { chatReducer } from '../../../common/state/protocol/reducers.js';
 import { ActionType, type ChatAction } from '../../../common/state/sessionActions.js';
-import { ChatOriginKind, ResponsePartKind, SessionStatus, ToolResultContentType, type ChatState } from '../../../common/state/sessionState.js';
+import { ChatOriginKind, ResponsePartKind, SessionStatus, ToolCallContributorKind, ToolResultContentType, type ChatState } from '../../../common/state/sessionState.js';
 import { ContextSizeConfigKey } from '../../../common/agentModelConfiguration.js';
 import {
 	createGrokBuildMapState,
@@ -680,20 +680,46 @@ suite('GrokBuild mapSessionUpdates', () => {
 		});
 	});
 
-	test('suppresses ACP tool_call / tool_call_update cards for client__ tools', () => {
-		const state = createGrokBuildMapState('turn-client');
+	test('maps live use_tool client__ cards with stripped display name and Client contributor', () => {
+		const state = createGrokBuildMapState('turn-client', {
+			clientMcpAttached: true,
+			clientToolOwnerOf: name => name === 'workspace_echo' ? 'workbench-1' : undefined,
+		});
 		const start = mapSessionUpdate(state, {
 			sessionId: 's',
 			update: {
 				sessionUpdate: 'tool_call',
 				toolCallId: 'grok-client-1',
-				title: 'client__workspace_echo',
+				title: 'use_tool',
 				kind: 'other',
 				status: 'pending',
-				rawInput: { msg: 'hi' },
+				rawInput: { tool_name: 'client__workspace_echo', tool_input: { msg: 'hi' } },
+				_meta: { 'x.ai/tool': { name: 'use_tool', namespace: 'grok_build' } },
 			},
 		});
-		assert.deepStrictEqual(start, []);
+		assert.strictEqual(start.length, 2);
+		assert.strictEqual(start[0]!.type, ActionType.ChatToolCallStart);
+		assert.strictEqual((start[0] as { toolName: string }).toolName, 'workspace_echo');
+		assert.strictEqual((start[0] as { displayName: string }).displayName, 'workspace_echo');
+		assert.deepStrictEqual((start[0] as { contributor?: unknown }).contributor, {
+			kind: ToolCallContributorKind.Client,
+			clientId: 'workbench-1',
+		});
+		assert.strictEqual(start[1]!.type, ActionType.ChatToolCallDelta);
+		assert.ok(!start.some(a => a.type === ActionType.ChatToolCallReady), 'Ready deferred to permission');
+
+		const titled = mapSessionUpdate(state, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'tool_call_update',
+				toolCallId: 'grok-client-1',
+				title: 'client__workspace_echo',
+				kind: 'other',
+				status: 'in_progress',
+			},
+		});
+		assert.deepStrictEqual(titled, []);
+		assert.strictEqual(state.toolCalls.get('grok-client-1')?.displayName, 'workspace_echo');
 
 		const done = mapSessionUpdate(state, {
 			sessionId: 's',
@@ -702,21 +728,36 @@ suite('GrokBuild mapSessionUpdates', () => {
 				toolCallId: 'grok-client-1',
 				title: 'client__workspace_echo',
 				status: 'completed',
-				rawOutput: { ok: true },
+				rawOutput: { type: 'MCP', tool_name: 'workspace_echo', server_name: 'client', output: 'ok' },
 			},
 		});
-		assert.deepStrictEqual(done, []);
+		assert.strictEqual(done.length, 1);
+		assert.strictEqual(done[0]!.type, ActionType.ChatToolCallComplete);
+		assert.strictEqual((done[0] as { result: { success: boolean } }).result.success, true);
+	});
 
-		const viaMeta = mapSessionUpdate(state, {
+	test('leaves use_tool client__ untouched when our client MCP server is off', () => {
+		const state = createGrokBuildMapState('turn-user-client', { clientMcpAttached: false });
+		const start = mapSessionUpdate(state, {
 			sessionId: 's',
 			update: {
 				sessionUpdate: 'tool_call',
-				toolCallId: 'grok-client-2',
+				toolCallId: 'user-mcp-1',
 				title: 'use_tool',
 				status: 'pending',
-				_meta: { 'x.ai/tool': { name: 'client__other_tool', kind: 'other', label: 'Other' } },
+				rawInput: { tool_name: 'client__workspace_echo', tool_input: { msg: 'hi' } },
+				_meta: { 'x.ai/tool': { name: 'use_tool', namespace: 'grok_build' } },
 			},
 		});
-		assert.deepStrictEqual(viaMeta, []);
+		assert.ok(start.some(a => a.type === ActionType.ChatToolCallStart));
+		const startAction = start.find(a => a.type === ActionType.ChatToolCallStart) as {
+			toolName: string;
+			displayName: string;
+			contributor?: unknown;
+		};
+		assert.strictEqual(startAction.toolName, 'use_tool');
+		assert.strictEqual(startAction.displayName, 'use_tool');
+		assert.strictEqual(startAction.contributor, undefined);
+		assert.ok(start.some(a => a.type === ActionType.ChatToolCallReady));
 	});
 });

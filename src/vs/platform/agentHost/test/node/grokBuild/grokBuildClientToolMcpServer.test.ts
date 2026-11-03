@@ -8,6 +8,7 @@ import * as http from 'http';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { ToolResultContentType, type ToolCallResult } from '../../../common/state/protocol/channels-chat/state.js';
 import type { ToolDefinition } from '../../../common/state/protocol/state.js';
+import { structuralEquals } from '../../../../../base/common/equals.js';
 import {
 	extractBearerToken,
 	GROK_CLIENT_MCP_MAX_BODY_BYTES,
@@ -17,9 +18,12 @@ import {
 	handleGrokClientMcpRequest,
 	hasClientToolNamePrefix,
 	isAllowedGrokClientMcpHost,
+	parseGrokClientToolTarget,
 	startGrokClientToolMcpServer,
 	stripClientToolNamePrefix,
+	takePendingGrokClientToolCall,
 	tokensEqual,
+	type IGrokPendingClientToolCall,
 } from '../../../node/grokBuild/grokBuildClientToolMcpServer.js';
 
 function tool(over: Partial<ToolDefinition> = {}): ToolDefinition {
@@ -57,6 +61,42 @@ suite('grokBuildClientToolMcpServer', () => {
 		assert.strictEqual(hasClientToolNamePrefix('shell'), false);
 		assert.strictEqual(stripClientToolNamePrefix('client__echo'), 'echo');
 		assert.strictEqual(stripClientToolNamePrefix('shell'), 'shell');
+	});
+
+	test('parseGrokClientToolTarget accepts live use_tool and later client__ title', () => {
+		assert.deepStrictEqual(parseGrokClientToolTarget({
+			title: 'use_tool',
+			rawInput: { tool_name: 'client__workspace_echo', tool_input: { msg: 'hi' } },
+			_meta: { 'x.ai/tool': { name: 'use_tool', namespace: 'grok_build' } },
+		}), { toolName: 'workspace_echo', args: { msg: 'hi' } });
+
+		assert.deepStrictEqual(parseGrokClientToolTarget({
+			title: 'client__workspace_echo',
+			rawInput: { msg: 'hi' },
+		}), { toolName: 'workspace_echo', args: { msg: 'hi' } });
+
+		assert.strictEqual(parseGrokClientToolTarget({
+			title: 'use_tool',
+			rawInput: { tool_name: 'other__echo', tool_input: {} },
+		}), undefined);
+	});
+
+	test('takePendingGrokClientToolCall matches args then falls back to FIFO by name', () => {
+		const pending: IGrokPendingClientToolCall[] = [
+			{ toolCallId: 'a', toolName: 'echo', args: { msg: 'one' }, invoked: false },
+			{ toolCallId: 'b', toolName: 'echo', args: { msg: 'two' }, invoked: false },
+		];
+		const matchTwo = takePendingGrokClientToolCall(pending, 'echo', { msg: 'two' }, structuralEquals);
+		assert.strictEqual(matchTwo?.toolCallId, 'b');
+		assert.strictEqual(matchTwo?.invoked, true);
+
+		const matchFallback = takePendingGrokClientToolCall(pending, 'echo', { msg: 'missing' }, structuralEquals);
+		assert.strictEqual(matchFallback?.toolCallId, 'a');
+
+		assert.strictEqual(
+			takePendingGrokClientToolCall(pending, 'echo', { msg: 'one' }, structuralEquals),
+			undefined,
+		);
 	});
 
 	test('isAllowedGrokClientMcpHost accepts only loopback with port', () => {

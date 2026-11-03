@@ -26,9 +26,15 @@ export const GROK_CLIENT_MCP_MAX_BODY_BYTES = 8 * 1024 * 1024;
 export const GROK_CLIENT_TOOL_NAME_PREFIX = `${GROK_CLIENT_MCP_SERVER_NAME}__`;
 
 /**
- * Whether an ACP tool title / x.ai tool name targets a workbench client tool
- * (`client__…`). Used by the session-update mapper to suppress a duplicate card
- * — the HTTP MCP `tools/call` path owns the single Client-contributor card.
+ * ACP / x.ai tool name for grok's MCP bridge (`use_tool`). Live 1.0.70 first
+ * event for a client tool is title/`x.ai/tool`.name `use_tool` with
+ * `rawInput.tool_name: 'client__<tool>'`.
+ */
+export const GROK_USE_TOOL_NAME = 'use_tool';
+
+/**
+ * Whether an ACP tool title / x.ai tool name carries the `client__` prefix
+ * grok applies to tools from the `client` MCP server.
  */
 export function hasClientToolNamePrefix(toolName: string): boolean {
 	return toolName.startsWith(GROK_CLIENT_TOOL_NAME_PREFIX);
@@ -40,6 +46,107 @@ export function hasClientToolNamePrefix(toolName: string): boolean {
  */
 export function stripClientToolNamePrefix(toolName: string): string {
 	return hasClientToolNamePrefix(toolName) ? toolName.slice(GROK_CLIENT_TOOL_NAME_PREFIX.length) : toolName;
+}
+
+/**
+ * Target of a grok ACP tool_call that routes to our workbench `client` MCP
+ * server: unprefixed tool name plus the args that will arrive on
+ * `tools/call`.
+ */
+export interface IGrokClientToolTarget {
+	readonly toolName: string;
+	readonly args: Record<string, unknown>;
+}
+
+/**
+ * Not-yet-invoked (or in-flight) grok `use_tool` card awaiting MCP
+ * `tools/call` correlation. Matched FIFO by tool name + deep-equal args,
+ * then FIFO by name alone.
+ */
+export interface IGrokPendingClientToolCall {
+	readonly toolCallId: string;
+	readonly toolName: string;
+	readonly args: Record<string, unknown>;
+	invoked: boolean;
+}
+
+/**
+ * Parse the workbench client-tool target from a grok ACP tool_call /
+ * tool_call_update. Accepts the live 1.0.70 first event (`use_tool` +
+ * `rawInput.tool_name: 'client__…'`) and the later title form (`client__…`).
+ * Returns `undefined` when the update is not a `client__*` tool call.
+ */
+export function parseGrokClientToolTarget(update: {
+	readonly title?: string;
+	readonly rawInput?: unknown;
+	readonly _meta?: Record<string, unknown>;
+}): IGrokClientToolTarget | undefined {
+	const xai = update._meta?.['x.ai/tool'];
+	const xaiName = xai && typeof xai === 'object' && typeof (xai as { name?: unknown }).name === 'string'
+		? (xai as { name: string }).name
+		: undefined;
+	const title = typeof update.title === 'string' ? update.title : undefined;
+	const isUseTool = title === GROK_USE_TOOL_NAME || xaiName === GROK_USE_TOOL_NAME;
+	const raw = update.rawInput;
+
+	if (isUseTool) {
+		if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+			return undefined;
+		}
+		const record = raw as Record<string, unknown>;
+		if (typeof record.tool_name !== 'string' || !hasClientToolNamePrefix(record.tool_name)) {
+			return undefined;
+		}
+		return {
+			toolName: stripClientToolNamePrefix(record.tool_name),
+			args: asToolArgsRecord(record.tool_input),
+		};
+	}
+
+	const prefixed =
+		(title && hasClientToolNamePrefix(title) ? title : undefined)
+		?? (xaiName && hasClientToolNamePrefix(xaiName) ? xaiName : undefined);
+	if (!prefixed) {
+		return undefined;
+	}
+	if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+		const record = raw as Record<string, unknown>;
+		if (typeof record.tool_name === 'string' && hasClientToolNamePrefix(record.tool_name)) {
+			return {
+				toolName: stripClientToolNamePrefix(record.tool_name),
+				args: asToolArgsRecord(record.tool_input),
+			};
+		}
+		return { toolName: stripClientToolNamePrefix(prefixed), args: record };
+	}
+	return { toolName: stripClientToolNamePrefix(prefixed), args: {} };
+}
+
+/**
+ * Pick the next pending grok client `use_tool` card for an MCP `tools/call`.
+ * Prefer name + deep-equal args; fall back to FIFO-by-name. Marks the match
+ * invoked. Returns `undefined` when nothing matches.
+ */
+export function takePendingGrokClientToolCall(
+	pending: readonly IGrokPendingClientToolCall[],
+	toolName: string,
+	args: Record<string, unknown>,
+	argsEqual: (a: Record<string, unknown>, b: Record<string, unknown>) => boolean,
+): IGrokPendingClientToolCall | undefined {
+	const candidates = pending.filter(entry => !entry.invoked && entry.toolName === toolName);
+	const byArgs = candidates.find(entry => argsEqual(entry.args, args));
+	const match = byArgs ?? candidates[0];
+	if (match) {
+		match.invoked = true;
+	}
+	return match;
+}
+
+function asToolArgsRecord(value: unknown): Record<string, unknown> {
+	if (value && typeof value === 'object' && !Array.isArray(value)) {
+		return value as Record<string, unknown>;
+	}
+	return {};
 }
 
 /**

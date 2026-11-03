@@ -253,10 +253,14 @@ returns JSON-RPC `-32601` (both OK for grok 1.0.70).
 Tools come from the session's `ActiveClientToolSet` (workbench
 `ILanguageModelToolsService` / enabled tool sets via
 `agentHostActiveClientService`), not from custom LSP wrappers. Grok surfaces
-them as `client__<tool>` through search_tool/use_tool; each use still goes
-through `session/request_permission` (no auto-approve). An MCP `tools/call`
-emits `ChatToolCallStart`/`Ready` with a `Client` contributor, parks on
-`pendingClientToolCalls`, and settles when `onClientToolCallComplete` runs.
+them as `client__<tool>` through search_tool/use_tool. Live 1.0.70 first emits
+ACP `tool_call` with title/`x.ai` name `use_tool` and
+`rawInput.tool_name: 'client__<tool>'`, then `session/request_permission`
+(no auto-approve), then MCP `tools/call`. The host keeps grok's toolCallId as
+the single card (display name strips `client__`, Client contributor),
+correlates MCP FIFO by tool name + args, parks on `pendingClientToolCalls`,
+and settles when `onClientToolCallComplete` runs. Without our `client` MCP
+server attached, a user's own server named `client` is left alone.
 
 Mid-session tool-set changes update the live `tools/list` snapshot
 (`listChanged: true`). grok 1.0.70 does not advertise

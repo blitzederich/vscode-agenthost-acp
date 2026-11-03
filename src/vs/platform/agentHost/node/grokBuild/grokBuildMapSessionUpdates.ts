@@ -11,7 +11,7 @@ import { ContextSizeConfigKey, createContextSizeConfigSchemaPropertyFromLimits }
 import { grokBuildTodoListMetaKey, toToolCallMeta } from '../../common/meta/agentToolCallMeta.js';
 import type { ConfigPropertySchema, ConfigSchema } from '../../common/state/protocol/common/state.js';
 import { ActionType, type ChatAction, type SessionAction } from '../../common/state/sessionActions.js';
-import { createErrorResponsePart, MessageKind, ResponsePartKind, ToolCallConfirmationReason, ToolCallStatus, ToolResultContentType, type ToolCallPendingConfirmationState, type ToolCallResult, type UsageInfo } from '../../common/state/sessionState.js';
+import { createErrorResponsePart, MessageKind, ResponsePartKind, ToolCallConfirmationReason, ToolCallContributorKind, ToolCallStatus, ToolResultContentType, type ToolCallPendingConfirmationState, type ToolCallResult, type UsageInfo } from '../../common/state/sessionState.js';
 import {
 	GROK_SUBAGENT_TOOL_NAME,
 	GROK_TODO_TOOL_NAME,
@@ -20,7 +20,7 @@ import {
 	todosFromToolInput,
 	type IGrokTodoItem,
 } from './grokBuildUx.js';
-import { hasClientToolNamePrefix } from './grokBuildClientToolMcpServer.js';
+import { parseGrokClientToolTarget, type IGrokClientToolTarget } from './grokBuildClientToolMcpServer.js';
 import type {
 	AcpModelState,
 	AcpPermissionOption,
@@ -44,6 +44,13 @@ export interface IGrokBuildToolCallEntry {
 	readonly subagentDescription?: string;
 	/** Plan markdown attached when `_x.ai/exit_plan_mode` arrives. */
 	planContent?: string;
+	/**
+	 * Workbench client tool owned end-to-end on grok's toolCallId (Client
+	 * contributor). When set, Ready is deferred to grok's permission prompt.
+	 */
+	clientTool?: IGrokClientToolTarget;
+	/** Owning workbench client id when {@link clientTool} is set. */
+	clientId?: string;
 	started: boolean;
 	completed: boolean;
 }
@@ -59,6 +66,14 @@ export interface IGrokBuildMapState {
 	 * The first source that produces todos owns the turn.
 	 */
 	todoSource?: 'tool' | 'plan';
+	/**
+	 * True when this chat's HTTP `client` MCP server is attached. Client-tool
+	 * `use_tool` cards are only rewritten / Client-stamped in that case so a
+	 * user's own MCP server named `client` is left alone.
+	 */
+	clientMcpAttached?: boolean;
+	/** Resolve the workbench client that owns a client-tool name. */
+	clientToolOwnerOf?: (toolName: string) => string | undefined;
 }
 
 /** Host display title for grok's `exit_plan_mode` / `_x.ai/exit_plan_mode` tool card. */
@@ -66,13 +81,18 @@ export const GROK_PRESENT_PLAN_DISPLAY_NAME = localize('grokBuild.tool.presentPl
 /** Host display title for grok's `ask_user_question` / `_x.ai/ask_user_question` tool card. */
 export const GROK_ASK_USER_DISPLAY_NAME = localize('grokBuild.tool.askUser', "Ask User");
 
-export function createGrokBuildMapState(turnId: string): IGrokBuildMapState {
+export function createGrokBuildMapState(turnId: string, options?: {
+	readonly clientMcpAttached?: boolean;
+	readonly clientToolOwnerOf?: (toolName: string) => string | undefined;
+}): IGrokBuildMapState {
 	return {
 		turnId,
 		markdownPartId: undefined,
 		reasoningPartId: undefined,
 		toolCalls: new Map(),
 		planSnapshots: 0,
+		clientMcpAttached: options?.clientMcpAttached,
+		clientToolOwnerOf: options?.clientToolOwnerOf,
 	};
 }
 
@@ -450,6 +470,14 @@ function toolInputText(update: AcpToolCallUpdate, entry?: IGrokBuildToolCallEntr
 			return '';
 		}
 	}
+	// Prefer the nested tool_input for client use_tool cards (not the wrapper).
+	if (entry?.clientTool) {
+		try {
+			return JSON.stringify(entry.clientTool.args);
+		} catch {
+			return '{}';
+		}
+	}
 	if (update.rawInput === undefined || update.rawInput === null) {
 		return update.title ?? '';
 	}
@@ -492,17 +520,17 @@ function formatUnified(oldText: string, newText: string): string {
 
 /**
  * Whether this ACP tool_call / tool_call_update targets a workbench client
- * tool (`client__…`). Those cards are owned by the HTTP MCP `tools/call`
- * path ({@link GrokBuildAgent} `_invokeClientTool`) so the mapper must not
- * emit a second Start/Ready/Complete for the same invocation.
+ * tool served by our attached `client` MCP server. Detects the live 1.0.70
+ * first event (`use_tool` + `rawInput.tool_name: 'client__…'`) and the later
+ * `client__…` title form. When {@link IGrokBuildMapState.clientMcpAttached}
+ * is false, returns false so a user's own MCP server named `client` is
+ * left alone.
  */
-export function isGrokClientToolCallUpdate(update: AcpToolCallUpdate): boolean {
-	const xaiName = xaiToolMeta(update)?.name;
-	if (typeof xaiName === 'string' && hasClientToolNamePrefix(xaiName)) {
-		return true;
+export function isGrokClientToolCallUpdate(update: AcpToolCallUpdate, clientMcpAttached = true): boolean {
+	if (!clientMcpAttached) {
+		return false;
 	}
-	const title = update.title;
-	return typeof title === 'string' && hasClientToolNamePrefix(title);
+	return parseGrokClientToolTarget(update) !== undefined;
 }
 
 function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (SessionAction | ChatAction)[] {
@@ -511,11 +539,7 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 		return [];
 	}
 
-	// Grok emits tool_call for `client__*` before POSTing MCP tools/call.
-	// Suppress the ACP card; the MCP invoker shows the single Client card.
-	if (isGrokClientToolCallUpdate(update)) {
-		return [];
-	}
+	const clientTarget = state.clientMcpAttached ? parseGrokClientToolTarget(update) : undefined;
 
 	const xaiName = xaiToolMeta(update)?.name;
 	if (xaiName === 'todo_write' || update.title === 'todo_write') {
@@ -529,12 +553,23 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 		}
 	}
 
-	const identity = resolveToolIdentity(update);
+	const identity = clientTarget
+		? {
+			toolName: clientTarget.toolName,
+			displayName: clientTarget.toolName,
+			permissionKind: AgentPermissionKind.CustomTool,
+			permissionPath: undefined as string | undefined,
+			isEdit: false,
+			toolKind: undefined as 'subagent' | 'exit_plan' | 'ask_user' | undefined,
+			subagentDescription: undefined as string | undefined,
+		}
+		: resolveToolIdentity(update);
 	let entry = state.toolCalls.get(toolCallId);
 	const actions: (SessionAction | ChatAction)[] = [];
 	const meta = () => toolCallMeta(entry!);
 
 	if (!entry) {
+		const clientId = clientTarget ? state.clientToolOwnerOf?.(clientTarget.toolName) : undefined;
 		entry = {
 			toolCallId,
 			toolName: identity.toolName,
@@ -543,26 +578,33 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 			permissionPath: identity.permissionPath,
 			toolKind: identity.toolKind,
 			subagentDescription: identity.subagentDescription,
+			...(clientTarget ? { clientTool: clientTarget, ...(clientId ? { clientId } : {}) } : {}),
 			started: false,
 			completed: false,
 		};
 		state.toolCalls.set(toolCallId, entry);
-	} else if (update.title || identity.displayName !== entry.displayName || identity.toolKind) {
+	} else if (clientTarget || update.title || identity.displayName !== entry.displayName || identity.toolKind) {
 		const stickyKind = isStickyToolKind(entry.toolKind)
 			? entry.toolKind
 			: (isStickyToolKind(identity.toolKind) ? identity.toolKind : undefined);
+		const clientId = entry.clientId
+			?? (clientTarget ? state.clientToolOwnerOf?.(clientTarget.toolName) : undefined);
 		entry = {
 			...entry,
 			displayName: stickyKind
 				? stickyDisplayName(stickyKind)
-				: (update.title ?? identity.displayName),
+				: (clientTarget ? clientTarget.toolName : (update.title ?? identity.displayName)),
 			permissionPath: identity.permissionPath ?? entry.permissionPath,
 			permissionKind: identity.permissionKind,
-			toolName: identity.toolKind === 'subagent' || isStickyToolKind(identity.toolKind)
-				? identity.toolName
-				: identity.isEdit ? 'file_edit' : entry.toolName,
+			toolName: clientTarget
+				? clientTarget.toolName
+				: identity.toolKind === 'subagent' || isStickyToolKind(identity.toolKind)
+					? identity.toolName
+					: identity.isEdit ? 'file_edit' : entry.toolName,
 			toolKind: identity.toolKind ?? entry.toolKind,
 			subagentDescription: identity.subagentDescription ?? entry.subagentDescription,
+			...(clientTarget ? { clientTool: clientTarget } : {}),
+			...(clientId ? { clientId } : {}),
 		};
 		state.toolCalls.set(toolCallId, entry);
 	}
@@ -580,6 +622,9 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 				toolCallId,
 				toolName: entry.toolName,
 				displayName: entry.displayName,
+				...(entry.clientId
+					? { contributor: { kind: ToolCallContributorKind.Client as const, clientId: entry.clientId } }
+					: {}),
 				...(callMeta ? { _meta: callMeta } : {}),
 			},
 			...(input ? [{
@@ -589,7 +634,12 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 				content: input,
 				...(callMeta ? { _meta: callMeta } : {}),
 			}] : []),
-			{
+		);
+		// Client tools stay Streaming until grok's session/request_permission
+		// Ready; Ready(NotNeeded) here would publish ToolClientExecution before
+		// the user approves.
+		if (!entry.clientTool) {
+			actions.push({
 				type: ActionType.ChatToolCallReady,
 				turnId: state.turnId,
 				toolCallId,
@@ -597,9 +647,9 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 				toolInput: input,
 				confirmed: ToolCallConfirmationReason.NotNeeded,
 				...(callMeta ? { _meta: callMeta } : {}),
-			},
-		);
-	} else if (update.title && update.sessionUpdate === 'tool_call_update' && !isStickyToolKind(entry.toolKind)) {
+			});
+		}
+	} else if (update.title && update.sessionUpdate === 'tool_call_update' && !isStickyToolKind(entry.toolKind) && !entry.clientTool) {
 		// Refresh invocation presentation when Grok upgrades the title (e.g. edit path).
 		const input = toolInputText(update, entry);
 		if (input) {
@@ -1096,6 +1146,9 @@ export function mapPermissionRequest(
 		confirmationTitle: title,
 		...(params.description ? { confirmationMessage: params.description } : {}),
 		...(path ? { toolInput: path } : {}),
+		...(entry?.clientId
+			? { contributor: { kind: ToolCallContributorKind.Client as const, clientId: entry.clientId } }
+			: {}),
 	};
 
 	return {
