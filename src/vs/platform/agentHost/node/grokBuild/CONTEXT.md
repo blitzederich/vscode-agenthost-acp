@@ -83,6 +83,10 @@ merged with existing keys (looked up by `owner.toString()`). `totalTokens: 0`
 (transient after `/compact`) is ignored. `tokenLimit` is the current model's
 `maxContextWindow`, overridden by `model_changed.context_window_selection`
 when present and cleared when that field is omitted or on `changeModel`.
+Restored turns set `message.model` from the pinned `backing.model` or else
+`models.currentModelId` (`cliCurrentModelId`, not written into providerData).
+`providerData.contextTokens` persists the last gauge across restarts when
+the load replay under-reports.
 
 Session updates that do not become chat actions: `available_commands_update`
 (slash skills, below), `config_option_update`, `session_info_update`,
@@ -151,7 +155,7 @@ Reject ends the prompt with `stopReason: "cancelled"`.
 | `authenticate` | **Implemented** | No-op `false` for unknown resources (CLI auth path) |
 | `getChatMetadata` | **Implemented** | Live backing, or providerData. `activation: 'restore'` attaches the runtime (including discovered/CLI sessions with no providerData, via `session/list` + `session/load`); a passive read does not. A missing session on restore is `AHP_SESSION_NOT_FOUND` with `grokSessionMissingError` (not a silent miss). |
 | `listChatsToMigrate` | **Implemented** | One unfiltered paginated `session/list`. `[]` when list is not advertised. `undefined` when the catalog cannot be read |
-| `recoverLegacyChat` | **Implemented** | Connects first (capabilities are empty before the handshake), then session id from the owner URI, cwd and title from `session/list`, then `session/load`. Provider data includes `models.currentModelId` from that load |
+| `recoverLegacyChat` | **Implemented** | Connects first (capabilities are empty before the handshake), then session id from the owner URI, cwd and title from `session/list`, then `session/load`. `models.currentModelId` is kept as in-memory `cliCurrentModelId` (not pinned into providerData.model) |
 | `setWorkingDirectory` | **Implemented** | Always rejects. grok cannot reload a session at a different cwd (`FS_NOT_FOUND`) |
 | `shutdown` / `dispose` | **Implemented** | Tears down ACP child |
 | All marketplace / canvas / MCP / sandbox / steering / truncate / plugin APIs | Stub | Omitted optional members |

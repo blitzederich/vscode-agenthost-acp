@@ -365,6 +365,12 @@ interface IGrokBuildChatBacking {
 	contextWindowOverride?: number;
 	/** Last published `copilot.usageInfo` (dedupe). */
 	publishedContextUsage?: IGrokContextUsageInfo;
+	/**
+	 * `models.currentModelId` from the latest `session/new` or `session/load`.
+	 * Used for restore history modelId / tokenLimit when the user has not
+	 * pinned `backing.model` (and must not be written into providerData).
+	 */
+	cliCurrentModelId?: string;
 }
 
 interface IPendingPermission {
@@ -583,7 +589,7 @@ function textFromSessionUpdate(params: AcpSessionUpdateParams): string | undefin
 	return undefined;
 }
 
-function turnRecordToTurn(record: IGrokBuildTurnRecord): Turn {
+function turnRecordToTurn(record: IGrokBuildTurnRecord, model?: ModelSelection): Turn {
 	const responseParts = [];
 	if (record.assistantMarkdown) {
 		responseParts.push({ kind: ResponsePartKind.Markdown as const, id: generateUuid(), content: record.assistantMarkdown });
@@ -593,11 +599,23 @@ function turnRecordToTurn(record: IGrokBuildTurnRecord): Turn {
 	}
 	return {
 		id: record.id,
-		message: { text: record.userText, origin: { kind: MessageKind.User } },
+		message: {
+			text: record.userText,
+			origin: { kind: MessageKind.User },
+			...(model ? { model } : {}),
+		},
 		responseParts,
 		usage: record.usage,
 		state: record.state,
 	};
+}
+
+/** Explicit user/provider selection wins over the CLI's currentModelId. */
+function modelForTurnRecords(backing: IGrokBuildChatBacking): ModelSelection | undefined {
+	if (backing.model) {
+		return backing.model;
+	}
+	return backing.cliCurrentModelId ? { id: backing.cliCurrentModelId } : undefined;
 }
 
 function spawnGrokBuildProcess(launch: IGrokBuildLaunchConfig): GrokBuildTestSpawnResult {
@@ -741,10 +759,17 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		abort: (chat, _context) => this._abort(chat),
 		getMessages: (chat, _context) => {
 			const backing = this._backings.get(chatKey(chat));
-			return Promise.resolve(backing?.turns.map(turnRecordToTurn) ?? []);
+			if (!backing) {
+				return Promise.resolve([]);
+			}
+			const model = modelForTurnRecords(backing);
+			return Promise.resolve(backing.turns.map(turn => turnRecordToTurn(turn, model)));
 		},
 		changeModel: (chat, model, _context) => this._changeModel(chat, model),
-		getModel: (chat, _context) => this._backings.get(chatKey(chat))?.model,
+		getModel: (chat, _context) => {
+			const backing = this._backings.get(chatKey(chat));
+			return backing ? modelForTurnRecords(backing) : undefined;
+		},
 		changeAgent: (_chat, _agent, _context) => Promise.resolve(),
 	};
 
@@ -939,7 +964,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 				startTime: backing.startTime,
 				modifiedTime: backing.modifiedTime,
 				summary: backing.summary,
-				model: backing.model,
+				model: modelForTurnRecords(backing),
 				workingDirectories: backing.workingDirectories,
 			};
 		} catch (err) {
@@ -1008,9 +1033,11 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			commands: sameSession ? existing?.commands : undefined,
 			ownerRef: sameSession ? existing?.ownerRef : undefined,
 			appliedModeId: sameSession ? existing?.appliedModeId : undefined,
-			lastTotalTokens: sameSession ? existing?.lastTotalTokens : undefined,
+			// Prefer in-memory gauge; otherwise seed from persisted contextTokens.
+			lastTotalTokens: sameSession ? existing?.lastTotalTokens : persisted.contextTokens,
 			contextWindowOverride: sameSession ? existing?.contextWindowOverride : undefined,
 			publishedContextUsage: sameSession ? existing?.publishedContextUsage : undefined,
+			cliCurrentModelId: sameSession ? existing?.cliCurrentModelId : undefined,
 		};
 		this._backings.set(chatKey(chat), backing);
 		this._sessionToChat.set(persisted.sessionId, chat);
@@ -1023,6 +1050,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			model: backing.model,
 			cwd: backing.workingDirectories?.[0]?.fsPath,
 			reasoningEffort: backing.reasoningEffort,
+			contextTokens: backing.lastTotalTokens,
 		});
 	}
 
@@ -1064,6 +1092,9 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 
 		this._rememberReasoningOption(readReasoningEffortOption(sessionNew.configOptions));
 		this._publishModels(sessionNew.models);
+		const cliCurrentModelId = typeof sessionNew.models?.currentModelId === 'string' && sessionNew.models.currentModelId.length > 0
+			? sessionNew.models.currentModelId
+			: undefined;
 
 		let model = options?.model;
 		if (options?.model?.id) {
@@ -1096,6 +1127,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		}
 
 		const backing = this._storeBacking(chat, { sessionId: sessionNew.sessionId, model: modelWithThinkingLevel(model, reasoningEffort), reasoningEffort }, workingDirectories);
+		backing.cliCurrentModelId = cliCurrentModelId;
 		this._rememberOwner(backing, context);
 		this._setLoadedGeneration(backing, this._connectionGeneration);
 		const modeId = modeIdForSessionMode(options?.config?.[SessionConfigKey.Mode]);
@@ -1181,6 +1213,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			this._finalizeTurn(backing, turn, result.stopReason === 'cancelled' ? TurnState.Cancelled : TurnState.Complete, usage);
 			// Turn end: refresh the context bar (messagesLength and latest totalTokens).
 			this._publishContextUsage(backing);
+			this._emitProviderDataChange(chat, backing);
 		} catch (err) {
 			// A dead grok process records the turn before this rejection is delivered.
 			// agentSideEffects maps a rejected sendMessage; do not also fire ChatError.
@@ -1379,7 +1412,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			return backing.contextWindowOverride;
 		}
 		const models = this._models.get();
-		const id = backing.model?.id;
+		const id = modelForTurnRecords(backing)?.id;
 		const match = id ? models.find(model => model.id === id) : undefined;
 		return match?.maxContextWindow ?? models.find(model => model.maxContextWindow !== undefined)?.maxContextWindow;
 	}
@@ -1800,8 +1833,9 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 				this._rememberReasoningOption(readReasoningEffortOption(result.configOptions));
 				this._publishModels(result.models);
 				const modelId = result.models?.currentModelId;
-				if (typeof modelId === 'string' && modelId.length > 0 && !backing.model) {
-					backing.model = { id: modelId };
+				if (typeof modelId === 'string' && modelId.length > 0) {
+					// CLI default only — never pin into backing.model / providerData.
+					backing.cliCurrentModelId = modelId;
 				}
 				const history = finishGrokHistoryReplay(replay);
 				backing.turns = mergeRestoredTurns(backing.turns, history.turns);
@@ -1813,7 +1847,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 				}
 				await this._reapplyReasoningEffort(client, backing);
 				backing.modifiedTime = Date.now();
-				// Replay may under-report totalTokens; publish the latest seen.
+				// Prefer last replayed totalTokens; otherwise the persisted contextTokens seed.
 				this._publishContextUsage(backing);
 			} catch (err) {
 				if (isGrokFsNotFound(err)) {
@@ -1835,6 +1869,10 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 				});
 				this._rememberReasoningOption(readReasoningEffortOption(result.configOptions));
 				this._publishModels(result.models);
+				const resumeModelId = result.models?.currentModelId;
+				if (typeof resumeModelId === 'string' && resumeModelId.length > 0) {
+					backing.cliCurrentModelId = resumeModelId;
+				}
 				await this._reapplyReasoningEffort(client, backing);
 			} catch (err) {
 				rethrowAcpFailure(err);

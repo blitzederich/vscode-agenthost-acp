@@ -539,6 +539,107 @@ suite('GrokBuildAgent', () => {
 		});
 	});
 
+	test('session/load restore sets message.model from currentModelId and publishes usage before metadata resolves', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client, LIVE_CAPABILITIES);
+		const signals: AgentSignal[] = [];
+		store.add(agent.onDidChatProgress(s => signals.push(s)));
+
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/restore-usage' });
+		const context = chatContext(chat);
+		// No pinned model in providerData — CLI currentModelId must populate turn message.model.
+		const providerData = encodeGrokBuildChat({ sessionId: 'sess-restore-usage', cwd: '/tmp/proj', contextTokens: 9000 });
+		const restoring = agent.getChatMetadata(chat, context, providerData, { activation: 'restore' });
+		const load = await readNextMessage(peer.outbound);
+		assert.strictEqual(load.method, 'session/load');
+
+		pushUpdate(peer, 'sess-restore-usage', {
+			sessionUpdate: 'user_message_chunk',
+			content: { type: 'text', text: 'earlier' },
+			_meta: { promptIndex: 0 },
+		});
+		pushUpdate(peer, 'sess-restore-usage', {
+			sessionUpdate: 'agent_message_chunk',
+			content: { type: 'text', text: 'reply' },
+			_meta: { promptIndex: 0, totalTokens: 14581 },
+		});
+		peer.push({
+			jsonrpc: '2.0',
+			id: load.id,
+			result: {
+				models: {
+					currentModelId: 'grok-4.7',
+					availableModels: [{ modelId: 'grok-4.7', name: 'Grok 4.7', _meta: { totalContextTokens: 256000 } }],
+				},
+				configOptions: [],
+			},
+		});
+		await answerSessionList(peer);
+		const metadata = await restoring;
+
+		const metaBeforeResolve = signals.filter(s => s.kind === 'action' && s.action.type === ActionType.SessionMetaChanged);
+		assert.ok(metaBeforeResolve.length >= 1);
+		const usageMeta = metaBeforeResolve.at(-1);
+		assert.ok(usageMeta && usageMeta.kind === 'action' && usageMeta.action.type === ActionType.SessionMetaChanged);
+		assert.deepStrictEqual(usageMeta.action._meta?.['copilot.usageInfo'], {
+			currentTokens: 14581,
+			tokenLimit: 256000,
+			messagesLength: 1,
+		});
+
+		const messages = await agent.chats.getMessages(chat, context);
+		assert.strictEqual(decodeGrokBuildChat(providerData)?.model, undefined);
+		assert.strictEqual(messages.at(-1)?.message.model?.id, 'grok-4.7');
+		assert.strictEqual(metadata?.model?.id, 'grok-4.7');
+		assert.strictEqual(agent.chats.getModel?.(chat, context)?.id, 'grok-4.7');
+	});
+
+	test('explicit backing.model wins over session/load currentModelId for turn message.model', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client, LIVE_CAPABILITIES);
+
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/pinned-model' });
+		const context = chatContext(chat);
+		const providerData = encodeGrokBuildChat({ sessionId: 'sess-pinned', cwd: '/tmp/proj', model: { id: 'pinned-grok' } });
+		const restoring = agent.getChatMetadata(chat, context, providerData, { activation: 'restore' });
+		const load = await readNextMessage(peer.outbound);
+		assert.strictEqual(load.method, 'session/load');
+		pushUpdate(peer, 'sess-pinned', {
+			sessionUpdate: 'user_message_chunk',
+			content: { type: 'text', text: 'hi' },
+			_meta: { promptIndex: 0 },
+		});
+		pushUpdate(peer, 'sess-pinned', {
+			sessionUpdate: 'agent_message_chunk',
+			content: { type: 'text', text: 'yo' },
+			_meta: { promptIndex: 0, totalTokens: 100 },
+		});
+		peer.push({
+			jsonrpc: '2.0',
+			id: load.id,
+			result: {
+				models: {
+					currentModelId: 'grok-4.7',
+					availableModels: [
+						{ modelId: 'grok-4.7', name: 'Grok 4.7', _meta: { totalContextTokens: 256000 } },
+						{ modelId: 'pinned-grok', name: 'Pinned', _meta: { totalContextTokens: 256000 } },
+					],
+				},
+				configOptions: [],
+			},
+		});
+		await answerSessionList(peer);
+		await restoring;
+
+		const messages = await agent.chats.getMessages(chat, context);
+		assert.strictEqual(messages.at(-1)?.message.model?.id, 'pinned-grok');
+		assert.strictEqual(agent.chats.getModel?.(chat, context)?.id, 'pinned-grok');
+	});
+
 	test('createChat with options.model calls session/set_model; changeModel updates backing', async () => {
 		const peer = store.add(makeFakePeer());
 		const client = store.add(new AcpClient(peer.transport));
@@ -1404,7 +1505,11 @@ suite('GrokBuildAgent', () => {
 		assert.strictEqual(prompt.params.sessionId, 'sess-cwd');
 		peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
 		await send;
-		assert.deepStrictEqual(changes, persisted);
+		// Turn end may re-persist providerData (contextTokens); cwd must stay /tmp/a.
+		assert.deepStrictEqual(changes.slice(0, persisted.length), persisted);
+		for (const blob of changes) {
+			assert.strictEqual(decodeGrokBuildChat(blob)?.cwd, '/tmp/a');
+		}
 		assert.ok(log.traces.some(message => /ignoring working directory/.test(message) && message.includes('/tmp/b') && message.includes('/tmp/a')));
 		const after = await agent.getChatMetadata(chat, context);
 		assert.strictEqual(after?.workingDirectories?.[0].fsPath, '/tmp/a');
@@ -1467,7 +1572,8 @@ suite('GrokBuildAgent', () => {
 		const decoded = decodeGrokBuildChat(result.providerData);
 		assert.strictEqual(decoded?.sessionId, sessionId);
 		assert.strictEqual(decoded?.cwd, '/tmp/proj');
-		assert.strictEqual(decoded?.model?.id, 'grok-4.7');
+		// CLI currentModelId is not pinned into providerData.model.
+		assert.strictEqual(decoded?.model, undefined);
 		const metadata = await agent.getChatMetadata(chat, context);
 		assert.strictEqual(metadata?.summary, 'Fresh title');
 		assert.strictEqual(metadata?.model?.id, 'grok-4.7');
@@ -1501,7 +1607,7 @@ suite('GrokBuildAgent', () => {
 		const result = await materialized;
 		assert.ok(result);
 		const decoded = decodeGrokBuildChat(result.providerData);
-		assert.strictEqual(decoded?.model?.id, 'grok-4.7');
+		assert.strictEqual(decoded?.model, undefined);
 		assert.strictEqual(decoded?.cwd, '/tmp/proj');
 		const metadata = await agent.getChatMetadata(chat, context);
 		assert.strictEqual(metadata?.summary, 'From the catalog');
