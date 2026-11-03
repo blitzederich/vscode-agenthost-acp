@@ -32,8 +32,11 @@ import { IAgentConfigurationService, type IAgentChatConfigurationChangeEvent, ty
 import type { AgentHostStateManager } from '../../../node/agentHostStateManager.js';
 import { SessionConfigKey } from '../../../common/sessionConfigKeys.js';
 import { GROK_BUILD_ACP_ARGV, grokCannotRestoreSessionError, grokCliMissingError, grokCliNotExecutableError, grokHandshakeTimeoutError, grokNotLoggedInError, grokSessionMissingError, grokUnreadableVersionWarning, grokVersionTooOldError, grokWorkingDirectoryRejectedError } from '../../../node/grokBuild/grokBuildLaunchConfig.js';
+import { GROK_CLIENT_MCP_SERVER_NAME } from '../../../node/grokBuild/grokBuildClientToolMcpServer.js';
 import type { AcpAgentCapabilities } from '../../../node/grokBuild/protocol/acpTypes.js';
 import { AHP_SESSION_NOT_FOUND, ProtocolError } from '../../../common/state/sessionProtocol.js';
+import { AgentHostGrokBuildClientToolsMcpEnabledConfigKey } from '../../../common/agentHostSchema.js';
+import { ToolCallContributorKind, ToolResultContentType } from '../../../common/state/sessionState.js';
 
 class TestProductService {
 	readonly _serviceBrand: undefined;
@@ -299,18 +302,49 @@ suite('GrokBuildAgent', () => {
 
 	const store = ensureNoDisposablesAreLeakedInTestSuite();
 
+	function assertClientToolsMcpServer(mcpServers: unknown): asserts mcpServers is Array<{
+		type: string;
+		name: string;
+		url: string;
+		headers: Array<{ name: string; value: string }>;
+	}> {
+		assert.ok(Array.isArray(mcpServers), 'mcpServers should be an array');
+		assert.strictEqual(mcpServers.length, 1);
+		const server = mcpServers[0] as {
+			type: string;
+			name: string;
+			url: string;
+			headers: Array<{ name: string; value: string }>;
+		};
+		assert.strictEqual(server.type, 'http');
+		assert.strictEqual(server.name, GROK_CLIENT_MCP_SERVER_NAME);
+		assert.ok(typeof server.url === 'string' && /^http:\/\/127\.0\.0\.1:\d+\/mcp$/.test(server.url), `unexpected mcp url: ${server.url}`);
+		assert.ok(Array.isArray(server.headers) && server.headers.length === 1);
+		assert.strictEqual(server.headers[0]!.name, 'Authorization');
+		assert.ok(/^Bearer [0-9a-f]+$/i.test(server.headers[0]!.value));
+	}
+
 	function createAgent(log: NullLogService = new NullLogService(), configuration?: {
 		readonly onDidChatConfigChange?: Event<IAgentChatConfigurationChangeEvent>;
 		readonly getChatConfigValues?: () => Record<string, unknown> | undefined;
+		readonly getRootValue?: (schema: unknown, key: string) => unknown;
 		readonly updateChatConfig?: (target: IAgentChatConfigurationTarget, patch: Record<string, unknown>) => void;
 		readonly configPatches?: Array<{ target: IAgentChatConfigurationTarget; patch: Record<string, unknown> }>;
 		readonly sessionMeta?: Record<string, unknown>;
 		readonly getSessionMeta?: () => Record<string, unknown> | undefined;
 		readonly onGetSessionState?: (key: unknown) => void;
+		/** When false, client-tools MCP is disabled (mcpServers stay empty). Default true. */
+		readonly clientToolsMcpEnabled?: boolean;
 	}): GrokBuildAgent {
 		const configurationService = {
 			onDidChatConfigChange: configuration?.onDidChatConfigChange ?? Event.None,
 			getChatConfigValues: configuration?.getChatConfigValues ?? (() => undefined),
+			getRootValue: configuration?.getRootValue ?? ((_schema: unknown, key: string) => {
+				if (key === AgentHostGrokBuildClientToolsMcpEnabledConfigKey) {
+					return configuration?.clientToolsMcpEnabled !== false;
+				}
+				return undefined;
+			}),
 			updateChatConfig: configuration?.updateChatConfig ?? ((target, patch) => {
 				configuration?.configPatches?.push({ target, patch });
 			}),
@@ -353,7 +387,7 @@ suite('GrokBuildAgent', () => {
 		const sessionNew = await readNextMessage(peer.outbound);
 		assert.strictEqual(sessionNew.method, 'session/new');
 		assert.strictEqual(sessionNew.params.cwd, '/tmp/grok-acp-probe');
-		assert.deepStrictEqual(sessionNew.params.mcpServers, []);
+		assertClientToolsMcpServer(sessionNew.params.mcpServers);
 		peer.push({
 			jsonrpc: '2.0',
 			id: sessionNew.id,
@@ -1477,7 +1511,9 @@ suite('GrokBuildAgent', () => {
 		const materialized = agent.materializeChat(chat, context, providerData);
 		const load = await readNextMessage(peer.outbound);
 		assert.strictEqual(load.method, 'session/load');
-		assert.deepStrictEqual(load.params, { sessionId: 'sess-old', cwd: '/tmp/proj', mcpServers: [] });
+		assert.strictEqual(load.params.sessionId, 'sess-old');
+		assert.strictEqual(load.params.cwd, '/tmp/proj');
+		assertClientToolsMcpServer(load.params.mcpServers);
 
 		pushUpdate(peer, 'sess-old', { sessionUpdate: 'user_message_chunk', messageId: 'u1', content: { type: 'text', text: 'first ' } });
 		pushUpdate(peer, 'sess-old', { sessionUpdate: 'user_message_chunk', messageId: 'u1', content: { type: 'text', text: 'question' } });
@@ -1548,7 +1584,9 @@ suite('GrokBuildAgent', () => {
 		const materialized = agent.materializeChat(chat, context, providerData);
 		const resume = await readNextMessage(peer.outbound);
 		assert.strictEqual(resume.method, 'session/resume');
-		assert.deepStrictEqual(resume.params, { sessionId: 'sess-resume', cwd: '/tmp/proj', mcpServers: [] });
+		assert.strictEqual(resume.params.sessionId, 'sess-resume');
+		assert.strictEqual(resume.params.cwd, '/tmp/proj');
+		assertClientToolsMcpServer(resume.params.mcpServers);
 		pushUpdate(peer, 'sess-resume', { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'should not replay' } });
 		peer.push({ jsonrpc: '2.0', id: resume.id, result: {} });
 		await materialized;
@@ -1756,7 +1794,9 @@ suite('GrokBuildAgent', () => {
 		await completeHandshake(respawned);
 		const load = await readNextMessage(respawned.outbound);
 		assert.strictEqual(load.method, 'session/load');
-		assert.deepStrictEqual(load.params, { sessionId: 'sess-crash', cwd: '/tmp/proj', mcpServers: [] });
+		assert.strictEqual(load.params.sessionId, 'sess-crash');
+		assert.strictEqual(load.params.cwd, '/tmp/proj');
+		assertClientToolsMcpServer(load.params.mcpServers);
 		pushLiveHistory(respawned, 'sess-crash', killed);
 		respawned.push({ jsonrpc: '2.0', id: load.id, result: { models: { currentModelId: 'grok-4.7', availableModels: [{ modelId: 'grok-4.7', name: 'Grok 4.7' }] }, configOptions: [] } });
 		await answerSessionList(respawned);
@@ -2137,7 +2177,9 @@ suite('GrokBuildAgent', () => {
 		});
 		const load = await readNextMessage(peer.outbound);
 		assert.strictEqual(load.method, 'session/load');
-		assert.deepStrictEqual(load.params, { sessionId, cwd: '/tmp/proj', mcpServers: [] });
+		assert.strictEqual(load.params.sessionId, sessionId);
+		assert.strictEqual(load.params.cwd, '/tmp/proj');
+		assertClientToolsMcpServer(load.params.mcpServers);
 		peer.push({
 			jsonrpc: '2.0',
 			id: load.id,
@@ -2165,7 +2207,9 @@ suite('GrokBuildAgent', () => {
 		const materialized = agent.materializeChat(chat, context, encodeGrokBuildChat({ sessionId: 'sess-title', cwd: '/tmp/proj' }));
 		const load = await readNextMessage(peer.outbound);
 		assert.strictEqual(load.method, 'session/load');
-		assert.deepStrictEqual(load.params, { sessionId: 'sess-title', cwd: '/tmp/proj', mcpServers: [] });
+		assert.strictEqual(load.params.sessionId, 'sess-title');
+		assert.strictEqual(load.params.cwd, '/tmp/proj');
+		assertClientToolsMcpServer(load.params.mcpServers);
 		peer.push({
 			jsonrpc: '2.0',
 			id: load.id,
@@ -2217,7 +2261,9 @@ suite('GrokBuildAgent', () => {
 		});
 		const load = await readNextMessage(peer.outbound);
 		assert.strictEqual(load.method, 'session/load');
-		assert.deepStrictEqual(load.params, { sessionId, cwd: '/tmp/proj', mcpServers: [] });
+		assert.strictEqual(load.params.sessionId, sessionId);
+		assert.strictEqual(load.params.cwd, '/tmp/proj');
+		assertClientToolsMcpServer(load.params.mcpServers);
 		peer.push({ jsonrpc: '2.0', id: load.id, result: { models: { currentModelId: 'grok-4.7', availableModels: [{ modelId: 'grok-4.7', name: 'Grok 4.7' }] }, configOptions: [] } });
 		const result = await recovered;
 		const decoded = decodeGrokBuildChat(result.providerData);
@@ -2240,7 +2286,9 @@ suite('GrokBuildAgent', () => {
 			result: { sessions: [{ sessionId: session2, cwd: '/tmp/other', title: 'Second title' }] },
 		});
 		const load2 = await readNextMessage(peer.outbound);
-		assert.deepStrictEqual(load2.params, { sessionId: session2, cwd: '/tmp/other', mcpServers: [] });
+		assert.strictEqual(load2.params.sessionId, session2);
+		assert.strictEqual(load2.params.cwd, '/tmp/other');
+		assertClientToolsMcpServer(load2.params.mcpServers);
 		peer.push({ jsonrpc: '2.0', id: load2.id, result: {} });
 		const result2 = await materialized;
 		assert.ok(result2);
@@ -2268,7 +2316,9 @@ suite('GrokBuildAgent', () => {
 		const materialized = agent.materializeChat(chat, context, encodeGrokBuildChat({ sessionId: '00000000-0000-0000-0000-000000000000', cwd: '/tmp/proj' }));
 		const load = await readNextMessage(peer.outbound);
 		assert.strictEqual(load.method, 'session/load');
-		assert.deepStrictEqual(load.params, { sessionId: '00000000-0000-0000-0000-000000000000', cwd: '/tmp/proj', mcpServers: [] });
+		assert.strictEqual(load.params.sessionId, '00000000-0000-0000-0000-000000000000');
+		assert.strictEqual(load.params.cwd, '/tmp/proj');
+		assertClientToolsMcpServer(load.params.mcpServers);
 		peer.push({
 			jsonrpc: '2.0',
 			id: load.id,
@@ -2306,7 +2356,9 @@ suite('GrokBuildAgent', () => {
 		});
 		const load = await readNextMessage(peer.outbound);
 		assert.strictEqual(load.method, 'session/load');
-		assert.deepStrictEqual(load.params, { sessionId, cwd: '/tmp/other-cli-cwd', mcpServers: [] });
+		assert.strictEqual(load.params.sessionId, sessionId);
+		assert.strictEqual(load.params.cwd, '/tmp/other-cli-cwd');
+		assertClientToolsMcpServer(load.params.mcpServers);
 		pushUpdate(peer, sessionId, { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'hello from cli' }, _meta: { promptIndex: 0 } });
 		pushUpdate(peer, sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'hi' }, _meta: { promptIndex: 0 } });
 		peer.push({
@@ -2344,7 +2396,9 @@ suite('GrokBuildAgent', () => {
 		});
 		const load = await readNextMessage(peer.outbound);
 		assert.strictEqual(load.method, 'session/load');
-		assert.deepStrictEqual(load.params, { sessionId, cwd: '/tmp/gone', mcpServers: [] });
+		assert.strictEqual(load.params.sessionId, sessionId);
+		assert.strictEqual(load.params.cwd, '/tmp/gone');
+		assertClientToolsMcpServer(load.params.mcpServers);
 		peer.push({
 			jsonrpc: '2.0',
 			id: load.id,
@@ -3890,6 +3944,105 @@ suite('GrokBuildAgent', () => {
 		assert.ok(!outbound2.some(message => message.id === 114 && message.result?.outcome === 'accepted'));
 		await send2.catch(() => undefined);
 		void prompt2;
+	});
+
+	test('clientToolsMcp setting off keeps mcpServers empty on session/new', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent(new NullLogService(), { clientToolsMcpEnabled: false });
+		agent.bindTestClient(client);
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/mcp-off' });
+		const createPromise = agent.chats.createChat(chat, chatContext(chat), {
+			workingDirectories: [URI.file('/tmp/proj')],
+		});
+		const sessionNew = await readNextMessage(peer.outbound);
+		assert.strictEqual(sessionNew.method, 'session/new');
+		assert.deepStrictEqual(sessionNew.params.mcpServers, []);
+		peerPushSession(peer, sessionNew.id, 'sess-mcp-off');
+		await createPromise;
+	});
+
+	test('session/new passes client HTTP mcpServers and onClientToolCallComplete resolves MCP tools/call', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client);
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/mcp-client' });
+		const context = chatContext(chat);
+
+		const active = agent.getOrCreateActiveClient(chat, context, { clientId: 'workbench-1', displayName: 'VS Code' });
+		active.tools = [{
+			name: 'workspace_echo',
+			description: 'echo for tests',
+			inputSchema: { type: 'object', properties: { msg: { type: 'string' } } },
+		}];
+
+		const signals: AgentSignal[] = [];
+		store.add(agent.onDidChatProgress(s => signals.push(s)));
+
+		const createPromise = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp/proj')] });
+		const sessionNew = await readNextMessage(peer.outbound);
+		assertClientToolsMcpServer(sessionNew.params.mcpServers);
+		const mcp = sessionNew.params.mcpServers[0]!;
+		peerPushSession(peer, sessionNew.id, 'sess-mcp-client');
+		await createPromise;
+
+		const sendPromise = agent.chats.sendMessage(chat, 'hi', [URI.file('/tmp/proj')], undefined, 'turn-mcp', undefined, context);
+		const prompt = await readNextMessage(peer.outbound);
+		assert.strictEqual(prompt.method, 'session/prompt');
+
+		const auth = mcp.headers[0]!.value;
+		const listRes = await fetch(mcp.url, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', Authorization: auth },
+			body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
+		});
+		assert.strictEqual(listRes.status, 200);
+		const listJson = await listRes.json() as { result: { tools: Array<{ name: string }> } };
+		assert.ok(listJson.result.tools.some(t => t.name === 'workspace_echo'));
+
+		const readyPromise = Event.toPromise(Event.filter(agent.onDidChatProgress, signal =>
+			signal.kind === 'action' && signal.action.type === ActionType.ChatToolCallReady
+		));
+		const callPromise = fetch(mcp.url, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', Authorization: auth },
+			body: JSON.stringify({
+				jsonrpc: '2.0',
+				id: 2,
+				method: 'tools/call',
+				params: { name: 'workspace_echo', arguments: { msg: 'ping' } },
+			}),
+		});
+		await readyPromise;
+		const start = signals.find(s =>
+			s.kind === 'action'
+			&& s.action.type === ActionType.ChatToolCallStart
+			&& (s.action as { toolName?: string }).toolName === 'workspace_echo'
+		);
+		assert.ok(start && start.kind === 'action' && start.action.type === ActionType.ChatToolCallStart);
+		assert.deepStrictEqual(start.action.contributor, { kind: ToolCallContributorKind.Client, clientId: 'workbench-1' });
+		const toolCallId = start.action.toolCallId;
+
+		agent.onClientToolCallComplete(chat, toolCallId, {
+			success: true,
+			content: [{ type: ToolResultContentType.Text, text: 'pong' }],
+		});
+		const callRes = await callPromise;
+		assert.strictEqual(callRes.status, 200);
+		const callJson = await callRes.json() as { result: { content: Array<{ type: string; text: string }> } };
+		assert.deepStrictEqual(callJson.result.content, [{ type: 'text', text: 'pong' }]);
+
+		peer.push({
+			jsonrpc: '2.0',
+			method: 'session/update',
+			params: {
+				sessionId: 'sess-mcp-client',
+				update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'done' } },
+			},
+		});
+		peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
+		await sendPromise;
 	});
 });
 

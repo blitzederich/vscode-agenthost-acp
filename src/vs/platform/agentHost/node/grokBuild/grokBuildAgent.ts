@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
+import { CancellationError } from '../../../../base/common/errors.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { Disposable, DisposableStore, toDisposable } from '../../../../base/common/lifecycle.js';
 import { equals } from '../../../../base/common/objects.js';
@@ -45,17 +46,25 @@ import {
 	resolveAgentChatContext,
 } from '../../common/agent.js';
 import { type ChatInputRequestWithPlanReview, type IAgentHostPlanReviewAction } from '../../common/agentHostPlanReview.js';
+import { AgentHostGrokBuildClientToolsMcpEnabledConfigKey, platformRootSchema } from '../../common/agentHostSchema.js';
 import { AgentHostGrokBuildBinaryPathEnvVar } from '../../common/agentService.js';
+import { PendingRequestRegistry } from '../../common/pendingRequestRegistry.js';
 import { ChatInputRequestPurpose, withChatInputRequestPurpose } from '../../common/meta/agentChatInputRequestMeta.js';
 import { SessionConfigKey } from '../../common/sessionConfigKeys.js';
 import type { ConfigSchema } from '../../common/state/protocol/common/state.js';
 import { IAgentConfigurationService, type IAgentChatConfigurationChangeEvent } from '../agentConfigurationService.js';
 import { AgentHostStateManager, IAgentHostStateManager } from '../agentHostStateManager.js';
+import { ActiveClientToolSet } from '../activeClientState.js';
 import { ActionType, type ChatAction, type SessionAction } from '../../common/state/sessionActions.js';
-import { ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, ChatInputResponseKind, createErrorResponsePart, MessageKind, ResponsePartKind, TurnState, type ChatInputAnswer, type ChatInputQuestion, type ClientPluginCustomization, type Customization, type ModelSelection, type ToolCallResult, type Turn } from '../../common/state/sessionState.js';
+import { ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, ChatInputResponseKind, createErrorResponsePart, MessageKind, ResponsePartKind, ToolCallConfirmationReason, ToolCallContributorKind, TurnState, type ChatInputAnswer, type ChatInputQuestion, type ClientPluginCustomization, type Customization, type ModelSelection, type ToolCallResult, type Turn } from '../../common/state/sessionState.js';
 import type { ProtectedResourceMetadata, ToolDefinition } from '../../common/state/protocol/state.js';
 import type { ResolveSessionConfigResult, SessionConfigCompletionsResult } from '../../common/state/protocol/commands.js';
 import { AHP_SESSION_NOT_FOUND, ProtocolError } from '../../common/state/sessionProtocol.js';
+import {
+	startGrokClientToolMcpServer,
+	type IGrokAcpHttpMcpServer,
+	type IGrokClientMcpServerHandle,
+} from './grokBuildClientToolMcpServer.js';
 import {
 	AcpClient,
 	AcpJsonRpcErrorCode,
@@ -389,6 +398,61 @@ interface IGrokBuildChatBacking {
 	 * the better gauge for the same turn.
 	 */
 	replaySuppressChunkTotals?: boolean;
+	/** Workbench client tools keyed by clientId (merged into the HTTP MCP server). */
+	clientToolSet: ActiveClientToolSet;
+	/** Parks MCP tools/call handlers until {@link GrokBuildAgent.onClientToolCallComplete}. */
+	pendingClientToolCalls: PendingRequestRegistry<ToolCallResult>;
+	/** Live HTTP MCP server for this chat, when client-tools MCP is enabled. */
+	clientMcpServer?: IGrokClientMcpServerHandle;
+	/** In-flight ensure of {@link clientMcpServer}. */
+	clientMcpServerInFlight?: Promise<IGrokClientMcpServerHandle | undefined>;
+}
+
+/**
+ * Active-client handle that writes tools into the chat's
+ * {@link ActiveClientToolSet} and refreshes the HTTP MCP tools/list snapshot.
+ */
+class GrokBuildActiveClientHandle implements IActiveClient {
+	private _tools: readonly ToolDefinition[] = [];
+	private _customizations: readonly ClientPluginCustomization[] = [];
+
+	constructor(
+		readonly clientId: string,
+		readonly displayName: string | undefined,
+		private readonly _resolveBacking: () => IGrokBuildChatBacking | undefined,
+		private readonly _onToolsChanged: (backing: IGrokBuildChatBacking) => void,
+	) { }
+
+	get tools(): readonly ToolDefinition[] {
+		return this._tools;
+	}
+	set tools(tools: readonly ToolDefinition[]) {
+		this._tools = tools;
+		const backing = this._resolveBacking();
+		if (!backing) {
+			return;
+		}
+		backing.clientToolSet.set(this.clientId, tools);
+		backing.clientMcpServer?.setTools(backing.clientToolSet.merged());
+		this._onToolsChanged(backing);
+	}
+
+	get customizations(): readonly ClientPluginCustomization[] {
+		return this._customizations;
+	}
+	set customizations(customizations: readonly ClientPluginCustomization[]) {
+		this._customizations = customizations;
+	}
+
+	remove(): void {
+		const backing = this._resolveBacking();
+		if (!backing) {
+			return;
+		}
+		backing.clientToolSet.delete(this.clientId);
+		backing.clientMcpServer?.setTools(backing.clientToolSet.merged());
+		this._onToolsChanged(backing);
+	}
 }
 
 interface IPendingPermission {
@@ -686,7 +750,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 	 * `current_mode_update` `default` so chat config can move to interactive.
 	 */
 	private readonly _sessionsExitingPlanMode = new Set<string>();
-	private readonly _activeClients = new Map<string, Map<string, IActiveClient>>();
+	private readonly _activeClients = new Map<string, Map<string, GrokBuildActiveClientHandle>>();
 	private readonly _restoreInFlight = new Map<string, Promise<void>>();
 	private readonly _tornDown = new WeakSet<IAcpClient>();
 
@@ -854,26 +918,32 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		if (active) {
 			return active;
 		}
-		let tools: readonly ToolDefinition[] = [];
-		let customizations: readonly ClientPluginCustomization[] = [];
-		active = {
-			clientId: client.clientId,
-			displayName: client.displayName,
-			get tools() { return tools; },
-			set tools(value: readonly ToolDefinition[]) { tools = value; },
-			get customizations() { return customizations; },
-			set customizations(value: readonly ClientPluginCustomization[]) { customizations = value; },
-		};
+		active = new GrokBuildActiveClientHandle(
+			client.clientId,
+			client.displayName,
+			() => this._backings.get(key),
+			backing => {
+				this._logService.trace(`[GrokBuild] client tools updated for ${backing.sessionId}: ${backing.clientToolSet.merged().map(t => t.name).join(', ') || '(none)'}`);
+			},
+		);
 		perChat.set(client.clientId, active);
 		return active;
 	}
 
 	removeActiveClient(chat: URI, _context: URI | IAgentChatContext, clientId: string): void {
-		this._activeClients.get(chatKey(chat))?.delete(clientId);
+		const key = chatKey(chat);
+		const handle = this._activeClients.get(key)?.get(clientId);
+		if (!handle) {
+			return;
+		}
+		handle.remove();
+		this._activeClients.get(key)?.delete(clientId);
 	}
 
-	onClientToolCallComplete(_chat: URI, _toolCallId: string, _result: ToolCallResult, _context?: IAgentChatContext): void {
-		// Client tools are not wired through Grok ACP yet.
+	onClientToolCallComplete(chat: URI, toolCallId: string, result: ToolCallResult, _context?: IAgentChatContext): void {
+		const backing = this._backings.get(chatKey(chat));
+		// AgentSideEffects forwards every ChatToolCallComplete; unknown ids are a no-op.
+		backing?.pendingClientToolCalls.respondOrBuffer(toolCallId, result);
 	}
 
 	respondToPermissionRequest(requestId: string, approved: boolean, _context?: IAgentPermissionResponseContext): void {
@@ -1017,6 +1087,9 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 
 	override dispose(): void {
 		this._disposeConnection();
+		for (const backing of this._backings.values()) {
+			this._disposeClientMcp(backing);
+		}
 		this._backings.clear();
 		this._sessionToChat.clear();
 		this._pendingPermissions.clear();
@@ -1031,6 +1104,13 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		const now = Date.now();
 		const existing = this._backings.get(chatKey(chat));
 		const sameSession = existing?.sessionId === persisted.sessionId;
+		if (existing && !sameSession) {
+			// New session id for this chat — drop the prior HTTP MCP listener.
+			this._disposeClientMcp(existing);
+			if (this._sessionToChat.get(existing.sessionId)?.toString() === chat.toString()) {
+				this._sessionToChat.delete(existing.sessionId);
+			}
+		}
 		const directories = workingDirectories
 			?? (sameSession ? existing?.workingDirectories : undefined)
 			?? (persisted.cwd ? [URI.file(persisted.cwd)] : undefined);
@@ -1054,6 +1134,12 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			publishedContextUsage: sameSession ? existing?.publishedContextUsage : undefined,
 			cliCurrentModelId: sameSession ? existing?.cliCurrentModelId : undefined,
 			replaySuppressChunkTotals: sameSession ? existing?.replaySuppressChunkTotals : undefined,
+			clientToolSet: sameSession && existing ? existing.clientToolSet : new ActiveClientToolSet(),
+			pendingClientToolCalls: sameSession && existing
+				? existing.pendingClientToolCalls
+				: new PendingRequestRegistry<ToolCallResult>(),
+			clientMcpServer: sameSession ? existing?.clientMcpServer : undefined,
+			clientMcpServerInFlight: sameSession ? existing?.clientMcpServerInFlight : undefined,
 		};
 		this._backings.set(chatKey(chat), backing);
 		this._sessionToChat.set(persisted.sessionId, chat);
@@ -1099,10 +1185,15 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		const cwd = requestedDirectories?.[0]?.fsPath ?? process.cwd();
 		const workingDirectories = requestedDirectories && requestedDirectories.length > 0 ? requestedDirectories : [URI.file(cwd)];
 
+		const createMcp = await this._startClientMcpForChat(chat);
 		let sessionNew;
 		try {
-			sessionNew = await client.request('session/new', { cwd, mcpServers: [] });
+			sessionNew = await client.request('session/new', {
+				cwd,
+				mcpServers: createMcp ? [createMcp.toAcpMcpServer()] : [],
+			});
 		} catch (err) {
+			createMcp?.dispose();
 			rethrowAcpFailure(err);
 		}
 
@@ -1148,6 +1239,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 
 		const backing = this._storeBacking(chat, { sessionId: sessionNew.sessionId, model: modelWithThinkingLevel(model, reasoningEffort), reasoningEffort }, workingDirectories);
 		backing.cliCurrentModelId = cliCurrentModelId;
+		this._attachClientMcpServer(backing, createMcp);
 		if (setModelApplied && createModelId && model?.id === createModelId && createContext && !createContext.ignored) {
 			this._applyContextWindowSelection(backing, createModelId, createContext.effective);
 		}
@@ -1341,6 +1433,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			return;
 		}
 		this._cancelPendingPermissionsForChat(chat);
+		this._disposeClientMcp(backing);
 		await this._closeSessionIfAdvertised(backing);
 		this._sessionToChat.delete(backing.sessionId);
 		this._backings.delete(key);
@@ -2067,10 +2160,11 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			const replay = createGrokHistoryReplay(backing.sessionId);
 			this._historyReplays.set(backing.sessionId, replay);
 			try {
+				const mcpServers = await this._mcpServersForBacking(backing);
 				const result = await client.request('session/load', {
 					sessionId: backing.sessionId,
 					cwd,
-					mcpServers: [],
+					mcpServers,
 				});
 				this._rememberReasoningOption(readReasoningEffortOption(result.configOptions));
 				this._publishModels(result.models);
@@ -2108,10 +2202,11 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			}
 		} else if (this._capabilities.resume) {
 			try {
+				const mcpServers = await this._mcpServersForBacking(backing);
 				const result = await client.request('session/resume', {
 					sessionId: backing.sessionId,
 					cwd,
-					mcpServers: [],
+					mcpServers,
 				});
 				this._rememberReasoningOption(readReasoningEffortOption(result.configOptions));
 				this._publishModels(result.models);
@@ -2224,6 +2319,10 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 
 	private _dropBacking(chat: URI, sessionId: string): void {
 		const key = chatKey(chat);
+		const backing = this._backings.get(key);
+		if (backing) {
+			this._disposeClientMcp(backing);
+		}
 		this._backings.delete(key);
 		if (this._sessionToChat.get(sessionId)?.toString() === chat.toString()) {
 			this._sessionToChat.delete(sessionId);
@@ -3039,5 +3138,162 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		if (this._testClient === connection.client) {
 			this._testClient = undefined;
 		}
+	}
+
+	/** Root setting `chat.agentHost.grokBuildAgent.clientToolsMcp.enabled` (default on). */
+	private _isClientToolsMcpEnabled(): boolean {
+		try {
+			const value = this._configurationService.getRootValue(platformRootSchema, AgentHostGrokBuildClientToolsMcpEnabledConfigKey);
+			return value !== false;
+		} catch {
+			return true;
+		}
+	}
+
+	private async _mcpServersForBacking(backing: IGrokBuildChatBacking): Promise<readonly IGrokAcpHttpMcpServer[]> {
+		const handle = await this._ensureClientMcpServer(backing);
+		return handle ? [handle.toAcpMcpServer()] : [];
+	}
+
+	private async _ensureClientMcpServer(backing: IGrokBuildChatBacking): Promise<IGrokClientMcpServerHandle | undefined> {
+		if (!this._isClientToolsMcpEnabled()) {
+			this._disposeClientMcp(backing);
+			return undefined;
+		}
+		if (backing.clientMcpServer) {
+			this._seedClientToolsFromHandles(backing);
+			backing.clientMcpServer.setTools(backing.clientToolSet.merged());
+			return backing.clientMcpServer;
+		}
+		if (backing.clientMcpServerInFlight) {
+			return backing.clientMcpServerInFlight;
+		}
+		const chat = backing.chat;
+		backing.clientMcpServerInFlight = this._startClientMcpForChat(chat).then(handle => {
+			if (this._backings.get(chatKey(chat)) !== backing) {
+				handle?.dispose();
+				return undefined;
+			}
+			this._attachClientMcpServer(backing, handle);
+			return backing.clientMcpServer;
+		}).finally(() => {
+			if (backing.clientMcpServerInFlight) {
+				backing.clientMcpServerInFlight = undefined;
+			}
+		});
+		return backing.clientMcpServerInFlight;
+	}
+
+	private async _startClientMcpForChat(chat: URI): Promise<IGrokClientMcpServerHandle | undefined> {
+		if (!this._isClientToolsMcpEnabled()) {
+			return undefined;
+		}
+		const initialTools = this._mergedToolsFromHandles(chat);
+		try {
+			return await startGrokClientToolMcpServer(
+				{
+					invoke: (toolName, args, toolCallId) => this._invokeClientTool(chat, toolName, args, toolCallId),
+				},
+				initialTools,
+			);
+		} catch (err) {
+			this._logService.warn(`[GrokBuild] failed to start client-tools MCP server: ${err instanceof Error ? err.message : String(err)}`);
+			return undefined;
+		}
+	}
+
+	private _attachClientMcpServer(backing: IGrokBuildChatBacking, handle: IGrokClientMcpServerHandle | undefined): void {
+		if (!handle) {
+			return;
+		}
+		if (backing.clientMcpServer && backing.clientMcpServer !== handle) {
+			backing.clientMcpServer.dispose();
+		}
+		backing.clientMcpServer = handle;
+		this._seedClientToolsFromHandles(backing);
+		handle.setTools(backing.clientToolSet.merged());
+	}
+
+	private _disposeClientMcp(backing: IGrokBuildChatBacking): void {
+		backing.pendingClientToolCalls.rejectAll(new CancellationError());
+		backing.clientMcpServer?.dispose();
+		backing.clientMcpServer = undefined;
+		backing.clientMcpServerInFlight = undefined;
+	}
+
+	private _seedClientToolsFromHandles(backing: IGrokBuildChatBacking): void {
+		const handles = this._activeClients.get(chatKey(backing.chat));
+		if (!handles) {
+			return;
+		}
+		for (const handle of handles.values()) {
+			backing.clientToolSet.set(handle.clientId, handle.tools);
+		}
+	}
+
+	private _mergedToolsFromHandles(chat: URI): readonly ToolDefinition[] {
+		const handles = this._activeClients.get(chatKey(chat));
+		if (!handles || handles.size === 0) {
+			return [];
+		}
+		const set = new ActiveClientToolSet();
+		for (const handle of handles.values()) {
+			set.set(handle.clientId, handle.tools);
+		}
+		return set.merged();
+	}
+
+	/**
+	 * MCP tools/call → ChatToolCallStart/Ready (Client contributor) → wait for
+	 * {@link onClientToolCallComplete}. Grok still gates the call with its own
+	 * session/request_permission before hitting this HTTP endpoint.
+	 */
+	private async _invokeClientTool(
+		chat: URI,
+		toolName: string,
+		args: Record<string, unknown>,
+		toolCallId: string,
+	): Promise<ToolCallResult> {
+		const backing = this._backings.get(chatKey(chat));
+		if (!backing) {
+			throw new Error(localize('grokBuild.clientTool.noChat', "Client tool \"{0}\" has no active Grok Build chat.", toolName));
+		}
+		const turnId = backing.activeTurnId;
+		if (!turnId) {
+			throw new Error(localize('grokBuild.clientTool.noTurn', "Client tool \"{0}\" was called without an active turn.", toolName));
+		}
+		const ownerClientId = backing.clientToolSet.ownerOf(toolName);
+		if (!ownerClientId) {
+			throw new Error(localize('grokBuild.clientTool.unknown', "Client tool \"{0}\" is not registered for this chat.", toolName));
+		}
+		let toolInput: string;
+		try {
+			toolInput = JSON.stringify(args);
+		} catch {
+			toolInput = '{}';
+		}
+		this._fireAction(chat, {
+			type: ActionType.ChatToolCallStart,
+			turnId,
+			toolCallId,
+			toolName,
+			displayName: toolName,
+			contributor: { kind: ToolCallContributorKind.Client, clientId: ownerClientId },
+		});
+		this._fireAction(chat, {
+			type: ActionType.ChatToolCallDelta,
+			turnId,
+			toolCallId,
+			content: toolInput,
+		});
+		this._fireAction(chat, {
+			type: ActionType.ChatToolCallReady,
+			turnId,
+			toolCallId,
+			invocationMessage: localize('grokBuild.clientTool.invoking', "Calling {0}", toolName),
+			toolInput,
+			confirmed: ToolCallConfirmationReason.NotNeeded,
+		});
+		return backing.pendingClientToolCalls.register(toolCallId);
 	}
 }

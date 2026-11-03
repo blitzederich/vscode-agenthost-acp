@@ -223,6 +223,13 @@ export const AgentHostGrokBuildAgentEnabledSettingId = 'chat.agentHost.grokBuild
 export const AgentHostGrokBuildBinaryPathSettingId = 'chat.agentHost.grokBuildAgent.binaryPath';
 
 /**
+ * When enabled (default), Grok Build forwards the workbench's client tools to
+ * the grok CLI as an HTTP MCP server named `client` on 127.0.0.1 with a
+ * per-session bearer token in `mcpServers` for `session/new` and `session/load`.
+ */
+export const AgentHostGrokBuildClientToolsMcpEnabledSettingId = 'chat.agentHost.grokBuildAgent.clientToolsMcp.enabled';
+
+/**
  * Configuration key controlling whether extension-provided BYOK ("bring your
  * own key") models are published and included in new agent-host sessions.
  * Changes are synchronized to the running agent host.

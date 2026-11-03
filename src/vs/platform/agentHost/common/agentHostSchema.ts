@@ -515,6 +515,13 @@ export const AgentHostCodexEnabledConfigKey = 'codexAgentEnabled';
  */
 export const AgentHostGrokBuildEnabledConfigKey = 'grokBuildAgentEnabled';
 
+/**
+ * Root config key for `chat.agentHost.grokBuildAgent.clientToolsMcp.enabled`.
+ * When true (default), Grok Build registers the workbench client-tools HTTP
+ * MCP server in ACP `mcpServers`.
+ */
+export const AgentHostGrokBuildClientToolsMcpEnabledConfigKey = 'grokBuildClientToolsMcpEnabled';
+
 /** Root config key carrying the effective edit auto-approve patterns. */
 export const AgentHostEditAutoApprovePatternsConfigKey = 'editAutoApprovePatterns';
 
@@ -877,6 +884,12 @@ export const platformRootSchema = createSchema({
 		title: localize('agentHost.config.grokBuildAgentEnabled.title', "Grok Build Agent"),
 		description: localize('agentHost.config.grokBuildAgentEnabled.description', "Whether the Grok Build ACP provider is enabled."),
 		default: false,
+	}),
+	[AgentHostGrokBuildClientToolsMcpEnabledConfigKey]: schemaProperty<boolean>({
+		type: 'boolean',
+		title: localize('agentHost.config.grokBuildClientToolsMcpEnabled.title', "Grok Build Client Tools MCP"),
+		description: localize('agentHost.config.grokBuildClientToolsMcpEnabled.description', "When enabled, Grok Build exposes the workbench's client tools to the grok CLI as a local HTTP MCP server."),
+		default: true,
 	}),
 	[AgentHostTerminalAutoApproveEnabledConfigKey]: schemaProperty<boolean>({
 		type: 'boolean',
