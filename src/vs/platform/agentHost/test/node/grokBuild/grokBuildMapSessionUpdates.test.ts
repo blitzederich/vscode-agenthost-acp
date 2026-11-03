@@ -679,4 +679,44 @@ suite('GrokBuild mapSessionUpdates', () => {
 			messagesLength: 5,
 		});
 	});
+
+	test('suppresses ACP tool_call / tool_call_update cards for client__ tools', () => {
+		const state = createGrokBuildMapState('turn-client');
+		const start = mapSessionUpdate(state, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'tool_call',
+				toolCallId: 'grok-client-1',
+				title: 'client__workspace_echo',
+				kind: 'other',
+				status: 'pending',
+				rawInput: { msg: 'hi' },
+			},
+		});
+		assert.deepStrictEqual(start, []);
+
+		const done = mapSessionUpdate(state, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'tool_call_update',
+				toolCallId: 'grok-client-1',
+				title: 'client__workspace_echo',
+				status: 'completed',
+				rawOutput: { ok: true },
+			},
+		});
+		assert.deepStrictEqual(done, []);
+
+		const viaMeta = mapSessionUpdate(state, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'tool_call',
+				toolCallId: 'grok-client-2',
+				title: 'use_tool',
+				status: 'pending',
+				_meta: { 'x.ai/tool': { name: 'client__other_tool', kind: 'other', label: 'Other' } },
+			},
+		});
+		assert.deepStrictEqual(viaMeta, []);
+	});
 });

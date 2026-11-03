@@ -6,6 +6,7 @@
 import assert from 'assert';
 import type { ChildProcessWithoutNullStreams } from 'child_process';
 import { EventEmitter } from 'events';
+import * as http from 'http';
 import { PassThrough } from 'stream';
 import { DeferredPromise } from '../../../../../base/common/async.js';
 import { Emitter, Event } from '../../../../../base/common/event.js';
@@ -4001,6 +4002,15 @@ suite('GrokBuildAgent', () => {
 		const listJson = await listRes.json() as { result: { tools: Array<{ name: string }> } };
 		assert.ok(listJson.result.tools.some(t => t.name === 'workspace_echo'));
 
+		// Completions for grok's own tools (unknown ids) must not be buffered.
+		agent.onClientToolCallComplete(chat, 'grok-native-tool-id', {
+			success: true,
+			pastTenseMessage: 'native done',
+			content: [{ type: ToolResultContentType.Text, text: 'should-not-buffer' }],
+		});
+		const pending = peekPendingClientToolCalls(agent, chat);
+		assert.strictEqual(pending.hasBufferedResult('grok-native-tool-id'), false);
+
 		const readyPromise = Event.toPromise(Event.filter(agent.onDidChatProgress, signal =>
 			signal.kind === 'action' && signal.action.type === ActionType.ChatToolCallReady
 		));
@@ -4015,17 +4025,38 @@ suite('GrokBuildAgent', () => {
 			}),
 		});
 		await readyPromise;
-		const start = signals.find(s =>
+
+		// Grok's ACP tool_call for client__* must not create a second card.
+		peer.push({
+			jsonrpc: '2.0',
+			method: 'session/update',
+			params: {
+				sessionId: 'sess-mcp-client',
+				update: {
+					sessionUpdate: 'tool_call',
+					toolCallId: 'grok-acp-client-card',
+					title: 'client__workspace_echo',
+					status: 'pending',
+					rawInput: { msg: 'ping' },
+				},
+			},
+		});
+
+		const starts = signals.filter(s =>
 			s.kind === 'action'
 			&& s.action.type === ActionType.ChatToolCallStart
 			&& (s.action as { toolName?: string }).toolName === 'workspace_echo'
 		);
-		assert.ok(start && start.kind === 'action' && start.action.type === ActionType.ChatToolCallStart);
+		assert.strictEqual(starts.length, 1, 'expected a single Client tool card');
+		const start = starts[0]!;
+		assert.ok(start.kind === 'action' && start.action.type === ActionType.ChatToolCallStart);
 		assert.deepStrictEqual(start.action.contributor, { kind: ToolCallContributorKind.Client, clientId: 'workbench-1' });
 		const toolCallId = start.action.toolCallId;
+		assert.notStrictEqual(toolCallId, 'grok-acp-client-card');
 
 		agent.onClientToolCallComplete(chat, toolCallId, {
 			success: true,
+			pastTenseMessage: 'echoed',
 			content: [{ type: ToolResultContentType.Text, text: 'pong' }],
 		});
 		const callRes = await callPromise;
@@ -4044,7 +4075,106 @@ suite('GrokBuildAgent', () => {
 		peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
 		await sendPromise;
 	});
+
+	test('pending client tool calls are rejected on turn cancel and turn end', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client);
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/mcp-cancel' });
+		const context = chatContext(chat);
+		agent.getOrCreateActiveClient(chat, context, { clientId: 'workbench-1' }).tools = [{
+			name: 'workspace_echo',
+			description: 'echo',
+			inputSchema: { type: 'object', properties: {} },
+		}];
+
+		const createPromise = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp/proj')] });
+		const sessionNew = await readNextMessage(peer.outbound);
+		assertClientToolsMcpServer(sessionNew.params.mcpServers);
+		const mcp = sessionNew.params.mcpServers[0]!;
+		peerPushSession(peer, sessionNew.id, 'sess-mcp-cancel');
+		await createPromise;
+
+		const sendPromise = agent.chats.sendMessage(chat, 'hi', [URI.file('/tmp/proj')], undefined, 'turn-cancel', undefined, context);
+		const prompt = await readNextMessage(peer.outbound);
+		assert.strictEqual(prompt.method, 'session/prompt');
+
+		const readyPromise = Event.toPromise(Event.filter(agent.onDidChatProgress, signal =>
+			signal.kind === 'action' && signal.action.type === ActionType.ChatToolCallReady
+		));
+		const callPromise = fetch(mcp.url, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', Authorization: mcp.headers[0]!.value },
+			body: JSON.stringify({
+				jsonrpc: '2.0',
+				id: 2,
+				method: 'tools/call',
+				params: { name: 'workspace_echo', arguments: {} },
+			}),
+		});
+		await readyPromise;
+		const pending = peekPendingClientToolCalls(agent, chat);
+		assert.strictEqual([...pending.entries()].length, 1);
+
+		await agent.chats.abort(chat, context);
+		assert.strictEqual([...pending.entries()].length, 0);
+
+		const callRes = await callPromise;
+		assert.strictEqual(callRes.status, 200);
+		const callJson = await callRes.json() as { result: { isError?: boolean } };
+		assert.strictEqual(callJson.result.isError, true);
+
+		peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'cancelled' } });
+		await sendPromise.catch(() => undefined);
+	});
+
+	test('disposeChat closes the client MCP listening port', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client);
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/mcp-dispose' });
+		const context = chatContext(chat);
+
+		const createPromise = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp/proj')] });
+		const sessionNew = await readNextMessage(peer.outbound);
+		assertClientToolsMcpServer(sessionNew.params.mcpServers);
+		const mcpUrl = sessionNew.params.mcpServers[0]!.url;
+		peerPushSession(peer, sessionNew.id, 'sess-mcp-dispose');
+		await createPromise;
+
+		await agent.chats.disposeChat(chat, context);
+
+		const port = Number(new URL(mcpUrl).port);
+		await new Promise<void>((resolve, reject) => {
+			const req = http.request({ hostname: '127.0.0.1', port, path: '/mcp', method: 'POST' }, res => {
+				res.resume();
+				reject(new Error(`expected connection refused, got ${res.statusCode}`));
+			});
+			req.on('error', (err: NodeJS.ErrnoException) => {
+				assert.ok(err.code === 'ECONNREFUSED' || err.code === 'ECONNRESET', err.message);
+				resolve();
+			});
+			req.end();
+		});
+	});
 });
+
+function peekPendingClientToolCalls(agent: GrokBuildAgent, chat: URI): {
+	hasBufferedResult(key: string): boolean;
+	entries(): IterableIterator<readonly [string, unknown]>;
+} {
+	const backings = (agent as unknown as {
+		_backings: Map<string, { pendingClientToolCalls: {
+			hasBufferedResult(key: string): boolean;
+			entries(): IterableIterator<readonly [string, unknown]>;
+		} }>;
+	})._backings;
+	const backing = backings.get(chat.toString());
+	assert.ok(backing, 'expected chat backing');
+	return backing.pendingClientToolCalls;
+}
 
 async function answerSessionList(peer: IFakePeer, sessions: readonly object[] = []): Promise<void> {
 	const list = await readNextMessage(peer.outbound);

@@ -30,14 +30,11 @@ const GROK_CLIENT_RESOURCE_SCHEME = 'grok-client';
 export function convertToolCallResult(result: ToolCallResult, toolCallId: string): GrokMcpCallToolResult {
 	const blocks = result.content ?? [];
 	const content = blocks.map((block, index) => convertBlock(block, toolCallId, index));
-	const out: GrokMcpCallToolResult = { content };
-	if (result.structuredContent !== undefined) {
-		out.structuredContent = result.structuredContent;
-	}
-	if (!result.success || result.error) {
-		out.isError = true;
-	}
-	return out;
+	return {
+		content,
+		...(result.structuredContent !== undefined ? { structuredContent: result.structuredContent } : {}),
+		...(!result.success || result.error ? { isError: true } : {}),
+	};
 }
 
 function convertBlock(block: ToolResultContent, toolCallId: string, index: number): GrokMcpToolResultContent {

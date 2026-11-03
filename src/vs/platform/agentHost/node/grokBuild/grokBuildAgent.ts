@@ -942,8 +942,9 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 
 	onClientToolCallComplete(chat: URI, toolCallId: string, result: ToolCallResult, _context?: IAgentChatContext): void {
 		const backing = this._backings.get(chatKey(chat));
-		// AgentSideEffects forwards every ChatToolCallComplete; unknown ids are a no-op.
-		backing?.pendingClientToolCalls.respondOrBuffer(toolCallId, result);
+		// AgentSideEffects forwards every ChatToolCallComplete (including grok's own
+		// tools). Only resolve ids we parked; never buffer unknowns forever.
+		backing?.pendingClientToolCalls.respond(toolCallId, result);
 	}
 
 	respondToPermissionRequest(requestId: string, approved: boolean, _context?: IAgentPermissionResponseContext): void {
@@ -1352,6 +1353,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			// Grok may finish the ask/plan card (timeout, decline text) without
 			// waiting for our ACP reply. Drop leftover UI without writing late results.
 			this._abandonPendingInteractiveRequestsForChat(chat, { cancelToolCards: true });
+			this._rejectPendingClientToolCalls(backing);
 			backing.activeTurnId = undefined;
 			backing.mapState = undefined;
 			backing.turnAssistantMarkdown = undefined;
@@ -1366,6 +1368,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			return;
 		}
 		this._cancelPendingPermissionsForChat(chat);
+		this._rejectPendingClientToolCalls(backing);
 		const client = this._connection?.client;
 		if (!client || backing.loadedGeneration !== this._connectionGeneration) {
 			return;
@@ -2088,6 +2091,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 
 	private _failActiveTurns(error: Error): void {
 		for (const backing of this._backings.values()) {
+			this._rejectPendingClientToolCalls(backing);
 			const turnId = backing.activeTurnId;
 			if (!turnId || backing.turns.some(record => record.id === turnId)) {
 				continue;
@@ -3169,7 +3173,12 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			return backing.clientMcpServerInFlight;
 		}
 		const chat = backing.chat;
-		backing.clientMcpServerInFlight = this._startClientMcpForChat(chat).then(handle => {
+		const inFlight = this._startClientMcpForChat(chat).then(handle => {
+			// Dispose won the race (or a newer ensure replaced us) — drop the handle.
+			if (backing.clientMcpServerInFlight !== inFlight) {
+				handle?.dispose();
+				return undefined;
+			}
 			if (this._backings.get(chatKey(chat)) !== backing) {
 				handle?.dispose();
 				return undefined;
@@ -3177,11 +3186,12 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			this._attachClientMcpServer(backing, handle);
 			return backing.clientMcpServer;
 		}).finally(() => {
-			if (backing.clientMcpServerInFlight) {
+			if (backing.clientMcpServerInFlight === inFlight) {
 				backing.clientMcpServerInFlight = undefined;
 			}
 		});
-		return backing.clientMcpServerInFlight;
+		backing.clientMcpServerInFlight = inFlight;
+		return inFlight;
 	}
 
 	private async _startClientMcpForChat(chat: URI): Promise<IGrokClientMcpServerHandle | undefined> {
@@ -3192,7 +3202,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		try {
 			return await startGrokClientToolMcpServer(
 				{
-					invoke: (toolName, args, toolCallId) => this._invokeClientTool(chat, toolName, args, toolCallId),
+					invoke: (toolName, args, toolCallId, signal) => this._invokeClientTool(chat, toolName, args, toolCallId, signal),
 				},
 				initialTools,
 			);
@@ -3214,8 +3224,12 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		handle.setTools(backing.clientToolSet.merged());
 	}
 
-	private _disposeClientMcp(backing: IGrokBuildChatBacking): void {
+	private _rejectPendingClientToolCalls(backing: IGrokBuildChatBacking): void {
 		backing.pendingClientToolCalls.rejectAll(new CancellationError());
+	}
+
+	private _disposeClientMcp(backing: IGrokBuildChatBacking): void {
+		this._rejectPendingClientToolCalls(backing);
 		backing.clientMcpServer?.dispose();
 		backing.clientMcpServer = undefined;
 		backing.clientMcpServerInFlight = undefined;
@@ -3247,12 +3261,17 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 	 * MCP tools/call → ChatToolCallStart/Ready (Client contributor) → wait for
 	 * {@link onClientToolCallComplete}. Grok still gates the call with its own
 	 * session/request_permission before hitting this HTTP endpoint.
+	 *
+	 * Grok also emits an ACP `tool_call` for `client__<tool>` before this runs;
+	 * the session-update mapper suppresses that card so only this Client card
+	 * is shown.
 	 */
 	private async _invokeClientTool(
 		chat: URI,
 		toolName: string,
 		args: Record<string, unknown>,
 		toolCallId: string,
+		signal?: AbortSignal,
 	): Promise<ToolCallResult> {
 		const backing = this._backings.get(chatKey(chat));
 		if (!backing) {
@@ -3266,34 +3285,51 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		if (!ownerClientId) {
 			throw new Error(localize('grokBuild.clientTool.unknown', "Client tool \"{0}\" is not registered for this chat.", toolName));
 		}
+		if (signal?.aborted) {
+			throw new CancellationError();
+		}
 		let toolInput: string;
 		try {
 			toolInput = JSON.stringify(args);
 		} catch {
 			toolInput = '{}';
 		}
-		this._fireAction(chat, {
-			type: ActionType.ChatToolCallStart,
-			turnId,
-			toolCallId,
-			toolName,
-			displayName: toolName,
-			contributor: { kind: ToolCallContributorKind.Client, clientId: ownerClientId },
-		});
-		this._fireAction(chat, {
-			type: ActionType.ChatToolCallDelta,
-			turnId,
-			toolCallId,
-			content: toolInput,
-		});
-		this._fireAction(chat, {
-			type: ActionType.ChatToolCallReady,
-			turnId,
-			toolCallId,
-			invocationMessage: localize('grokBuild.clientTool.invoking', "Calling {0}", toolName),
-			toolInput,
-			confirmed: ToolCallConfirmationReason.NotNeeded,
-		});
-		return backing.pendingClientToolCalls.register(toolCallId);
+		const onAbort = () => {
+			backing.pendingClientToolCalls.respond(toolCallId, {
+				success: false,
+				pastTenseMessage: localize('grokBuild.clientTool.cancelled', "{0} cancelled", toolName),
+				content: [],
+				error: { message: localize('grokBuild.clientTool.requestClosed', "Client tool request closed"), code: 'cancelled' },
+			});
+		};
+		signal?.addEventListener('abort', onAbort, { once: true });
+		try {
+			return await backing.pendingClientToolCalls.registerAndFire(toolCallId, () => {
+				this._fireAction(chat, {
+					type: ActionType.ChatToolCallStart,
+					turnId,
+					toolCallId,
+					toolName,
+					displayName: toolName,
+					contributor: { kind: ToolCallContributorKind.Client, clientId: ownerClientId },
+				});
+				this._fireAction(chat, {
+					type: ActionType.ChatToolCallDelta,
+					turnId,
+					toolCallId,
+					content: toolInput,
+				});
+				this._fireAction(chat, {
+					type: ActionType.ChatToolCallReady,
+					turnId,
+					toolCallId,
+					invocationMessage: localize('grokBuild.clientTool.invoking', "Calling {0}", toolName),
+					toolInput,
+					confirmed: ToolCallConfirmationReason.NotNeeded,
+				});
+			});
+		} finally {
+			signal?.removeEventListener('abort', onAbort);
+		}
 	}
 }

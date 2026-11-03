@@ -4,15 +4,21 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
+import * as http from 'http';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { ToolResultContentType, type ToolCallResult } from '../../../common/state/protocol/channels-chat/state.js';
 import type { ToolDefinition } from '../../../common/state/protocol/state.js';
 import {
 	extractBearerToken,
+	GROK_CLIENT_MCP_MAX_BODY_BYTES,
 	GROK_CLIENT_MCP_PROTOCOL_VERSION,
 	GROK_CLIENT_MCP_SERVER_NAME,
 	handleGrokClientMcpHttpRequest,
 	handleGrokClientMcpRequest,
+	hasClientToolNamePrefix,
+	isAllowedGrokClientMcpHost,
+	startGrokClientToolMcpServer,
+	stripClientToolNamePrefix,
 	tokensEqual,
 } from '../../../node/grokBuild/grokBuildClientToolMcpServer.js';
 
@@ -25,9 +31,17 @@ function tool(over: Partial<ToolDefinition> = {}): ToolDefinition {
 	};
 }
 
+function okResult(text = ''): ToolCallResult {
+	return {
+		success: true,
+		pastTenseMessage: 'done',
+		content: text ? [{ type: ToolResultContentType.Text, text }] : [],
+	};
+}
+
 suite('grokBuildClientToolMcpServer', () => {
 
-	ensureNoDisposablesAreLeakedInTestSuite();
+	const store = ensureNoDisposablesAreLeakedInTestSuite();
 
 	test('extractBearerToken and tokensEqual', () => {
 		assert.strictEqual(extractBearerToken('Bearer abc'), 'abc');
@@ -38,11 +52,28 @@ suite('grokBuildClientToolMcpServer', () => {
 		assert.strictEqual(tokensEqual('a', 'b'), false);
 	});
 
+	test('hasClientToolNamePrefix / stripClientToolNamePrefix', () => {
+		assert.strictEqual(hasClientToolNamePrefix('client__echo'), true);
+		assert.strictEqual(hasClientToolNamePrefix('shell'), false);
+		assert.strictEqual(stripClientToolNamePrefix('client__echo'), 'echo');
+		assert.strictEqual(stripClientToolNamePrefix('shell'), 'shell');
+	});
+
+	test('isAllowedGrokClientMcpHost accepts only loopback with port', () => {
+		assert.strictEqual(isAllowedGrokClientMcpHost('127.0.0.1:3456', 3456), true);
+		assert.strictEqual(isAllowedGrokClientMcpHost('localhost:3456', 3456), true);
+		assert.strictEqual(isAllowedGrokClientMcpHost('LOCALHOST:3456', 3456), true);
+		assert.strictEqual(isAllowedGrokClientMcpHost('127.0.0.1:9999', 3456), false);
+		assert.strictEqual(isAllowedGrokClientMcpHost('example.com:3456', 3456), false);
+		assert.strictEqual(isAllowedGrokClientMcpHost('127.0.0.1', 3456), false);
+		assert.strictEqual(isAllowedGrokClientMcpHost(undefined, 3456), false);
+	});
+
 	test('initialize returns protocolVersion and tools capability', async () => {
 		const response = await handleGrokClientMcpRequest(
 			{ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: GROK_CLIENT_MCP_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'test', version: '0' } } },
 			[],
-			{ invoke: async () => ({ success: true, content: [] }) },
+			{ invoke: async () => okResult() },
 		);
 		assert.ok(response);
 		assert.strictEqual('result' in response, true);
@@ -63,7 +94,7 @@ suite('grokBuildClientToolMcpServer', () => {
 		const response = await handleGrokClientMcpRequest(
 			{ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
 			[tool({ name: 'a' }), tool({ name: 'b', description: 'bee' })],
-			{ invoke: async () => ({ success: true, content: [] }) },
+			{ invoke: async () => okResult() },
 		);
 		assert.ok(response && 'result' in response);
 		const tools = (response as { result: { tools: Array<{ name: string; description: string }> } }).result.tools;
@@ -79,11 +110,7 @@ suite('grokBuildClientToolMcpServer', () => {
 			{
 				invoke: async (name, args, toolCallId) => {
 					seen = { name, args, id: toolCallId };
-					const result: ToolCallResult = {
-						success: true,
-						content: [{ type: ToolResultContentType.Text, text: 'pong' }],
-					};
-					return result;
+					return okResult('pong');
 				},
 			},
 			() => 'fixed-id',
@@ -99,7 +126,7 @@ suite('grokBuildClientToolMcpServer', () => {
 		const response = await handleGrokClientMcpRequest(
 			{ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'missing', arguments: {} } },
 			[tool()],
-			{ invoke: async () => ({ success: true, content: [] }) },
+			{ invoke: async () => okResult() },
 		);
 		assert.ok(response && 'error' in response);
 		assert.strictEqual((response as { error: { code: number } }).error.code, -32602);
@@ -109,7 +136,7 @@ suite('grokBuildClientToolMcpServer', () => {
 		const response = await handleGrokClientMcpRequest(
 			{ jsonrpc: '2.0', id: 5, method: 'server/discover', params: {} },
 			[],
-			{ invoke: async () => ({ success: true, content: [] }) },
+			{ invoke: async () => okResult() },
 		);
 		assert.ok(response && 'error' in response);
 		assert.strictEqual((response as { error: { code: number } }).error.code, -32601);
@@ -122,7 +149,7 @@ suite('grokBuildClientToolMcpServer', () => {
 			expectedToken: 'secret',
 			bodyText: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }),
 			tools: [],
-			invoker: { invoke: async () => ({ success: true, content: [] }) },
+			invoker: { invoke: async () => okResult() },
 		});
 		assert.strictEqual(response.status, 401);
 	});
@@ -134,9 +161,37 @@ suite('grokBuildClientToolMcpServer', () => {
 			expectedToken: 'secret',
 			bodyText: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }),
 			tools: [],
-			invoker: { invoke: async () => ({ success: true, content: [] }) },
+			invoker: { invoke: async () => okResult() },
 		});
 		assert.strictEqual(response.status, 401);
+	});
+
+	test('HTTP rejects disallowed Host header', async () => {
+		const response = await handleGrokClientMcpHttpRequest({
+			method: 'POST',
+			authorizationHeader: 'Bearer secret',
+			expectedToken: 'secret',
+			hostHeader: 'evil.example:1234',
+			listenPort: 1234,
+			bodyText: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }),
+			tools: [],
+			invoker: { invoke: async () => okResult() },
+		});
+		assert.strictEqual(response.status, 403);
+	});
+
+	test('HTTP rejects oversized body with 413', async () => {
+		const response = await handleGrokClientMcpHttpRequest({
+			method: 'POST',
+			authorizationHeader: 'Bearer secret',
+			expectedToken: 'secret',
+			hostHeader: '127.0.0.1:9',
+			listenPort: 9,
+			bodyText: 'x'.repeat(GROK_CLIENT_MCP_MAX_BODY_BYTES + 1),
+			tools: [],
+			invoker: { invoke: async () => okResult() },
+		});
+		assert.strictEqual(response.status, 413);
 	});
 
 	test('HTTP GET returns 405', async () => {
@@ -146,7 +201,7 @@ suite('grokBuildClientToolMcpServer', () => {
 			expectedToken: 'secret',
 			bodyText: '',
 			tools: [],
-			invoker: { invoke: async () => ({ success: true, content: [] }) },
+			invoker: { invoke: async () => okResult() },
 		});
 		assert.strictEqual(response.status, 405);
 	});
@@ -156,13 +211,69 @@ suite('grokBuildClientToolMcpServer', () => {
 			method: 'POST',
 			authorizationHeader: 'Bearer secret',
 			expectedToken: 'secret',
+			hostHeader: '127.0.0.1:9',
+			listenPort: 9,
 			bodyText: JSON.stringify({ jsonrpc: '2.0', id: 9, method: 'initialize', params: {} }),
 			tools: [],
-			invoker: { invoke: async () => ({ success: true, content: [] }) },
+			invoker: { invoke: async () => okResult() },
 		});
 		assert.strictEqual(response.status, 200);
 		assert.ok(response.body);
 		const parsed = JSON.parse(response.body!) as { result: { serverInfo: { name: string } } };
 		assert.strictEqual(parsed.result.serverInfo.name, GROK_CLIENT_MCP_SERVER_NAME);
+	});
+
+	test('live server checks auth before body and rejects bad Host', async () => {
+		const handle = store.add(await startGrokClientToolMcpServer({ invoke: async () => okResult() }));
+		const port = Number(new URL(handle.url).port);
+
+		const unauthorized = await new Promise<{ status: number }>((resolve, reject) => {
+			const req = http.request(handle.url, { method: 'POST', headers: { Host: `127.0.0.1:${port}`, 'Content-Type': 'application/json' } }, res => {
+				res.resume();
+				resolve({ status: res.statusCode ?? 0 });
+			});
+			req.on('error', reject);
+			req.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }));
+			req.end();
+		});
+		assert.strictEqual(unauthorized.status, 401);
+
+		const forbidden = await new Promise<{ status: number }>((resolve, reject) => {
+			const req = http.request({
+				hostname: '127.0.0.1',
+				port,
+				path: '/mcp',
+				method: 'POST',
+				headers: {
+					Host: `evil.local:${port}`,
+					Authorization: `Bearer ${handle.token}`,
+					'Content-Type': 'application/json',
+				},
+			}, res => {
+				res.resume();
+				resolve({ status: res.statusCode ?? 0 });
+			});
+			req.on('error', reject);
+			req.write('{}');
+			req.end();
+		});
+		assert.strictEqual(forbidden.status, 403);
+	});
+
+	test('dispose closes the listening port', async () => {
+		const handle = await startGrokClientToolMcpServer({ invoke: async () => okResult() });
+		const port = Number(new URL(handle.url).port);
+		handle.dispose();
+		await new Promise<void>((resolve, reject) => {
+			const req = http.request({ hostname: '127.0.0.1', port, path: '/mcp', method: 'POST' }, res => {
+				res.resume();
+				reject(new Error(`expected connection refused, got ${res.statusCode}`));
+			});
+			req.on('error', (err: NodeJS.ErrnoException) => {
+				assert.ok(err.code === 'ECONNREFUSED' || err.code === 'ECONNRESET', err.message);
+				resolve();
+			});
+			req.end();
+		});
 	});
 });

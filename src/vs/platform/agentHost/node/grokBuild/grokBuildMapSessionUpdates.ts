@@ -20,6 +20,7 @@ import {
 	todosFromToolInput,
 	type IGrokTodoItem,
 } from './grokBuildUx.js';
+import { hasClientToolNamePrefix } from './grokBuildClientToolMcpServer.js';
 import type {
 	AcpModelState,
 	AcpPermissionOption,
@@ -489,9 +490,30 @@ function formatUnified(oldText: string, newText: string): string {
 	return lines.join('\n');
 }
 
+/**
+ * Whether this ACP tool_call / tool_call_update targets a workbench client
+ * tool (`client__…`). Those cards are owned by the HTTP MCP `tools/call`
+ * path ({@link GrokBuildAgent} `_invokeClientTool`) so the mapper must not
+ * emit a second Start/Ready/Complete for the same invocation.
+ */
+export function isGrokClientToolCallUpdate(update: AcpToolCallUpdate): boolean {
+	const xaiName = xaiToolMeta(update)?.name;
+	if (typeof xaiName === 'string' && hasClientToolNamePrefix(xaiName)) {
+		return true;
+	}
+	const title = update.title;
+	return typeof title === 'string' && hasClientToolNamePrefix(title);
+}
+
 function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (SessionAction | ChatAction)[] {
 	const toolCallId = update.toolCallId;
 	if (!toolCallId) {
+		return [];
+	}
+
+	// Grok emits tool_call for `client__*` before POSTing MCP tools/call.
+	// Suppress the ACP card; the MCP invoker shows the single Client card.
+	if (isGrokClientToolCallUpdate(update)) {
 		return [];
 	}
 

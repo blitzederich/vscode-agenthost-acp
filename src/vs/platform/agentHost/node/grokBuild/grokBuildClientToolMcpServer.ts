@@ -19,6 +19,43 @@ export const GROK_CLIENT_MCP_SERVER_NAME = 'client';
 /** MCP protocol version accepted for initialize (streamable HTTP with plain JSON). */
 export const GROK_CLIENT_MCP_PROTOCOL_VERSION = '2024-11-05';
 
+/** Max JSON-RPC body size accepted by the client-tools HTTP MCP server. */
+export const GROK_CLIENT_MCP_MAX_BODY_BYTES = 8 * 1024 * 1024;
+
+/** Prefix grok applies to tools from the `client` MCP server (`client__<tool>`). */
+export const GROK_CLIENT_TOOL_NAME_PREFIX = `${GROK_CLIENT_MCP_SERVER_NAME}__`;
+
+/**
+ * Whether an ACP tool title / x.ai tool name targets a workbench client tool
+ * (`client__…`). Used by the session-update mapper to suppress a duplicate card
+ * — the HTTP MCP `tools/call` path owns the single Client-contributor card.
+ */
+export function hasClientToolNamePrefix(toolName: string): boolean {
+	return toolName.startsWith(GROK_CLIENT_TOOL_NAME_PREFIX);
+}
+
+/**
+ * Strip the `client__` prefix grok applies to MCP client tools. Returns the
+ * input unchanged when it does not carry the prefix.
+ */
+export function stripClientToolNamePrefix(toolName: string): string {
+	return hasClientToolNamePrefix(toolName) ? toolName.slice(GROK_CLIENT_TOOL_NAME_PREFIX.length) : toolName;
+}
+
+/**
+ * Accept only loopback Host headers for the ephemeral MCP port.
+ * `Host` must be `127.0.0.1:<port>` or `localhost:<port>` (optional brackets
+ * around IPv4 are rejected; no other hosts).
+ */
+export function isAllowedGrokClientMcpHost(hostHeader: string | undefined, port: number): boolean {
+	if (typeof hostHeader !== 'string') {
+		return false;
+	}
+	const host = hostHeader.trim().toLowerCase();
+	const expectedPort = String(port);
+	return host === `127.0.0.1:${expectedPort}` || host === `localhost:${expectedPort}`;
+}
+
 /**
  * ACP `mcpServers` HTTP entry for grok 1.0.70:
  * `{ type: 'http', name, url, headers: [{ name, value }] }`.
@@ -35,8 +72,11 @@ export interface IGrokClientMcpToolInvoker {
 	 * Run a workbench client tool: fire ChatToolCallStart/Ready with a Client
 	 * contributor, then resolve when {@link IAgent.onClientToolCallComplete}
 	 * delivers the result for `toolCallId`.
+	 *
+	 * `signal` is aborted when the HTTP request socket closes so the parked
+	 * pending call can be cleaned up instead of hanging.
 	 */
-	invoke(toolName: string, args: Record<string, unknown>, toolCallId: string): Promise<ToolCallResult>;
+	invoke(toolName: string, args: Record<string, unknown>, toolCallId: string, signal?: AbortSignal): Promise<ToolCallResult>;
 }
 
 export interface IGrokClientMcpServerHandle extends Disposable {
@@ -86,6 +126,7 @@ export async function handleGrokClientMcpRequest(
 	tools: readonly ToolDefinition[],
 	invoker: IGrokClientMcpToolInvoker,
 	mintToolCallId: () => string = () => randomBytes(16).toString('hex'),
+	signal?: AbortSignal,
 ): Promise<GrokMcpJsonRpcResponse | undefined> {
 	if (!message || typeof message !== 'object' || Array.isArray(message)) {
 		return jsonRpcError(null, -32600, 'Invalid Request');
@@ -144,7 +185,7 @@ export async function handleGrokClientMcpRequest(
 				: {};
 			const toolCallId = mintToolCallId();
 			try {
-				const protocolResult = await invoker.invoke(name, args, toolCallId);
+				const protocolResult = await invoker.invoke(name, args, toolCallId, signal);
 				const mcpResult: GrokMcpCallToolResult = convertToolCallResult(protocolResult, toolCallId);
 				return jsonRpcResult(id, mcpResult);
 			} catch (err) {
@@ -188,7 +229,10 @@ export function tokensEqual(a: string, b: string): boolean {
 
 /**
  * HTTP request handler for one MCP endpoint. Used by unit tests without
- * binding a port. Rejects missing/invalid bearer tokens with 401.
+ * binding a port. Rejects missing/invalid bearer tokens with 401 and
+ * disallowed Host headers with 403. Callers that bind a real socket should
+ * check auth (and Host) before reading the body; this helper still validates
+ * both for pure unit tests that already hold `bodyText`.
  */
 export async function handleGrokClientMcpHttpRequest(options: {
 	readonly method: string;
@@ -198,6 +242,9 @@ export async function handleGrokClientMcpHttpRequest(options: {
 	readonly tools: readonly ToolDefinition[];
 	readonly invoker: IGrokClientMcpToolInvoker;
 	readonly mintToolCallId?: () => string;
+	readonly hostHeader?: string;
+	readonly listenPort?: number;
+	readonly signal?: AbortSignal;
 }): Promise<IGrokMcpHttpResponse> {
 	const method = options.method.toUpperCase();
 	if (method === 'GET' || method === 'HEAD') {
@@ -208,9 +255,17 @@ export async function handleGrokClientMcpHttpRequest(options: {
 		return { status: 405, headers: { Allow: 'POST' }, body: 'Method Not Allowed' };
 	}
 
+	if (options.listenPort !== undefined && !isAllowedGrokClientMcpHost(options.hostHeader, options.listenPort)) {
+		return { status: 403, body: 'Forbidden' };
+	}
+
 	const token = extractBearerToken(options.authorizationHeader);
 	if (!token || !tokensEqual(token, options.expectedToken)) {
 		return { status: 401, body: 'Unauthorized' };
+	}
+
+	if (Buffer.byteLength(options.bodyText, 'utf8') > GROK_CLIENT_MCP_MAX_BODY_BYTES) {
+		return { status: 413, body: 'Payload Too Large' };
 	}
 
 	let parsed: unknown;
@@ -229,6 +284,7 @@ export async function handleGrokClientMcpHttpRequest(options: {
 		options.tools,
 		options.invoker,
 		options.mintToolCallId,
+		options.signal,
 	);
 	if (response === undefined) {
 		// JSON-RPC notification — empty success.
@@ -245,6 +301,10 @@ export async function handleGrokClientMcpHttpRequest(options: {
  * Bind a 127.0.0.1 HTTP MCP server that surfaces workbench client tools to
  * grok via ACP `mcpServers`. The live tool snapshot is mutable via
  * {@link IGrokClientMcpServerHandle.setTools}.
+ *
+ * Auth and Host are checked before the body is read. Bodies larger than
+ * {@link GROK_CLIENT_MCP_MAX_BODY_BYTES} return 413. Socket close aborts the
+ * in-flight `tools/call` so pending client invocations do not hang.
  */
 export async function startGrokClientToolMcpServer(
 	invoker: IGrokClientMcpToolInvoker,
@@ -252,22 +312,91 @@ export async function startGrokClientToolMcpServer(
 ): Promise<IGrokClientMcpServerHandle> {
 	const token = randomBytes(32).toString('hex');
 	let tools: readonly ToolDefinition[] = initialTools.slice();
+	let listenPort = 0;
 
 	const server = http.createServer((req, res) => {
 		void (async () => {
-			const chunks: Buffer[] = [];
-			for await (const chunk of req) {
-				chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+			const method = (req.method ?? 'GET').toUpperCase();
+			if (method === 'GET' || method === 'HEAD' || method !== 'POST') {
+				res.writeHead(405, { Allow: 'POST' });
+				res.end('Method Not Allowed');
+				req.resume();
+				return;
 			}
-			const bodyText = Buffer.concat(chunks).toString('utf8');
+
+			if (!isAllowedGrokClientMcpHost(headerValue(req.headers.host), listenPort)) {
+				res.writeHead(403);
+				res.end('Forbidden');
+				req.resume();
+				return;
+			}
+
+			const bearer = extractBearerToken(headerValue(req.headers.authorization));
+			if (!bearer || !tokensEqual(bearer, token)) {
+				res.writeHead(401);
+				res.end('Unauthorized');
+				req.resume();
+				return;
+			}
+
+			const contentLengthHeader = headerValue(req.headers['content-length']);
+			if (contentLengthHeader !== undefined) {
+				const contentLength = Number(contentLengthHeader);
+				if (Number.isFinite(contentLength) && contentLength > GROK_CLIENT_MCP_MAX_BODY_BYTES) {
+					res.writeHead(413);
+					res.end('Payload Too Large');
+					req.resume();
+					return;
+				}
+			}
+
+			// Abort only when the client drops the connection mid-handler, not
+			// when the request body stream ends normally (IncomingMessage 'close').
+			const abort = new AbortController();
+			const onClientGone = () => {
+				if (!res.writableFinished) {
+					abort.abort();
+				}
+			};
+			req.on('aborted', onClientGone);
+			res.on('close', onClientGone);
+
+			let bodyText: string;
+			try {
+				bodyText = await readRequestBodyCapped(req, GROK_CLIENT_MCP_MAX_BODY_BYTES);
+			} catch (err) {
+				req.off('aborted', onClientGone);
+				res.off('close', onClientGone);
+				if (err instanceof BodyTooLargeError) {
+					if (!res.headersSent) {
+						res.writeHead(413);
+						res.end('Payload Too Large');
+					}
+					return;
+				}
+				throw err;
+			}
+
 			const response = await handleGrokClientMcpHttpRequest({
-				method: req.method ?? 'GET',
+				method: 'POST',
 				authorizationHeader: headerValue(req.headers.authorization),
 				expectedToken: token,
 				bodyText,
 				tools,
 				invoker,
+				hostHeader: headerValue(req.headers.host),
+				listenPort,
+				signal: abort.signal,
 			});
+			req.off('aborted', onClientGone);
+			res.off('close', onClientGone);
+			if (abort.signal.aborted) {
+				if (!res.headersSent) {
+					res.writeHead(499);
+					res.end();
+				}
+				return;
+			}
 			res.writeHead(response.status, response.headers);
 			res.end(response.body);
 		})().catch(() => {
@@ -291,6 +420,7 @@ export async function startGrokClientToolMcpServer(
 		server.close();
 		throw new Error('Grok client MCP server failed to bind a TCP port');
 	}
+	listenPort = address.port;
 	const url = `http://127.0.0.1:${address.port}/mcp`;
 
 	return new class extends Disposable implements IGrokClientMcpServerHandle {
@@ -325,6 +455,28 @@ export async function startGrokClientToolMcpServer(
 			};
 		}
 	};
+}
+
+class BodyTooLargeError extends Error {
+	constructor() {
+		super('Payload Too Large');
+		this.name = 'BodyTooLargeError';
+	}
+}
+
+async function readRequestBodyCapped(req: http.IncomingMessage, maxBytes: number): Promise<string> {
+	const chunks: Buffer[] = [];
+	let total = 0;
+	for await (const chunk of req) {
+		const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+		total += buf.length;
+		if (total > maxBytes) {
+			req.resume();
+			throw new BodyTooLargeError();
+		}
+		chunks.push(buf);
+	}
+	return Buffer.concat(chunks).toString('utf8');
 }
 
 function headerValue(value: string | string[] | undefined): string | undefined {
