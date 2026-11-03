@@ -31,7 +31,7 @@ import { AgentSession, CODEX_AGENT_PROVIDER_ID, type IAgentCanvasCloseRequest, t
 import { ChatProvidersConfigKey, ChatProvidersSettingId } from '../../../../../../platform/agentHost/common/agentHostChatProviders.js';
 import { agentSdkSetupStatusKey } from '../../../../../../platform/agentHost/common/agentSdkSetup.js';
 import { IAgentHostConnectionsService } from '../../../../../../platform/agentHost/common/agentHostConnectionsService.js';
-import { AgentHostCodexAgentEnabledSettingId, AgentHostPrewarmSessionsSettingId, IAgentHostService } from '../../../../../../platform/agentHost/common/agentService.js';
+import { AgentHostCodexAgentEnabledSettingId, AgentHostGrokBuildAgentEnabledSettingId, AgentHostPrewarmSessionsSettingId, IAgentHostService } from '../../../../../../platform/agentHost/common/agentService.js';
 import { getAgentHostExtensionInitializeResultMeta } from '../../../../../../platform/agentHost/common/agentHostExtensionProtocol.js';
 import { AgentHostAutonomousAutomationsCapabilityMetaKey } from '../../../../../../platform/agentHost/common/meta/agentHostAutomationsMeta.js';
 import { AgentHostCreateChatWorkspaceCapabilityMetaKey } from '../../../../../../platform/agentHost/common/meta/agentHostCreateChatWorkspaceMeta.js';
@@ -1656,16 +1656,22 @@ suite('LocalAgentHostSessionsProvider', () => {
 			{ provider: 'copilotcli', displayName: 'Copilot', description: '', models: [] } as AgentInfo,
 			{ provider: 'claude', displayName: 'Claude', description: '', models: [] } as AgentInfo,
 			{ provider: 'openai', displayName: 'OpenAI', description: '', models: [] } as AgentInfo,
+			{ provider: 'grokBuild', displayName: 'Grok Build', description: '', models: [] } as AgentInfo,
 			{ provider: 'unknown-agent', displayName: 'Unknown', description: '', models: [] } as AgentInfo,
+			{ provider: 'not-grokBuild-extra', displayName: 'Not Grok', description: '', models: [] } as AgentInfo,
 		]);
-		const provider = createProvider(disposables, agentHost);
+		const configurationService = new TestConfigurationService();
+		configurationService.setUserConfiguration(AgentHostGrokBuildAgentEnabledSettingId, true);
+		const provider = createProvider(disposables, agentHost, undefined, { configurationService });
 		assert.deepStrictEqual(
 			provider.sessionTypes.map(t => ({ id: t.id, icon: t.icon.id, supportsWorktreeConfiguration: t.supportsWorktreeConfiguration })),
 			[
 				{ id: 'copilotcli', icon: 'copilot', supportsWorktreeConfiguration: true },
 				{ id: 'claude', icon: 'claude', supportsWorktreeConfiguration: true },
 				{ id: 'openai', icon: 'openai', supportsWorktreeConfiguration: true },
+				{ id: 'grokBuild', icon: 'xai', supportsWorktreeConfiguration: true },
 				{ id: 'unknown-agent', icon: 'vm', supportsWorktreeConfiguration: true },
+				{ id: 'not-grokBuild-extra', icon: 'vm', supportsWorktreeConfiguration: true },
 			],
 		);
 	});

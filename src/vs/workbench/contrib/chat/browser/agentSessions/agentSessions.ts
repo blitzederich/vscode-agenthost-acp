@@ -12,7 +12,7 @@ import { getChatSessionType } from '../../common/model/chatUri.js';
 import { isAgentHostTarget, SessionType } from '../../common/chatSessionsService.js';
 import { IChatRequestVariableEntry } from '../../common/attachments/chatVariableEntries.js';
 import { MenuId } from '../../../../../platform/actions/common/actions.js';
-import { isCopilotAgentHostSessionType } from '../../../../../platform/agentHost/common/agentHostSessionType.js';
+import { GrokBuildAgentHostIcon, isCopilotAgentHostSessionType } from '../../../../../platform/agentHost/common/agentHostSessionType.js';
 
 export const AgentSessionChatContextMenu = new MenuId('AgentSessionChatContext');
 export const AgentSessionChatToolbar = new MenuId('AgentSessionChatToolbar');
@@ -26,6 +26,7 @@ export enum AgentSessionProviders {
 	AgentHostCopilot = SessionType.AgentHostCopilot,
 	AgentHostClaude = SessionType.AgentHostClaude,
 	AgentHostCodex = SessionType.AgentHostCodex,
+	AgentHostGrokBuild = SessionType.AgentHostGrokBuild,
 }
 
 /**
@@ -52,6 +53,7 @@ export function getAgentSessionProvider(sessionResource: URI | string): AgentSes
 		case AgentSessionProviders.AgentHostCopilot:
 		case AgentSessionProviders.AgentHostClaude:
 		case AgentSessionProviders.AgentHostCodex:
+		case AgentSessionProviders.AgentHostGrokBuild:
 			return type;
 		default:
 			return undefined;
@@ -71,6 +73,8 @@ export function getAgentSessionProviderName(provider: AgentSessionTarget): strin
 		case AgentSessionProviders.Codex:
 		case AgentSessionProviders.AgentHostCodex:
 			return 'Codex';
+		case AgentSessionProviders.AgentHostGrokBuild:
+			return 'Grok Build';
 		case AgentSessionProviders.Growth:
 			return 'Growth';
 		case AgentSessionProviders.AgentHostCopilot:
@@ -96,6 +100,8 @@ export function getAgentSessionProviderIcon(provider: AgentSessionTarget): Theme
 			return Codicon.openai;
 		case AgentSessionProviders.AgentHostClaude:
 			return Codicon.claude;
+		case AgentSessionProviders.AgentHostGrokBuild:
+			return GrokBuildAgentHostIcon;
 		case AgentSessionProviders.Growth:
 			return Codicon.lightbulb;
 		case AgentSessionProviders.AgentHostCopilot:
@@ -115,6 +121,7 @@ export function isFirstPartyAgentSessionProvider(provider: AgentSessionTarget): 
 		case AgentSessionProviders.AgentHostClaude:
 		case AgentSessionProviders.Codex:
 		case AgentSessionProviders.AgentHostCodex:
+		case AgentSessionProviders.AgentHostGrokBuild:
 		case AgentSessionProviders.Growth:
 			return false;
 		default:
@@ -190,6 +197,8 @@ export function getAgentSessionProviderDescription(provider: AgentSessionTarget)
 			return localize('chat.session.providerDescription.codex', "Open a new Codex session using the Codex extension from OpenAI. Codex sessions can be managed from the chat sessions view.");
 		case AgentSessionProviders.AgentHostCodex:
 			return localize('chat.session.providerDescription.agentHostCodex', "Work with OpenAI's Codex agent using your ChatGPT or GitHub Copilot subscription.");
+		case AgentSessionProviders.AgentHostGrokBuild:
+			return localize('chat.session.providerDescription.agentHostGrokBuild', "Build and iterate on code with Grok through the Agent Client Protocol.");
 		case AgentSessionProviders.Growth:
 			return localize('chat.session.providerDescription.growth', "Learn about Copilot features.");
 		case AgentSessionProviders.AgentHostCopilot:
