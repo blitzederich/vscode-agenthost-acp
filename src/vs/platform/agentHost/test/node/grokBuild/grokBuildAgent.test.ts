@@ -16,6 +16,7 @@ import type { IProductService } from '../../../../product/common/productService.
 import { AgentSession, fixedChatOwnerRef, GROK_BUILD_AGENT_PROVIDER_ID, type AgentSignal, type IAgentChatContext, type IAgentDiscoveredChat } from '../../../common/agent.js';
 import type { ChatInputRequestWithPlanReview } from '../../../common/agentHostPlanReview.js';
 import { ChatInputRequestPurpose, readChatInputRequestPurpose } from '../../../common/meta/agentChatInputRequestMeta.js';
+import { readUsageInfoMeta } from '../../../common/meta/agentUsageMeta.js';
 import { ActionType } from '../../../common/state/sessionActions.js';
 import { ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, ChatInputResponseKind, CustomizationType, ResponsePartKind, TurnState, type ChatInputAnswer, type ChatInputRequest, type Turn } from '../../../common/state/sessionState.js';
 import {
@@ -302,6 +303,7 @@ suite('GrokBuildAgent', () => {
 		readonly updateChatConfig?: (target: IAgentChatConfigurationTarget, patch: Record<string, unknown>) => void;
 		readonly configPatches?: Array<{ target: IAgentChatConfigurationTarget; patch: Record<string, unknown> }>;
 		readonly sessionMeta?: Record<string, unknown>;
+		readonly onGetSessionState?: (key: unknown) => void;
 	}): GrokBuildAgent {
 		const configurationService = {
 			onDidChatConfigChange: configuration?.onDidChatConfigChange ?? Event.None,
@@ -311,9 +313,12 @@ suite('GrokBuildAgent', () => {
 			}),
 		} as unknown as IAgentConfigurationService;
 		const stateManager = {
-			getSessionState: () => configuration?.sessionMeta !== undefined
-				? { _meta: configuration.sessionMeta }
-				: undefined,
+			getSessionState: (key: unknown) => {
+				configuration?.onGetSessionState?.(key);
+				return configuration?.sessionMeta !== undefined
+					? { _meta: configuration.sessionMeta }
+					: undefined;
+			},
 		} as unknown as AgentHostStateManager;
 		return store.add(new GrokBuildAgent(log, new TestProductService() as unknown as IProductService, configurationService, stateManager));
 	}
@@ -438,7 +443,11 @@ suite('GrokBuildAgent', () => {
 	test('totalTokens and compaction publish merged copilot.usageInfo; 0 ignored', async () => {
 		const peer = store.add(makeFakePeer());
 		const client = store.add(new AcpClient(peer.transport));
-		const agent = createAgent(new NullLogService(), { sessionMeta: { keep: 'yes' } });
+		const getSessionStateKeys: unknown[] = [];
+		const agent = createAgent(new NullLogService(), {
+			sessionMeta: { keep: 'yes', 'agentHost.external': true },
+			onGetSessionState: key => getSessionStateKeys.push(key),
+		});
 		agent.bindTestClient(client);
 		const signals: AgentSignal[] = [];
 		store.add(agent.onDidChatProgress(s => signals.push(s)));
@@ -485,7 +494,7 @@ suite('GrokBuildAgent', () => {
 			method: '_x.ai/session_notification',
 			params: {
 				sessionId: 'sess-ctx-usage',
-				notification: { type: 'auto_compact_completed', tokens_before: 32001, tokens_after: 14345 },
+				update: { sessionUpdate: 'auto_compact_completed', tokens_after: 14345 },
 			},
 		});
 		peer.push({
@@ -509,13 +518,20 @@ suite('GrokBuildAgent', () => {
 		const lastUsage = usageActions.at(-1);
 		assert.ok(lastUsage && lastUsage.kind === 'action' && lastUsage.action.type === ActionType.ChatUsage);
 		assert.strictEqual(lastUsage.action.usage.inputTokens, 31897);
-		assert.deepStrictEqual(lastUsage.action.usage._meta?.turnTokenTotals?.[0]?.inputTokens, 131894);
+		assert.strictEqual(readUsageInfoMeta(lastUsage.action.usage).turnTokenTotals?.[0]?.inputTokens, 131894);
+
+		assert.ok(getSessionStateKeys.length >= 1);
+		for (const key of getSessionStateKeys) {
+			assert.strictEqual(typeof key, 'string');
+			assert.strictEqual(key, context.owner.get().toString());
+		}
 
 		const metaActions = signals.filter(s => s.kind === 'action' && s.action.type === ActionType.SessionMetaChanged);
 		assert.ok(metaActions.length >= 1);
 		const lastMeta = metaActions.at(-1);
 		assert.ok(lastMeta && lastMeta.kind === 'action' && lastMeta.action.type === ActionType.SessionMetaChanged);
 		assert.strictEqual(lastMeta.action._meta?.keep, 'yes');
+		assert.strictEqual(lastMeta.action._meta?.['agentHost.external'], true);
 		assert.deepStrictEqual(lastMeta.action._meta?.['copilot.usageInfo'], {
 			currentTokens: 14345,
 			tokenLimit: 256000,

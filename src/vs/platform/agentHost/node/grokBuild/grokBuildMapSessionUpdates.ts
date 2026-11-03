@@ -865,75 +865,59 @@ export function withGrokContextUsage(meta: Record<string, unknown> | undefined, 
 }
 
 /**
- * Current-context tokens from grok compaction notifications
- * (`auto_compact_completed.tokens_after`, `auto_compact_started.tokens_used`).
- * Accepts flat or nested `_x.ai/session_notification` / `_x.ai/session/update` shapes.
+ * Wire envelope for `_x.ai/session_notification` / replay `_x.ai/session/update`:
+ * `{ sessionId, update: { sessionUpdate: "...", ... } }` where `sessionUpdate`
+ * is the serde discriminator (tag = "sessionUpdate").
+ */
+function readGrokExtensionUpdate(params: unknown): Record<string, unknown> | undefined {
+	const outer = asRecord(params);
+	if (!outer) {
+		return undefined;
+	}
+	return asRecord(outer.update);
+}
+
+/**
+ * Current-context tokens from grok compaction notifications.
+ * Real shapes:
+ * - `update.sessionUpdate === "auto_compact_completed"` → `tokens_after`
+ *   (`tokens_before` is Option and may be absent on older shells)
+ * - `update.sessionUpdate === "auto_compact_started"` → `tokens_used`
+ * Do not read `context_window` from started events as a session override.
  */
 export function readGrokCompactionCurrentTokens(params: unknown): number | undefined {
-	const roots: unknown[] = [params];
-	const record = asRecord(params);
-	if (record) {
-		for (const key of ['notification', 'update', 'event', 'payload', 'data']) {
-			if (record[key] !== undefined) {
-				roots.push(record[key]);
-			}
-		}
+	const update = readGrokExtensionUpdate(params);
+	if (!update) {
+		return undefined;
 	}
-	for (const root of roots) {
-		const obj = asRecord(root);
-		if (!obj) {
-			continue;
-		}
-		const type = typeof obj.type === 'string' ? obj.type
-			: typeof obj.kind === 'string' ? obj.kind
-				: typeof obj.event === 'string' ? obj.event
-					: undefined;
-		if (type === 'auto_compact_completed' || type === 'AutoCompactCompleted') {
-			const after = readTokenCount(obj.tokens_after) ?? readTokenCount(obj.tokensAfter);
-			if (after !== undefined) {
-				return after;
-			}
-		}
-		if (type === 'auto_compact_started' || type === 'AutoCompactStarted') {
-			const used = readTokenCount(obj.tokens_used) ?? readTokenCount(obj.tokensUsed);
-			if (used !== undefined && used > 0) {
-				return used;
-			}
-		}
-		// Type omitted: still honour unambiguous compaction fields.
-		const after = readTokenCount(obj.tokens_after) ?? readTokenCount(obj.tokensAfter);
-		if (after !== undefined && (obj.tokens_before !== undefined || obj.tokensBefore !== undefined)) {
-			return after;
-		}
+	const kind = update.sessionUpdate;
+	if (kind === 'auto_compact_completed') {
+		return readTokenCount(update.tokens_after);
+	}
+	if (kind === 'auto_compact_started') {
+		const used = readTokenCount(update.tokens_used);
+		return used !== undefined && used > 0 ? used : undefined;
 	}
 	return undefined;
 }
 
-/** Optional 500k (or other) window from `model_changed.context_window_selection`. */
-export function readGrokContextWindowSelection(params: unknown): number | undefined {
-	const roots: unknown[] = [params];
-	const record = asRecord(params);
-	if (record) {
-		for (const key of ['notification', 'update', 'event', 'payload', 'data']) {
-			if (record[key] !== undefined) {
-				roots.push(record[key]);
-			}
-		}
+/**
+ * `model_changed` window selection from the extension notification update.
+ * Returns `undefined` when the notification is not `model_changed`.
+ * `selection` is the chosen window, or `undefined` when the field is omitted /
+ * null (model default — callers must clear any override).
+ */
+export function readGrokModelChangedContextWindow(params: unknown): { readonly selection: number | undefined } | undefined {
+	const update = readGrokExtensionUpdate(params);
+	if (!update || update.sessionUpdate !== 'model_changed') {
+		return undefined;
 	}
-	for (const root of roots) {
-		const obj = asRecord(root);
-		if (!obj) {
-			continue;
-		}
-		const selected = readGrokPositiveInt(obj.context_window_selection)
-			?? readGrokPositiveInt(obj.contextWindowSelection)
-			?? readGrokPositiveInt(obj.context_window)
-			?? readGrokPositiveInt(obj.contextWindow);
-		if (selected !== undefined) {
-			return selected;
-		}
+	const raw = update.context_window_selection;
+	// Absent / null / undefined → model default (caller clears override).
+	if (raw === null || raw === undefined) {
+		return { selection: undefined };
 	}
-	return undefined;
+	return { selection: readGrokPositiveInt(raw) };
 }
 
 export function mapTurnCompleted(turnId: string, stopReason: AcpStopReason | undefined, duration = 0): (SessionAction | ChatAction)[] {

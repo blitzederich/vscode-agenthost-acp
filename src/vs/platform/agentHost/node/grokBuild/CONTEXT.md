@@ -74,21 +74,22 @@ falls back to those values for ChatUsage.
 
 Context bar (`chat.contextUsage.enabled`): every `session/update` and the
 prompt result carry `_meta.totalTokens` (grok's live context estimate; the
-same number its TUI uses). Non-zero values, plus compaction
-`auto_compact_completed.tokens_after` /
-`auto_compact_started.tokens_used` from `_x.ai/session_notification` (and
-`_x.ai/session/update` on replay), publish session
+same number its TUI uses). Non-zero values, plus compaction notifications
+from `_x.ai/session_notification` / replay `_x.ai/session/update` whose
+`update.sessionUpdate` is `auto_compact_completed` (`tokens_after`) or
+`auto_compact_started` (`tokens_used`), publish session
 `_meta['copilot.usageInfo'] = { currentTokens, tokenLimit, messagesLength }`
-merged with existing keys. `totalTokens: 0` (transient after `/compact`) is
-ignored. `tokenLimit` is the current model's `maxContextWindow`.
+merged with existing keys (looked up by `owner.toString()`). `totalTokens: 0`
+(transient after `/compact`) is ignored. `tokenLimit` is the current model's
+`maxContextWindow`, overridden by `model_changed.context_window_selection`
+when present and cleared when that field is omitted or on `changeModel`.
 
 Session updates that do not become chat actions: `available_commands_update`
 (slash skills, below), `config_option_update`, `session_info_update`,
 `tool_call_delta_chunk`, `response_completed`, `turn_completed`,
 `session_summary_generated`, `pending_interaction`, `interaction_resolved`,
 plus `_x.ai/*` (including `_x.ai/session/prompt_complete`,
-`_x.ai/mcp_initialized`, and hook events such as `subagent_stop`). Compaction
-and models-update notifications update context usage / model windows.
+`_x.ai/mcp_initialized`, and hook events such as `subagent_stop`).
 `plan` updates and `todo_write` tool calls become `manage_todo_list` tool
 calls. A turn renders only the first of those two sources.
 

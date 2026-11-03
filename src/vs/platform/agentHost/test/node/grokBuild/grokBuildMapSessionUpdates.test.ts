@@ -7,6 +7,7 @@ import assert from 'assert';
 import { URI } from '../../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { AgentPermissionKind } from '../../../common/agent.js';
+import { readUsageInfoMeta } from '../../../common/meta/agentUsageMeta.js';
 import { grokBuildTodoListMetaKey } from '../../../common/meta/agentToolCallMeta.js';
 import { chatReducer } from '../../../common/state/protocol/reducers.js';
 import { ActionType, type ChatAction } from '../../../common/state/sessionActions.js';
@@ -24,6 +25,7 @@ import {
 	mapUsage,
 	readGrokCompactionCurrentTokens,
 	readGrokMaxContextWindow,
+	readGrokModelChangedContextWindow,
 	readGrokTotalTokens,
 	selectPermissionOptionId,
 	toGrokUsageInfo,
@@ -554,7 +556,7 @@ suite('GrokBuild mapSessionUpdates', () => {
 		assert.strictEqual(info?.inputTokens, 31897);
 		assert.strictEqual(info?.outputTokens, 50);
 		assert.strictEqual(info?.cacheReadTokens, 29056);
-		assert.deepStrictEqual(info?._meta?.turnTokenTotals, [{
+		assert.deepStrictEqual(readUsageInfoMeta(info).turnTokenTotals, [{
 			model: 'grok-4.7',
 			inputTokens: 131894,
 			cachedTokens: 100000,
@@ -566,7 +568,7 @@ suite('GrokBuild mapSessionUpdates', () => {
 		assert.strictEqual(actions[0].type, ActionType.ChatUsage);
 		if (actions[0].type === ActionType.ChatUsage) {
 			assert.strictEqual(actions[0].usage.inputTokens, 31897);
-			assert.deepStrictEqual(actions[0].usage._meta?.turnTokenTotals?.[0]?.inputTokens, 131894);
+			assert.strictEqual(readUsageInfoMeta(actions[0].usage).turnTokenTotals?.[0]?.inputTokens, 131894);
 		}
 	});
 
@@ -575,7 +577,7 @@ suite('GrokBuild mapSessionUpdates', () => {
 		assert.strictEqual(info?.inputTokens, 20167);
 		assert.strictEqual(info?.outputTokens, 31);
 		assert.strictEqual(info?.cacheReadTokens, 2176);
-		assert.deepStrictEqual(info?._meta?.turnTokenTotals, [{
+		assert.deepStrictEqual(readUsageInfoMeta(info).turnTokenTotals, [{
 			model: 'grok-4.7',
 			inputTokens: 20167,
 			cachedTokens: 2176,
@@ -591,19 +593,45 @@ suite('GrokBuild mapSessionUpdates', () => {
 		assert.strictEqual(readGrokMaxContextWindow(undefined), undefined);
 	});
 
-	test('totalTokens 0 is ignored; compaction tokens_after lowers context', () => {
+	test('totalTokens 0 is ignored; compaction sessionUpdate shapes lower context', () => {
 		assert.strictEqual(readGrokTotalTokens({ totalTokens: 31954 }), 31954);
 		assert.strictEqual(readGrokTotalTokens({ totalTokens: 0 }), undefined);
 		assert.strictEqual(readGrokCompactionCurrentTokens({
 			sessionId: 's',
-			notification: { type: 'auto_compact_completed', tokens_before: 32001, tokens_after: 14345 },
+			update: { sessionUpdate: 'auto_compact_completed', tokens_after: 14345 },
 		}), 14345);
 		assert.strictEqual(readGrokCompactionCurrentTokens({
-			type: 'auto_compact_started',
-			tokens_used: 28000,
-			context_window: 256000,
-			percentage: 85,
+			sessionId: 's',
+			update: { sessionUpdate: 'auto_compact_completed', tokens_before: 32001, tokens_after: 14345 },
+		}), 14345);
+		assert.strictEqual(readGrokCompactionCurrentTokens({
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'auto_compact_started',
+				tokens_used: 28000,
+				context_window: 256000,
+				percentage: 85,
+			},
 		}), 28000);
+		assert.strictEqual(readGrokCompactionCurrentTokens({
+			sessionId: 's',
+			notification: { type: 'auto_compact_completed', tokens_after: 14345 },
+		}), undefined);
+	});
+
+	test('model_changed context_window_selection sets or clears the override', () => {
+		assert.deepStrictEqual(readGrokModelChangedContextWindow({
+			sessionId: 's',
+			update: { sessionUpdate: 'model_changed', model_id: 'grok-4.7', context_window_selection: 500000 },
+		}), { selection: 500000 });
+		assert.deepStrictEqual(readGrokModelChangedContextWindow({
+			sessionId: 's',
+			update: { sessionUpdate: 'model_changed', model_id: 'grok-4.7' },
+		}), { selection: undefined });
+		assert.strictEqual(readGrokModelChangedContextWindow({
+			sessionId: 's',
+			update: { sessionUpdate: 'auto_compact_started', tokens_used: 1, context_window: 256000 },
+		}), undefined);
 	});
 
 	test('withGrokContextUsage merges without dropping other keys', () => {

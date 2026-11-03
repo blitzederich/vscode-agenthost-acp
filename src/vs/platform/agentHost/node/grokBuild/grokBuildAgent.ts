@@ -51,7 +51,7 @@ import type { ConfigSchema } from '../../common/state/protocol/common/state.js';
 import { IAgentConfigurationService, type IAgentChatConfigurationChangeEvent } from '../agentConfigurationService.js';
 import { AgentHostStateManager, IAgentHostStateManager } from '../agentHostStateManager.js';
 import { ActionType, type ChatAction, type SessionAction } from '../../common/state/sessionActions.js';
-import { ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, ChatInputResponseKind, createErrorResponsePart, MessageKind, ResponsePartKind, TurnState, type ChatInputAnswer, type ChatInputQuestion, type ClientPluginCustomization, type Customization, type ModelSelection, type ToolCallResult, type Turn, type UsageInfo } from '../../common/state/sessionState.js';
+import { ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, ChatInputResponseKind, createErrorResponsePart, MessageKind, ResponsePartKind, TurnState, type ChatInputAnswer, type ChatInputQuestion, type ClientPluginCustomization, type Customization, type ModelSelection, type ToolCallResult, type Turn } from '../../common/state/sessionState.js';
 import type { ProtectedResourceMetadata, ToolDefinition } from '../../common/state/protocol/state.js';
 import type { ResolveSessionConfigResult, SessionConfigCompletionsResult } from '../../common/state/protocol/commands.js';
 import { AHP_SESSION_NOT_FOUND, ProtocolError } from '../../common/state/sessionProtocol.js';
@@ -97,8 +97,8 @@ import {
 	mapTurnStarted,
 	mapUsage,
 	readGrokCompactionCurrentTokens,
-	readGrokContextWindowSelection,
 	readGrokMaxContextWindow,
+	readGrokModelChangedContextWindow,
 	readGrokTotalTokens,
 	selectPermissionOptionId,
 	toGrokUsageInfo,
@@ -359,8 +359,8 @@ interface IGrokBuildChatBacking {
 	 */
 	lastTotalTokens?: number;
 	/**
-	 * Window selected via `model_changed.context_window_selection` or
-	 * `session/set_model` `_meta.contextWindow`. Overrides the model list.
+	 * Window selected via `model_changed.context_window_selection`.
+	 * Cleared when that field is omitted/null or on `changeModel`.
 	 */
 	contextWindowOverride?: number;
 	/** Last published `copilot.usageInfo` (dedupe). */
@@ -1008,6 +1008,9 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			commands: sameSession ? existing?.commands : undefined,
 			ownerRef: sameSession ? existing?.ownerRef : undefined,
 			appliedModeId: sameSession ? existing?.appliedModeId : undefined,
+			lastTotalTokens: sameSession ? existing?.lastTotalTokens : undefined,
+			contextWindowOverride: sameSession ? existing?.contextWindowOverride : undefined,
+			publishedContextUsage: sameSession ? existing?.publishedContextUsage : undefined,
 		};
 		this._backings.set(chatKey(chat), backing);
 		this._sessionToChat.set(persisted.sessionId, chat);
@@ -1075,10 +1078,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 				const current = sessionNew.models?.currentModelId;
 				model = current ? { id: current } : undefined;
 			}
-		} else if (sessionNew.models?.currentModelId) {
-			model = { id: sessionNew.models.currentModelId };
 		}
-
 		const requestedEffort = thinkingLevelOf(options?.model);
 		let reasoningEffort = requestedEffort ?? this._reasoningOption?.currentValue;
 		if (requestedEffort) {
@@ -1259,8 +1259,11 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		}
 		const effort = backing.reasoningEffort;
 		backing.model = modelWithThinkingLevel(model, effort);
+		// A model switch drops any prior non-default window selection.
+		backing.contextWindowOverride = undefined;
 		backing.modifiedTime = Date.now();
 		this._emitProviderDataChange(chat, backing);
+		this._publishContextUsage(backing);
 	}
 
 	/**
@@ -1404,7 +1407,8 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		if (equals(backing.publishedContextUsage, usage)) {
 			return;
 		}
-		const existing = this._stateManager.getSessionState(owner)?._meta;
+		// Protocol URI keys are strings; a URI object never hits the session map.
+		const existing = this._stateManager.getSessionState(owner.toString())?._meta;
 		const nextMeta = withGrokContextUsage(existing, usage);
 		backing.publishedContextUsage = usage;
 		this._onDidChatProgress.fire({
@@ -2195,9 +2199,6 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		store.add(client.onNotification('_x.ai/session/update', params => {
 			this._handleGrokExtensionNotification(params);
 		}));
-		store.add(client.onNotification('_x.ai/models/update', params => {
-			this._handleModelsUpdate(params);
-		}));
 		store.add(client.onRequest('session/request_permission', params => {
 			return this._handlePermissionRequest(params as AcpRequestPermissionParams);
 		}));
@@ -2284,27 +2285,13 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			backing.lastTotalTokens = compactionTokens;
 			this._publishContextUsage(backing);
 		}
-		const selectedWindow = readGrokContextWindowSelection(params);
-		if (selectedWindow !== undefined && selectedWindow !== backing.contextWindowOverride) {
-			backing.contextWindowOverride = selectedWindow;
-			this._publishContextUsage(backing);
-		}
-	}
-
-	private _handleModelsUpdate(params: unknown): void {
-		const record = params !== null && typeof params === 'object' ? params as Record<string, unknown> : undefined;
-		const models = record?.models ?? record?.modelState;
-		if (models && typeof models === 'object') {
-			this._publishModels(models as AcpModelState);
-		}
-		const sessionId = readSessionId(params);
-		if (!sessionId) {
-			return;
-		}
-		const chat = this._sessionToChat.get(sessionId);
-		const backing = chat ? this._backings.get(chatKey(chat)) : undefined;
-		if (backing) {
-			this._publishContextUsage(backing);
+		const modelWindow = readGrokModelChangedContextWindow(params);
+		if (modelWindow) {
+			// Absent / null selection means the model default — clear the override.
+			if (modelWindow.selection !== backing.contextWindowOverride) {
+				backing.contextWindowOverride = modelWindow.selection;
+				this._publishContextUsage(backing);
+			}
 		}
 	}
 
