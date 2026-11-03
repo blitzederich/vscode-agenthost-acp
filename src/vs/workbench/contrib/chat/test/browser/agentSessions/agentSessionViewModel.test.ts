@@ -2952,6 +2952,16 @@ suite('AgentSessions', () => {
 			assert.strictEqual(icon.id, Codicon.openai.id);
 		});
 
+		test('should return correct name for AgentHostGrokBuild provider', () => {
+			const name = getAgentSessionProviderName(AgentSessionProviders.AgentHostGrokBuild);
+			assert.strictEqual(name, 'Grok Build');
+		});
+
+		test('should return correct icon for AgentHostGrokBuild provider', () => {
+			const icon = getAgentSessionProviderIcon(AgentSessionProviders.AgentHostGrokBuild);
+			assert.strictEqual(icon.id, Codicon.xai.id);
+		});
+
 		test('should resolve AgentHostClaude provider from session type', () => {
 			const provider = getAgentSessionProvider(AgentSessionProviders.AgentHostClaude);
 			assert.strictEqual(provider, AgentSessionProviders.AgentHostClaude);
@@ -2960,6 +2970,11 @@ suite('AgentSessions', () => {
 		test('should resolve AgentHostCodex provider from session type', () => {
 			const provider = getAgentSessionProvider(AgentSessionProviders.AgentHostCodex);
 			assert.strictEqual(provider, AgentSessionProviders.AgentHostCodex);
+		});
+
+		test('should resolve AgentHostGrokBuild provider from session type', () => {
+			const provider = getAgentSessionProvider(AgentSessionProviders.AgentHostGrokBuild);
+			assert.strictEqual(provider, AgentSessionProviders.AgentHostGrokBuild);
 		});
 
 		test('should handle Local provider type in model', async () => {
