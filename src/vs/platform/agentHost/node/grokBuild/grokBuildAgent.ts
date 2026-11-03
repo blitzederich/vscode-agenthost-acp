@@ -6,6 +6,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { Disposable, DisposableStore, toDisposable } from '../../../../base/common/lifecycle.js';
+import { equals } from '../../../../base/common/objects.js';
 import { type IObservable, observableValue } from '../../../../base/common/observable.js';
 import { extUri } from '../../../../base/common/resources.js';
 import { URI } from '../../../../base/common/uri.js';
@@ -48,6 +49,7 @@ import { ChatInputRequestPurpose, withChatInputRequestPurpose } from '../../comm
 import { SessionConfigKey } from '../../common/sessionConfigKeys.js';
 import type { ConfigSchema } from '../../common/state/protocol/common/state.js';
 import { IAgentConfigurationService, type IAgentChatConfigurationChangeEvent } from '../agentConfigurationService.js';
+import { AgentHostStateManager, IAgentHostStateManager } from '../agentHostStateManager.js';
 import { ActionType, type ChatAction, type SessionAction } from '../../common/state/sessionActions.js';
 import { ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, ChatInputResponseKind, createErrorResponsePart, MessageKind, ResponsePartKind, TurnState, type ChatInputAnswer, type ChatInputQuestion, type ClientPluginCustomization, type Customization, type ModelSelection, type ToolCallResult, type Turn, type UsageInfo } from '../../common/state/sessionState.js';
 import type { ProtectedResourceMetadata, ToolDefinition } from '../../common/state/protocol/state.js';
@@ -94,8 +96,15 @@ import {
 	mapTurnCompleted,
 	mapTurnStarted,
 	mapUsage,
+	readGrokCompactionCurrentTokens,
+	readGrokContextWindowSelection,
+	readGrokMaxContextWindow,
+	readGrokTotalTokens,
 	selectPermissionOptionId,
+	toGrokUsageInfo,
+	withGrokContextUsage,
 	type IGrokBuildMapState,
+	type IGrokContextUsageInfo,
 } from './grokBuildMapSessionUpdates.js';
 import {
 	applyGrokHistoryUpdate,
@@ -134,6 +143,7 @@ import {
 	type AcpConfigOption,
 	type AcpExitPlanModeParams,
 	type AcpExitPlanModeResult,
+	type AcpModelInfo,
 	type AcpModelState,
 	type AcpRequestPermissionParams,
 	type AcpRequestPermissionResult,
@@ -143,12 +153,19 @@ import {
 	type AcpSessionUpdate,
 	type AcpSessionUpdateParams,
 	type AcpToolCallUpdate,
-	type AcpUsage,
 	ACP_PROTOCOL_VERSION,
 } from './protocol/acpTypes.js';
 
 function isAcpToolCallUpdate(update: AcpSessionUpdate): update is AcpToolCallUpdate {
 	return update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update';
+}
+
+function readSessionId(params: unknown): string | undefined {
+	if (!params || typeof params !== 'object') {
+		return undefined;
+	}
+	const sessionId = (params as { sessionId?: unknown }).sessionId;
+	return typeof sessionId === 'string' && sessionId.length > 0 ? sessionId : undefined;
 }
 
 /** Plan-review action: approve and leave plan mode so grok can execute. */
@@ -336,6 +353,18 @@ interface IGrokBuildChatBacking {
 	 * Not copied into providerData until that load succeeds.
 	 */
 	pendingLoadCwd?: string;
+	/**
+	 * Latest non-zero `_meta.totalTokens` (or compaction `tokens_after` /
+	 * `tokens_used`). Drives `copilot.usageInfo.currentTokens`.
+	 */
+	lastTotalTokens?: number;
+	/**
+	 * Window selected via `model_changed.context_window_selection` or
+	 * `session/set_model` `_meta.contextWindow`. Overrides the model list.
+	 */
+	contextWindowOverride?: number;
+	/** Last published `copilot.usageInfo` (dedupe). */
+	publishedContextUsage?: IGrokContextUsageInfo;
 }
 
 interface IPendingPermission {
@@ -514,29 +543,16 @@ function rethrowAcpFailure(error: unknown): never {
 	throw formatAcpError(error);
 }
 
-function toAgentModelInfo(model: { modelId: string; name?: string }, provider: AgentProvider, schema: ConfigSchema | undefined): IAgentModelInfo {
+function toAgentModelInfo(model: AcpModelInfo, provider: AgentProvider, schema: ConfigSchema | undefined): IAgentModelInfo {
+	const maxContextWindow = readGrokMaxContextWindow(model._meta);
 	return {
 		provider,
 		id: model.modelId,
 		name: model.name ?? model.modelId,
 		supportsVision: false,
+		...(maxContextWindow !== undefined ? { maxContextWindow } : {}),
 		...(schema ? { configSchema: schema } : {}),
 	};
-}
-
-function toUsageInfo(usage: AcpUsage | undefined): UsageInfo | undefined {
-	if (!usage) {
-		return undefined;
-	}
-	const info: UsageInfo = {
-		inputTokens: typeof usage.inputTokens === 'number' ? usage.inputTokens : undefined,
-		outputTokens: typeof usage.outputTokens === 'number' ? usage.outputTokens : undefined,
-		cacheReadTokens: typeof usage.cachedReadTokens === 'number' ? usage.cachedReadTokens : undefined,
-	};
-	if (info.inputTokens === undefined && info.outputTokens === undefined && info.cacheReadTokens === undefined) {
-		return undefined;
-	}
-	return info;
 }
 
 function applyModelState(
@@ -658,6 +674,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		@ILogService private readonly _logService: ILogService,
 		@IProductService private readonly _productService: IProductService,
 		@IAgentConfigurationService private readonly _configurationService: IAgentConfigurationService,
+		@IAgentHostStateManager private readonly _stateManager: AgentHostStateManager,
 	) {
 		super();
 		this._register(this._configurationService.onDidChatConfigChange(event => this._onChatConfigChanged(event)));
@@ -1058,6 +1075,8 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 				const current = sessionNew.models?.currentModelId;
 				model = current ? { id: current } : undefined;
 			}
+		} else if (sessionNew.models?.currentModelId) {
+			model = { id: sessionNew.models.currentModelId };
 		}
 
 		const requestedEffort = thinkingLevelOf(options?.model);
@@ -1147,10 +1166,12 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 				prompt: [{ type: 'text', text: prompt }],
 			});
 			const promptMeta = result._meta;
-			const usage = toUsageInfo(promptMeta?.usage);
-			for (const action of mapUsage(turn, promptMeta?.usage)) {
+			const modelId = backing.model?.id ?? this._models.get()[0]?.id;
+			const usage = toGrokUsageInfo(promptMeta, modelId);
+			for (const action of mapUsage(turn, promptMeta, modelId)) {
 				this._fireAction(chat, action);
 			}
+			this._noteTotalTokens(backing, promptMeta);
 			for (const action of mapTurnCompleted(turn, result.stopReason)) {
 				this._fireAction(chat, action);
 			}
@@ -1158,6 +1179,8 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			// unless an update already carried grok's own promptIndex.
 			this._notePromptAccepted(backing, promptMeta);
 			this._finalizeTurn(backing, turn, result.stopReason === 'cancelled' ? TurnState.Cancelled : TurnState.Complete, usage);
+			// Turn end: refresh the context bar (messagesLength and latest totalTokens).
+			this._publishContextUsage(backing);
 		} catch (err) {
 			// A dead grok process records the turn before this rejection is delivered.
 			// agentSideEffects maps a rejected sendMessage; do not also fire ChatError.
@@ -1336,6 +1359,59 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 
 	private _fireAction(chat: URI, action: SessionAction | ChatAction): void {
 		this._onDidChatProgress.fire({ kind: 'action', resource: chat, action });
+	}
+
+	/** @returns true when `lastTotalTokens` changed (caller may publish). */
+	private _noteTotalTokens(backing: IGrokBuildChatBacking, meta: Record<string, unknown> | undefined): boolean {
+		const total = readGrokTotalTokens(meta);
+		if (total === undefined || total === backing.lastTotalTokens) {
+			return false;
+		}
+		backing.lastTotalTokens = total;
+		return true;
+	}
+
+	private _tokenLimitFor(backing: IGrokBuildChatBacking): number | undefined {
+		if (backing.contextWindowOverride !== undefined) {
+			return backing.contextWindowOverride;
+		}
+		const models = this._models.get();
+		const id = backing.model?.id;
+		const match = id ? models.find(model => model.id === id) : undefined;
+		return match?.maxContextWindow ?? models.find(model => model.maxContextWindow !== undefined)?.maxContextWindow;
+	}
+
+	/**
+	 * Publishes `_meta['copilot.usageInfo']` for the chat context bar.
+	 * Merges with existing session `_meta` keys. No-ops when tokenLimit is
+	 * unknown, currentTokens is unset, or the payload is unchanged.
+	 */
+	private _publishContextUsage(backing: IGrokBuildChatBacking): void {
+		const owner = backing.ownerRef?.get();
+		if (!owner) {
+			return;
+		}
+		const tokenLimit = this._tokenLimitFor(backing);
+		const currentTokens = backing.lastTotalTokens;
+		if (tokenLimit === undefined || currentTokens === undefined) {
+			return;
+		}
+		const usage: IGrokContextUsageInfo = {
+			currentTokens,
+			tokenLimit,
+			messagesLength: backing.turns.length,
+		};
+		if (equals(backing.publishedContextUsage, usage)) {
+			return;
+		}
+		const existing = this._stateManager.getSessionState(owner)?._meta;
+		const nextMeta = withGrokContextUsage(existing, usage);
+		backing.publishedContextUsage = usage;
+		this._onDidChatProgress.fire({
+			kind: 'action',
+			resource: owner,
+			action: { type: ActionType.SessionMetaChanged, _meta: nextMeta },
+		});
 	}
 
 	private _cancelPendingPermissionsForChat(chat: URI): void {
@@ -1733,6 +1809,8 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 				}
 				await this._reapplyReasoningEffort(client, backing);
 				backing.modifiedTime = Date.now();
+				// Replay may under-report totalTokens; publish the latest seen.
+				this._publishContextUsage(backing);
 			} catch (err) {
 				if (isGrokFsNotFound(err)) {
 					this._dropBacking(backing.chat, backing.sessionId);
@@ -2111,6 +2189,15 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		store.add(client.onNotification('session/update', params => {
 			this._handleSessionUpdate(params as AcpSessionUpdateParams);
 		}));
+		store.add(client.onNotification('_x.ai/session_notification', params => {
+			this._handleGrokExtensionNotification(params);
+		}));
+		store.add(client.onNotification('_x.ai/session/update', params => {
+			this._handleGrokExtensionNotification(params);
+		}));
+		store.add(client.onNotification('_x.ai/models/update', params => {
+			this._handleModelsUpdate(params);
+		}));
 		store.add(client.onRequest('session/request_permission', params => {
 			return this._handlePermissionRequest(params as AcpRequestPermissionParams);
 		}));
@@ -2130,6 +2217,12 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		const replay = this._historyReplays.get(params.sessionId);
 		if (replay) {
 			applyGrokHistoryUpdate(replay, params.update);
+			const replayChat = this._sessionToChat.get(params.sessionId);
+			const replayBacking = replayChat ? this._backings.get(chatKey(replayChat)) : undefined;
+			if (replayBacking) {
+				this._noteTotalTokens(replayBacking, params.update?._meta);
+				this._noteTotalTokens(replayBacking, params._meta);
+			}
 			return;
 		}
 		const chat = this._sessionToChat.get(params.sessionId);
@@ -2145,7 +2238,12 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			backing.summary = title;
 			backing.modifiedTime = Date.now();
 		}
+		const tokensChanged = this._noteTotalTokens(backing, params.update?._meta)
+			|| this._noteTotalTokens(backing, params._meta);
 		if (!backing.activeTurnId || !backing.mapState) {
+			if (tokensChanged) {
+				this._publishContextUsage(backing);
+			}
 			return;
 		}
 		this._notePromptAccepted(backing, params.update?._meta);
@@ -2163,7 +2261,50 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			if (status === 'completed' || status === 'failed' || status === 'cancelled') {
 				// Grok finished the card (e.g. ask timeout) without waiting for our reply.
 				this._abandonPendingInteractiveForToolCall(params.sessionId, update.toolCallId);
+				this._publishContextUsage(backing);
 			}
+		} else if (tokensChanged) {
+			// Live gauge: publish when totalTokens moves (deduped inside).
+			this._publishContextUsage(backing);
+		}
+	}
+
+	private _handleGrokExtensionNotification(params: unknown): void {
+		const sessionId = readSessionId(params);
+		if (!sessionId) {
+			return;
+		}
+		const chat = this._sessionToChat.get(sessionId);
+		const backing = chat ? this._backings.get(chatKey(chat)) : undefined;
+		if (!backing) {
+			return;
+		}
+		const compactionTokens = readGrokCompactionCurrentTokens(params);
+		if (compactionTokens !== undefined) {
+			backing.lastTotalTokens = compactionTokens;
+			this._publishContextUsage(backing);
+		}
+		const selectedWindow = readGrokContextWindowSelection(params);
+		if (selectedWindow !== undefined && selectedWindow !== backing.contextWindowOverride) {
+			backing.contextWindowOverride = selectedWindow;
+			this._publishContextUsage(backing);
+		}
+	}
+
+	private _handleModelsUpdate(params: unknown): void {
+		const record = params !== null && typeof params === 'object' ? params as Record<string, unknown> : undefined;
+		const models = record?.models ?? record?.modelState;
+		if (models && typeof models === 'object') {
+			this._publishModels(models as AcpModelState);
+		}
+		const sessionId = readSessionId(params);
+		if (!sessionId) {
+			return;
+		}
+		const chat = this._sessionToChat.get(sessionId);
+		const backing = chat ? this._backings.get(chatKey(chat)) : undefined;
+		if (backing) {
+			this._publishContextUsage(backing);
 		}
 	}
 

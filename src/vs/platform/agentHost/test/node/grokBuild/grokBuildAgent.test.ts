@@ -26,6 +26,7 @@ import { decodeGrokBuildChat, encodeGrokBuildChat } from '../../../node/grokBuil
 import { GrokBuildAgent, mergeRestoredTurns } from '../../../node/grokBuild/grokBuildAgent.js';
 import { GROK_PERMISSION_PRESET_ALLOW_EDITS, GROK_PERMISSION_PRESET_ASK, GROK_PERMISSION_PRESET_KEY, GROK_THINKING_LEVEL_KEY, grokPathPrefixRejectedError, grokPlanModeFailedError, grokSlashCommandRejectedError, grokSlashCommandsUnavailableError } from '../../../node/grokBuild/grokBuildUx.js';
 import { IAgentConfigurationService, type IAgentChatConfigurationChangeEvent, type IAgentChatConfigurationTarget } from '../../../node/agentConfigurationService.js';
+import type { AgentHostStateManager } from '../../../node/agentHostStateManager.js';
 import { SessionConfigKey } from '../../../common/sessionConfigKeys.js';
 import { GROK_BUILD_ACP_ARGV, grokCannotRestoreSessionError, grokCliMissingError, grokCliNotExecutableError, grokHandshakeTimeoutError, grokNotLoggedInError, grokSessionMissingError, grokUnreadableVersionWarning, grokVersionTooOldError, grokWorkingDirectoryRejectedError } from '../../../node/grokBuild/grokBuildLaunchConfig.js';
 import type { AcpAgentCapabilities } from '../../../node/grokBuild/protocol/acpTypes.js';
@@ -300,6 +301,7 @@ suite('GrokBuildAgent', () => {
 		readonly getChatConfigValues?: () => Record<string, unknown> | undefined;
 		readonly updateChatConfig?: (target: IAgentChatConfigurationTarget, patch: Record<string, unknown>) => void;
 		readonly configPatches?: Array<{ target: IAgentChatConfigurationTarget; patch: Record<string, unknown> }>;
+		readonly sessionMeta?: Record<string, unknown>;
 	}): GrokBuildAgent {
 		const configurationService = {
 			onDidChatConfigChange: configuration?.onDidChatConfigChange ?? Event.None,
@@ -308,7 +310,12 @@ suite('GrokBuildAgent', () => {
 				configuration?.configPatches?.push({ target, patch });
 			}),
 		} as unknown as IAgentConfigurationService;
-		return store.add(new GrokBuildAgent(log, new TestProductService() as unknown as IProductService, configurationService));
+		const stateManager = {
+			getSessionState: () => configuration?.sessionMeta !== undefined
+				? { _meta: configuration.sessionMeta }
+				: undefined,
+		} as unknown as AgentHostStateManager;
+		return store.add(new GrokBuildAgent(log, new TestProductService() as unknown as IProductService, configurationService, stateManager));
 	}
 
 	test('descriptor uses Grok Build label and provider id', () => {
@@ -396,6 +403,124 @@ suite('GrokBuildAgent', () => {
 		const messages = await agent.chats.getMessages(chat, context);
 		assert.strictEqual(messages.length, 1);
 		assert.strictEqual(messages[0].message.text, 'hi');
+	});
+
+	test('models expose maxContextWindow from totalContextTokens / contextWindow', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client);
+
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/ctx-window' });
+		const context = chatContext(chat);
+		const createPromise = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp')] });
+		const sessionNew = await readNextMessage(peer.outbound);
+		peer.push({
+			jsonrpc: '2.0',
+			id: sessionNew.id,
+			result: {
+				sessionId: 'sess-ctx-window',
+				models: {
+					currentModelId: 'grok-4.7',
+					availableModels: [
+						{ modelId: 'grok-4.7', name: 'Grok 4.7', _meta: { totalContextTokens: 256000, contextWindows: [256000, 500000] } },
+						{ modelId: 'grok-4.7-500k', name: 'Grok 500k', _meta: { totalContextTokens: 256000, contextWindow: 500000 } },
+					],
+				},
+			},
+		});
+		await createPromise;
+		const models = agent.models.get();
+		assert.strictEqual(models.find(m => m.id === 'grok-4.7')?.maxContextWindow, 256000);
+		assert.strictEqual(models.find(m => m.id === 'grok-4.7-500k')?.maxContextWindow, 500000);
+	});
+
+	test('totalTokens and compaction publish merged copilot.usageInfo; 0 ignored', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent(new NullLogService(), { sessionMeta: { keep: 'yes' } });
+		agent.bindTestClient(client);
+		const signals: AgentSignal[] = [];
+		store.add(agent.onDidChatProgress(s => signals.push(s)));
+
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/ctx-usage' });
+		const context = chatContext(chat);
+		const createPromise = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp')] });
+		const sessionNew = await readNextMessage(peer.outbound);
+		peer.push({
+			jsonrpc: '2.0',
+			id: sessionNew.id,
+			result: {
+				sessionId: 'sess-ctx-usage',
+				models: {
+					currentModelId: 'grok-4.7',
+					availableModels: [{ modelId: 'grok-4.7', name: 'Grok 4.7', _meta: { totalContextTokens: 256000 } }],
+				},
+			},
+		});
+		await createPromise;
+
+		const sendPromise = agent.chats.sendMessage(chat, 'hi', [URI.file('/tmp')], undefined, 'turn-ctx', undefined, context);
+		const prompt = await readNextMessage(peer.outbound);
+		assert.strictEqual(prompt.method, 'session/prompt');
+
+		peer.push({
+			jsonrpc: '2.0',
+			method: 'session/update',
+			params: {
+				sessionId: 'sess-ctx-usage',
+				update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'ok' }, _meta: { totalTokens: 20926 } },
+			},
+		});
+		peer.push({
+			jsonrpc: '2.0',
+			method: 'session/update',
+			params: {
+				sessionId: 'sess-ctx-usage',
+				update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '!' }, _meta: { totalTokens: 0 } },
+			},
+		});
+		peer.push({
+			jsonrpc: '2.0',
+			method: '_x.ai/session_notification',
+			params: {
+				sessionId: 'sess-ctx-usage',
+				notification: { type: 'auto_compact_completed', tokens_before: 32001, tokens_after: 14345 },
+			},
+		});
+		peer.push({
+			jsonrpc: '2.0',
+			id: prompt.id,
+			result: {
+				stopReason: 'end_turn',
+				_meta: {
+					inputTokens: 31897,
+					outputTokens: 50,
+					cachedReadTokens: 29056,
+					totalTokens: 14345,
+					usage: { inputTokens: 131894, outputTokens: 331, cachedReadTokens: 100000 },
+				},
+			},
+		});
+		await sendPromise;
+
+		const usageActions = signals.filter(s => s.kind === 'action' && s.action.type === ActionType.ChatUsage);
+		assert.ok(usageActions.length >= 1);
+		const lastUsage = usageActions.at(-1);
+		assert.ok(lastUsage && lastUsage.kind === 'action' && lastUsage.action.type === ActionType.ChatUsage);
+		assert.strictEqual(lastUsage.action.usage.inputTokens, 31897);
+		assert.deepStrictEqual(lastUsage.action.usage._meta?.turnTokenTotals?.[0]?.inputTokens, 131894);
+
+		const metaActions = signals.filter(s => s.kind === 'action' && s.action.type === ActionType.SessionMetaChanged);
+		assert.ok(metaActions.length >= 1);
+		const lastMeta = metaActions.at(-1);
+		assert.ok(lastMeta && lastMeta.kind === 'action' && lastMeta.action.type === ActionType.SessionMetaChanged);
+		assert.strictEqual(lastMeta.action._meta?.keep, 'yes');
+		assert.deepStrictEqual(lastMeta.action._meta?.['copilot.usageInfo'], {
+			currentTokens: 14345,
+			tokenLimit: 256000,
+			messagesLength: 1,
+		});
 	});
 
 	test('createChat with options.model calls session/set_model; changeModel updates backing', async () => {

@@ -61,15 +61,34 @@ Connection is published only after handshake succeeds so concurrent
 Models: from `session/new`; `session/set_model { sessionId, modelId }` on
 create (when `options.model` is set) and `changeModel`. Success
 `_meta.model.Ok`; unknown id → `-32602` / data `"unknown model id"`.
+`IAgentModelInfo.maxContextWindow` comes from model `_meta.contextWindow`
+when set (non-default window, e.g. 500000), else `_meta.totalContextTokens`
+(default 256000).
 
-Usage field is `cachedReadTokens` (not `cachedTokens`).
+Usage: top-level prompt `_meta.inputTokens` / `outputTokens` /
+`cachedReadTokens` are the **last model call** (ChatUsage fields). Nested
+`_meta.usage` is the **turn sum** and is stored as
+`UsageInfo._meta.turnTokenTotals` (Codex shape). Field name is
+`cachedReadTokens` (not `cachedTokens`). Older grok that only sends `usage`
+falls back to those values for ChatUsage.
+
+Context bar (`chat.contextUsage.enabled`): every `session/update` and the
+prompt result carry `_meta.totalTokens` (grok's live context estimate; the
+same number its TUI uses). Non-zero values, plus compaction
+`auto_compact_completed.tokens_after` /
+`auto_compact_started.tokens_used` from `_x.ai/session_notification` (and
+`_x.ai/session/update` on replay), publish session
+`_meta['copilot.usageInfo'] = { currentTokens, tokenLimit, messagesLength }`
+merged with existing keys. `totalTokens: 0` (transient after `/compact`) is
+ignored. `tokenLimit` is the current model's `maxContextWindow`.
 
 Session updates that do not become chat actions: `available_commands_update`
 (slash skills, below), `config_option_update`, `session_info_update`,
 `tool_call_delta_chunk`, `response_completed`, `turn_completed`,
 `session_summary_generated`, `pending_interaction`, `interaction_resolved`,
 plus `_x.ai/*` (including `_x.ai/session/prompt_complete`,
-`_x.ai/mcp_initialized`, and hook events such as `subagent_stop`).
+`_x.ai/mcp_initialized`, and hook events such as `subagent_stop`). Compaction
+and models-update notifications update context usage / model windows.
 `plan` updates and `todo_write` tool calls become `manage_todo_list` tool
 calls. A turn renders only the first of those two sources.
 

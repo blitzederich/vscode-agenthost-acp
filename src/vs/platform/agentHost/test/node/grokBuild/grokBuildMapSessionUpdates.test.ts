@@ -14,6 +14,7 @@ import { ChatOriginKind, ResponsePartKind, SessionStatus, ToolResultContentType,
 import {
 	createGrokBuildMapState,
 	GROK_ASK_USER_DISPLAY_NAME,
+	GROK_COPILOT_USAGE_INFO_KEY,
 	GROK_PRESENT_PLAN_DISPLAY_NAME,
 	mapExitPlanContent,
 	mapPermissionRequest,
@@ -21,7 +22,12 @@ import {
 	mapTurnCompleted,
 	mapTurnStarted,
 	mapUsage,
+	readGrokCompactionCurrentTokens,
+	readGrokMaxContextWindow,
+	readGrokTotalTokens,
 	selectPermissionOptionId,
+	toGrokUsageInfo,
+	withGrokContextUsage,
 } from '../../../node/grokBuild/grokBuildMapSessionUpdates.js';
 
 function makeChat(): ChatState {
@@ -528,5 +534,90 @@ suite('GrokBuild mapSessionUpdates', () => {
 		assert.strictEqual(complete2.result.pastTenseMessage, GROK_ASK_USER_DISPLAY_NAME);
 		assert.ok(complete2.result.content?.some(block => block.type === ToolResultContentType.Text && block.text === messageOnly));
 		assert.ok(!JSON.stringify(complete2.result.content).includes('"type":"AskUserQuestion"'));
+	});
+
+	test('five-call turn: last-call inputTokens 31897, turn totals 131894', () => {
+		const meta = {
+			inputTokens: 31897,
+			outputTokens: 50,
+			cachedReadTokens: 29056,
+			totalTokens: 31954,
+			usage: {
+				inputTokens: 131894,
+				outputTokens: 331,
+				cachedReadTokens: 100000,
+				totalTokens: 132225,
+				modelCalls: 5,
+			},
+		};
+		const info = toGrokUsageInfo(meta, 'grok-4.7');
+		assert.strictEqual(info?.inputTokens, 31897);
+		assert.strictEqual(info?.outputTokens, 50);
+		assert.strictEqual(info?.cacheReadTokens, 29056);
+		assert.deepStrictEqual(info?._meta?.turnTokenTotals, [{
+			model: 'grok-4.7',
+			inputTokens: 131894,
+			cachedTokens: 100000,
+			outputTokens: 331,
+		}]);
+
+		const actions = mapUsage('turn-2', meta, 'grok-4.7');
+		assert.strictEqual(actions.length, 1);
+		assert.strictEqual(actions[0].type, ActionType.ChatUsage);
+		if (actions[0].type === ActionType.ChatUsage) {
+			assert.strictEqual(actions[0].usage.inputTokens, 31897);
+			assert.deepStrictEqual(actions[0].usage._meta?.turnTokenTotals?.[0]?.inputTokens, 131894);
+		}
+	});
+
+	test('older grok usage-only meta falls back to usage fields', () => {
+		const info = toGrokUsageInfo({ usage: { inputTokens: 20167, outputTokens: 31, cachedReadTokens: 2176 } }, 'grok-4.7');
+		assert.strictEqual(info?.inputTokens, 20167);
+		assert.strictEqual(info?.outputTokens, 31);
+		assert.strictEqual(info?.cacheReadTokens, 2176);
+		assert.deepStrictEqual(info?._meta?.turnTokenTotals, [{
+			model: 'grok-4.7',
+			inputTokens: 20167,
+			cachedTokens: 2176,
+			outputTokens: 31,
+		}]);
+	});
+
+	test('maxContextWindow from totalContextTokens or contextWindow', () => {
+		assert.strictEqual(readGrokMaxContextWindow({ totalContextTokens: 256000 }), 256000);
+		assert.strictEqual(readGrokMaxContextWindow({ totalContextTokens: 256000, contextWindow: 500000 }), 500000);
+		assert.strictEqual(readGrokMaxContextWindow({ totalContextTokens: 0 }), undefined);
+		assert.strictEqual(readGrokMaxContextWindow({ contextWindow: -1 }), undefined);
+		assert.strictEqual(readGrokMaxContextWindow(undefined), undefined);
+	});
+
+	test('totalTokens 0 is ignored; compaction tokens_after lowers context', () => {
+		assert.strictEqual(readGrokTotalTokens({ totalTokens: 31954 }), 31954);
+		assert.strictEqual(readGrokTotalTokens({ totalTokens: 0 }), undefined);
+		assert.strictEqual(readGrokCompactionCurrentTokens({
+			sessionId: 's',
+			notification: { type: 'auto_compact_completed', tokens_before: 32001, tokens_after: 14345 },
+		}), 14345);
+		assert.strictEqual(readGrokCompactionCurrentTokens({
+			type: 'auto_compact_started',
+			tokens_used: 28000,
+			context_window: 256000,
+			percentage: 85,
+		}), 28000);
+	});
+
+	test('withGrokContextUsage merges without dropping other keys', () => {
+		const merged = withGrokContextUsage({ keep: true, other: 1 }, {
+			currentTokens: 21866,
+			tokenLimit: 256000,
+			messagesLength: 5,
+		});
+		assert.strictEqual(merged.keep, true);
+		assert.strictEqual(merged.other, 1);
+		assert.deepStrictEqual(merged[GROK_COPILOT_USAGE_INFO_KEY], {
+			currentTokens: 21866,
+			tokenLimit: 256000,
+			messagesLength: 5,
+		});
 	});
 });
