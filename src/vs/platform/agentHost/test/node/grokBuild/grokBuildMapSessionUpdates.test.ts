@@ -12,8 +12,10 @@ import { grokBuildTodoListMetaKey } from '../../../common/meta/agentToolCallMeta
 import { chatReducer } from '../../../common/state/protocol/reducers.js';
 import { ActionType, type ChatAction } from '../../../common/state/sessionActions.js';
 import { ChatOriginKind, ResponsePartKind, SessionStatus, ToolResultContentType, type ChatState } from '../../../common/state/sessionState.js';
+import { ContextSizeConfigKey } from '../../../common/agentModelConfiguration.js';
 import {
 	createGrokBuildMapState,
+	createGrokContextSizeConfigSchemaProperty,
 	GROK_ASK_USER_DISPLAY_NAME,
 	GROK_COPILOT_USAGE_INFO_KEY,
 	GROK_PRESENT_PLAN_DISPLAY_NAME,
@@ -24,6 +26,7 @@ import {
 	mapTurnStarted,
 	mapUsage,
 	readGrokCompactionCurrentTokens,
+	readGrokContextWindows,
 	readGrokMaxContextWindow,
 	readGrokModelChangedContextWindow,
 	readGrokTotalTokens,
@@ -591,6 +594,17 @@ suite('GrokBuild mapSessionUpdates', () => {
 		assert.strictEqual(readGrokMaxContextWindow({ totalContextTokens: 0 }), undefined);
 		assert.strictEqual(readGrokMaxContextWindow({ contextWindow: -1 }), undefined);
 		assert.strictEqual(readGrokMaxContextWindow(undefined), undefined);
+	});
+
+	test('contextSize schema only when contextWindows offers more than one size', () => {
+		assert.deepStrictEqual(readGrokContextWindows({ contextWindows: [256000, 500000] }), [256000, 500000]);
+		const multi = createGrokContextSizeConfigSchemaProperty({ totalContextTokens: 256000, contextWindows: [256000, 500000] });
+		assert.ok(multi);
+		assert.deepStrictEqual(multi.enum, [256000, 500000]);
+		assert.strictEqual(multi.default, 256000);
+		assert.strictEqual(createGrokContextSizeConfigSchemaProperty({ totalContextTokens: 256000, contextWindows: [256000] }), undefined);
+		assert.strictEqual(createGrokContextSizeConfigSchemaProperty({ totalContextTokens: 256000 }), undefined);
+		assert.strictEqual(ContextSizeConfigKey, 'contextSize');
 	});
 
 	test('totalTokens 0 is ignored; compaction sessionUpdate shapes lower context', () => {

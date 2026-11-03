@@ -15,6 +15,7 @@ import { localize } from '../../../../nls.js';
 import { ILogService } from '../../../log/common/log.js';
 import { IProductService } from '../../../product/common/productService.js';
 import { deriveLegacyDefaultChat } from '../../common/agentHostLegacyDefaultChat.js';
+import { ContextSizeConfigKey, getModelContextSize } from '../../common/agentModelConfiguration.js';
 import {
 	AgentChatMigrationResult,
 	AgentSession,
@@ -88,7 +89,9 @@ import {
 	type IGrokBuildResolvedBinary,
 } from './grokBuildLaunchConfig.js';
 import {
+	contextSizeConfigSchema,
 	createGrokBuildMapState,
+	createGrokContextSizeConfigSchemaProperty,
 	mapExitPlanContent,
 	mapPendingRequestCancelled,
 	mapPermissionRequest,
@@ -96,6 +99,7 @@ import {
 	mapTurnCompleted,
 	mapTurnStarted,
 	mapUsage,
+	mergeGrokModelConfigSchema,
 	GROK_COPILOT_USAGE_INFO_KEY,
 	readGrokCompactionCurrentTokens,
 	readGrokMaxContextWindow,
@@ -152,6 +156,7 @@ import {
 	type AcpSessionInfo,
 	type AcpSessionListParams,
 	type AcpSessionListResult,
+	type AcpSessionSetModelParams,
 	type AcpSessionUpdate,
 	type AcpSessionUpdateParams,
 	type AcpToolCallUpdate,
@@ -558,15 +563,19 @@ function rethrowAcpFailure(error: unknown): never {
 	throw formatAcpError(error);
 }
 
-function toAgentModelInfo(model: AcpModelInfo, provider: AgentProvider, schema: ConfigSchema | undefined): IAgentModelInfo {
+function toAgentModelInfo(model: AcpModelInfo, provider: AgentProvider, reasoningSchema: ConfigSchema | undefined): IAgentModelInfo {
 	const maxContextWindow = readGrokMaxContextWindow(model._meta);
+	const configSchema = mergeGrokModelConfigSchema(
+		reasoningSchema,
+		contextSizeConfigSchema(createGrokContextSizeConfigSchemaProperty(model._meta)),
+	);
 	return {
 		provider,
 		id: model.modelId,
 		name: model.name ?? model.modelId,
 		supportsVision: false,
 		...(maxContextWindow !== undefined ? { maxContextWindow } : {}),
-		...(schema ? { configSchema: schema } : {}),
+		...(configSchema ? { configSchema } : {}),
 	};
 }
 
@@ -574,13 +583,13 @@ function applyModelState(
 	setModels: (models: readonly IAgentModelInfo[]) => void,
 	provider: AgentProvider,
 	state: AcpModelState | undefined,
-	schema: ConfigSchema | undefined,
+	reasoningSchema: ConfigSchema | undefined,
 ): void {
 	const available = state?.availableModels;
 	if (!available?.length) {
 		return;
 	}
-	setModels(available.map(m => toAgentModelInfo(m, provider, schema)));
+	setModels(available.map(m => toAgentModelInfo(m, provider, reasoningSchema)));
 }
 
 function textFromSessionUpdate(params: AcpSessionUpdateParams): string | undefined {
@@ -1100,12 +1109,16 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			: undefined;
 
 		let model = options?.model;
-		if (options?.model?.id) {
+		const createModelId = options?.model?.id ?? cliCurrentModelId;
+		const createContext = createModelId
+			? this._resolveContextWindowForSetModel(options?.model, createModelId, undefined)
+			: undefined;
+		const needsSetModel = !!options?.model?.id || createContext?.changed === true;
+		let setModelApplied = false;
+		if (needsSetModel && createModelId) {
 			try {
-				await client.request('session/set_model', {
-					sessionId: sessionNew.sessionId,
-					modelId: options.model.id,
-				});
+				await client.request('session/set_model', this._setModelParams(sessionNew.sessionId, createModelId, createContext));
+				setModelApplied = true;
 			} catch (err) {
 				const formatted = formatAcpError(err);
 				this._logService.warn(`[GrokBuild] session/set_model failed; keeping the CLI default model: ${grokLogSummary(formatted.message)}`);
@@ -1131,6 +1144,9 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 
 		const backing = this._storeBacking(chat, { sessionId: sessionNew.sessionId, model: modelWithThinkingLevel(model, reasoningEffort), reasoningEffort }, workingDirectories);
 		backing.cliCurrentModelId = cliCurrentModelId;
+		if (setModelApplied && createModelId && model?.id === createModelId && createContext && !createContext.ignored) {
+			this._applyContextWindowSelection(backing, createModelId, createContext.effective);
+		}
 		this._rememberOwner(backing, context);
 		this._setLoadedGeneration(backing, this._connectionGeneration);
 		const modeId = modeIdForSessionMode(options?.config?.[SessionConfigKey.Mode]);
@@ -1272,11 +1288,14 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		if (!client) {
 			throw grokCliMissingError();
 		}
+		const sameModel = backing.model?.id === model.id;
+		const context = this._resolveContextWindowForSetModel(
+			model,
+			model.id,
+			sameModel ? backing.contextWindowOverride : undefined,
+		);
 		try {
-			await client.request('session/set_model', {
-				sessionId: backing.sessionId,
-				modelId: model.id,
-			});
+			await client.request('session/set_model', this._setModelParams(backing.sessionId, model.id, context));
 		} catch (err) {
 			rethrowAcpFailure(err);
 		}
@@ -1295,8 +1314,12 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		}
 		const effort = backing.reasoningEffort;
 		backing.model = modelWithThinkingLevel(model, effort);
-		// A model switch drops any prior non-default window selection.
-		backing.contextWindowOverride = undefined;
+		if (!context.ignored) {
+			this._applyContextWindowSelection(backing, model.id, context.effective);
+		} else if (!sameModel) {
+			// Switching models without a supported contextSize clears any prior override.
+			backing.contextWindowOverride = undefined;
+		}
 		backing.modifiedTime = Date.now();
 		this._emitProviderDataChange(chat, backing);
 		this._publishContextUsage(backing);
@@ -1430,6 +1453,110 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		backing.lastTotalTokens = total;
 		backing.replaySuppressChunkTotals = true;
 		return true;
+	}
+
+	/**
+	 * Resolve the context-window size to send on `session/set_model`.
+	 * Unsupported sizes are ignored (preserve current). Default size omits
+	 * `_meta` so grok returns to its default (256k). Unchanged selections
+	 * still include `_meta` when non-default so a later `set_model` does not
+	 * reset the window.
+	 */
+	private _resolveContextWindowForSetModel(
+		model: ModelSelection | undefined,
+		modelId: string,
+		currentOverride: number | undefined,
+	): {
+		readonly effective: number | undefined;
+		readonly meta: { readonly contextWindow: number } | undefined;
+		readonly changed: boolean;
+		readonly ignored: boolean;
+	} {
+		const modelInfo = this._models.get().find(candidate => candidate.id === modelId);
+		const prop = modelInfo?.configSchema?.properties?.[ContextSizeConfigKey];
+		const offered = prop?.enum;
+		const defaultSize = typeof prop?.default === 'number'
+			? prop.default
+			: (Array.isArray(offered) && typeof offered[0] === 'number' ? offered[0] : undefined);
+		const wanted = getModelContextSize(model);
+		const supported = wanted !== undefined && Array.isArray(offered) && offered.includes(wanted);
+		if (wanted !== undefined && !supported) {
+			// Unsupported size — leave grok's window alone.
+			const current = currentOverride ?? defaultSize ?? modelInfo?.maxContextWindow;
+			return {
+				effective: current,
+				meta: current !== undefined && defaultSize !== undefined && current !== defaultSize
+					? { contextWindow: current }
+					: undefined,
+				changed: false,
+				ignored: true,
+			};
+		}
+		const effective = supported ? wanted : (currentOverride ?? defaultSize);
+		const current = currentOverride ?? defaultSize;
+		const meta = effective !== undefined && defaultSize !== undefined && effective !== defaultSize
+			? { contextWindow: effective }
+			: undefined;
+		return {
+			effective,
+			meta,
+			changed: effective !== undefined && effective !== current,
+			ignored: false,
+		};
+	}
+
+	private _setModelParams(
+		sessionId: string,
+		modelId: string,
+		context: { readonly meta: { readonly contextWindow: number } | undefined } | undefined,
+	): AcpSessionSetModelParams {
+		return context?.meta
+			? { sessionId, modelId, _meta: context.meta }
+			: { sessionId, modelId };
+	}
+
+	/** Apply a selected window to the backing override and published model max. */
+	private _applyContextWindowSelection(backing: IGrokBuildChatBacking, modelId: string, effective: number | undefined): void {
+		const modelInfo = this._models.get().find(candidate => candidate.id === modelId);
+		const prop = modelInfo?.configSchema?.properties?.[ContextSizeConfigKey];
+		const defaultSize = typeof prop?.default === 'number' ? prop.default : undefined;
+		backing.contextWindowOverride = effective !== undefined && defaultSize !== undefined && effective !== defaultSize
+			? effective
+			: undefined;
+		if (effective !== undefined) {
+			this._setModelMaxContextWindow(modelId, effective);
+		}
+	}
+
+	private _defaultContextWindow(modelId: string | undefined): number | undefined {
+		if (!modelId) {
+			return undefined;
+		}
+		const modelInfo = this._models.get().find(candidate => candidate.id === modelId);
+		const prop = modelInfo?.configSchema?.properties?.[ContextSizeConfigKey];
+		if (typeof prop?.default === 'number') {
+			return prop.default;
+		}
+		const offered = prop?.enum;
+		if (Array.isArray(offered) && typeof offered[0] === 'number') {
+			return offered[0];
+		}
+		return modelInfo?.maxContextWindow;
+	}
+
+	private _setModelMaxContextWindow(modelId: string, window: number): void {
+		const models = this._models.get();
+		let changed = false;
+		const next = models.map(model => {
+			if (model.id !== modelId || model.maxContextWindow === window) {
+				return model;
+			}
+			changed = true;
+			return { ...model, maxContextWindow: window };
+		});
+		if (changed) {
+			this._models.set(next, undefined);
+		}
 	}
 
 	private _tokenLimitFor(backing: IGrokBuildChatBacking): number | undefined {
@@ -2398,6 +2525,11 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			// Absent / null selection means the model default — clear the override.
 			if (modelWindow.selection !== backing.contextWindowOverride) {
 				backing.contextWindowOverride = modelWindow.selection;
+				const modelId = backing.model?.id;
+				const effective = modelWindow.selection ?? this._defaultContextWindow(modelId);
+				if (modelId && effective !== undefined) {
+					this._setModelMaxContextWindow(modelId, effective);
+				}
 				this._publishContextUsage(backing);
 			}
 		}
@@ -2636,13 +2768,21 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 	}
 
 	private _publishModels(state: AcpModelState | undefined): void {
-		const schema = this._reasoningSchema();
+		const reasoningSchema = this._reasoningSchema();
 		const before = this._models.get();
-		applyModelState(models => this._models.set(models, undefined), this.id, state, schema);
-		if (state?.availableModels?.length || before.length === 0 || !schema) {
+		applyModelState(models => this._models.set(models, undefined), this.id, state, reasoningSchema);
+		if (state?.availableModels?.length || before.length === 0) {
 			return;
 		}
-		this._models.set(before.map(model => ({ ...model, configSchema: schema })), undefined);
+		// Reasoning-only refresh: keep each model's Context Size property.
+		this._models.set(before.map(model => {
+			const contextProp = model.configSchema?.properties?.[ContextSizeConfigKey];
+			const configSchema = mergeGrokModelConfigSchema(
+				reasoningSchema,
+				contextSizeConfigSchema(contextProp),
+			);
+			return { ...model, configSchema };
+		}), undefined);
 	}
 
 	private async _reapplyReasoningEffort(client: IAcpClient, backing: IGrokBuildChatBacking): Promise<void> {
