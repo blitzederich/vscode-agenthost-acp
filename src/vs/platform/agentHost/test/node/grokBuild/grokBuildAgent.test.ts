@@ -4742,6 +4742,11 @@ suite('GrokBuildAgent', () => {
 			assert.ok(inputReq, 'ChatInput approval shown');
 			assert.match(inputReq.message ?? '', /get_errors/);
 			assert.match(inputReq.message ?? '', /filePaths/);
+			assert.ok(inputReq.message?.includes('```'), 'args rendered inside a code fence');
+			assert.ok(
+				inputReq.questions?.[0]?.kind === ChatInputQuestionKind.SingleSelect
+				&& inputReq.questions[0].allowFreeformInput === false,
+			);
 
 			const requestId = answerInputRequest(agent, chatState, true);
 			chatState = chatReducer(chatState, {
@@ -4914,6 +4919,118 @@ suite('GrokBuildAgent', () => {
 			assert.strictEqual(tc.status, ToolCallStatus.Completed);
 			assert.strictEqual(tc.status === ToolCallStatus.Completed ? tc.success : undefined, false);
 			assertNoStreaming(chatState);
+
+			peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
+			await sendPromise;
+		});
+
+		test('approve args A then MCP args B → re-ask; reject → User declined, no execution', async () => {
+			const peer = store.add(makeFakePeer());
+			const client = store.add(new AcpClient(peer.transport));
+			const agent = createAgent();
+			agent.bindTestClient(client);
+			const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/reducer-args-mismatch' });
+			const context = chatContext(chat);
+			const approvedArgs = { filePaths: ['/a.ts'] };
+			const mcpArgs = { filePaths: ['/etc/shadow'] };
+			agent.getOrCreateActiveClient(chat, context, { clientId: 'workbench-1' }).tools = [{
+				name: 'get_errors',
+				description: 'errors',
+				inputSchema: { type: 'object', properties: { filePaths: { type: 'array' } } },
+			}];
+
+			const signals: AgentSignal[] = [];
+			store.add(agent.onDidChatProgress(s => signals.push(s)));
+
+			const createPromise = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp/proj')] });
+			const sessionNew = await readNextMessage(peer.outbound);
+			assertClientToolsMcpServer(sessionNew.params.mcpServers);
+			const mcp = sessionNew.params.mcpServers[0]!;
+			peerPushSession(peer, sessionNew.id, 'sess-reducer-args-mismatch');
+			await createPromise;
+
+			const turnId = 'turn-reducer-args-mismatch';
+			const sendPromise = agent.chats.sendMessage(chat, 'hi', [URI.file('/tmp/proj')], undefined, turnId, undefined, context);
+			const prompt = await readNextMessage(peer.outbound);
+
+			let chatState = chatReducer(makeChatState(), {
+				type: ActionType.ChatTurnStarted,
+				turnId,
+				startedAt: new Date().toISOString(),
+				message: { text: 'hi', origin: { kind: MessageKind.User } },
+			});
+
+			const grokToolCallId = 'grok-reducer-args-mismatch';
+			peer.push({
+				jsonrpc: '2.0',
+				method: 'session/update',
+				params: {
+					sessionId: 'sess-reducer-args-mismatch',
+					update: {
+						sessionUpdate: 'tool_call',
+						toolCallId: grokToolCallId,
+						title: 'use_tool',
+						status: 'pending',
+						rawInput: { tool_name: 'client__get_errors', tool_input: approvedArgs },
+						_meta: { 'x.ai/tool': { name: 'use_tool', namespace: 'grok_build' } },
+					},
+				},
+			});
+			peer.push({
+				jsonrpc: '2.0',
+				id: 61,
+				method: 'session/request_permission',
+				params: {
+					sessionId: 'sess-reducer-args-mismatch',
+					toolCall: { toolCallId: grokToolCallId, title: 'use_tool' },
+					options: LIVE_PERMISSION_OPTIONS,
+				},
+			});
+			await new Promise(r => setTimeout(r, 20));
+			chatState = foldSignals(chatState, signals);
+			const firstAsk = findInputRequest(chatState);
+			assert.ok(firstAsk);
+			assert.match(firstAsk.message ?? '', /\/a\.ts/);
+			const firstRequestId = answerInputRequest(agent, chatState, true);
+			chatState = chatReducer(chatState, {
+				type: ActionType.ChatInputCompleted,
+				requestId: firstRequestId,
+				response: ChatInputResponseKind.Accept,
+			});
+			const permReply = await readNextMessage(peer.outbound);
+			assert.strictEqual(permReply.result.outcome.optionId, 'allow-once');
+
+			const callPromise = fetch(mcp.url, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json', Authorization: mcp.headers[0]!.value },
+				body: JSON.stringify({
+					jsonrpc: '2.0',
+					id: 2,
+					method: 'tools/call',
+					params: { name: 'get_errors', arguments: mcpArgs },
+				}),
+			});
+			await new Promise(r => setTimeout(r, 40));
+			chatState = foldSignals(chatState, signals);
+			const secondAsk = findInputRequest(chatState);
+			assert.ok(secondAsk, 'MCP args B must re-ask with real args');
+			assert.match(secondAsk.message ?? '', /\/etc\/shadow/);
+			assert.ok(!secondAsk.message?.includes('/a.ts') || secondAsk.message.includes('/etc/shadow'));
+			assert.strictEqual(toolCardCount(chatState), 0);
+
+			const secondRequestId = answerInputRequest(agent, chatState, false);
+			chatState = chatReducer(chatState, {
+				type: ActionType.ChatInputCompleted,
+				requestId: secondRequestId,
+				response: ChatInputResponseKind.Accept,
+			});
+			const callRes = await callPromise;
+			assert.strictEqual(callRes.status, 200);
+			const callJson = await callRes.json() as { result: { isError?: boolean; content: Array<{ text: string }> } };
+			assert.strictEqual(callJson.result.isError, true);
+			assert.ok(callJson.result.content.some(c => c.text.includes('User declined')));
+			chatState = foldSignals(chatState, signals);
+			assert.strictEqual(toolCardCount(chatState), 0);
 
 			peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
 			await sendPromise;
@@ -5196,6 +5313,94 @@ suite('GrokBuildAgent', () => {
 			});
 			await new Promise(r => setTimeout(r, 20));
 			chatState = foldSignals(chatState, signals);
+			assert.strictEqual(toolCardCount(chatState), 0);
+
+			peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
+			await sendPromise;
+		});
+
+		test('MCP abort during approval question closes ChatInput as Cancel', async () => {
+			const peer = store.add(makeFakePeer());
+			const client = store.add(new AcpClient(peer.transport));
+			const agent = createAgent();
+			agent.bindTestClient(client);
+			const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/reducer-abort-ask' });
+			const context = chatContext(chat);
+			const args = { filePaths: ['/a.ts'] };
+			agent.getOrCreateActiveClient(chat, context, { clientId: 'workbench-1' }).tools = [{
+				name: 'get_errors',
+				description: 'errors',
+				inputSchema: { type: 'object', properties: { filePaths: { type: 'array' } } },
+			}];
+
+			const signals: AgentSignal[] = [];
+			store.add(agent.onDidChatProgress(s => signals.push(s)));
+
+			const createPromise = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp/proj')] });
+			const sessionNew = await readNextMessage(peer.outbound);
+			assertClientToolsMcpServer(sessionNew.params.mcpServers);
+			const mcp = sessionNew.params.mcpServers[0]!;
+			peerPushSession(peer, sessionNew.id, 'sess-reducer-abort-ask');
+			await createPromise;
+
+			const turnId = 'turn-reducer-abort-ask';
+			const sendPromise = agent.chats.sendMessage(chat, 'hi', [URI.file('/tmp/proj')], undefined, turnId, undefined, context);
+			const prompt = await readNextMessage(peer.outbound);
+
+			let chatState = chatReducer(makeChatState(), {
+				type: ActionType.ChatTurnStarted,
+				turnId,
+				startedAt: new Date().toISOString(),
+				message: { text: 'hi', origin: { kind: MessageKind.User } },
+			});
+
+			const grokToolCallId = 'grok-reducer-abort-ask';
+			peer.push({
+				jsonrpc: '2.0',
+				method: 'session/update',
+				params: {
+					sessionId: 'sess-reducer-abort-ask',
+					update: {
+						sessionUpdate: 'tool_call',
+						toolCallId: grokToolCallId,
+						title: 'use_tool',
+						status: 'pending',
+						rawInput: { tool_name: 'client__get_errors', tool_input: args },
+						_meta: { 'x.ai/tool': { name: 'use_tool', namespace: 'grok_build' } },
+					},
+				},
+			});
+			await new Promise(r => setTimeout(r, 20));
+
+			const abort = new AbortController();
+			const callPromise = fetch(mcp.url, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json', Authorization: mcp.headers[0]!.value },
+				body: JSON.stringify({
+					jsonrpc: '2.0',
+					id: 2,
+					method: 'tools/call',
+					params: { name: 'get_errors', arguments: args },
+				}),
+				signal: abort.signal,
+			});
+			await new Promise(r => setTimeout(r, 40));
+			chatState = foldSignals(chatState, signals);
+			const pendingAsk = findInputRequest(chatState);
+			assert.ok(pendingAsk, 'approval question shown before abort');
+
+			abort.abort();
+			await callPromise.catch(() => undefined);
+			await new Promise(r => setTimeout(r, 50));
+			const cancelSignal = signals.find(s =>
+				s.kind === 'action'
+				&& s.action.type === ActionType.ChatInputCompleted
+				&& s.action.requestId === pendingAsk.id
+				&& s.action.response === ChatInputResponseKind.Cancel
+			);
+			assert.ok(cancelSignal, 'pending question closed with ChatInputCompleted Cancel');
+			chatState = foldSignals(chatState, signals);
+			assert.strictEqual(findInputRequest(chatState), undefined);
 			assert.strictEqual(toolCardCount(chatState), 0);
 
 			peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });

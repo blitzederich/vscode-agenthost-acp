@@ -260,17 +260,21 @@ ACP `tool_call` with title/`x.ai` name `use_tool` and
 
 While our `client` MCP is attached, those ACP updates are **tracked only**
 (`pendingGrokClientToolCalls`) — no Start/Delta/Ready for grok's id. Approval
-uses `ChatInputRequested` (single-select **Allow once** / **Reject**, message
-shows the VS Code tool name and `rawInput.tool_input` args), not
-`pending_confirmation`. Answers map to grok `allow_once` / `reject_once` only
-— never `allow_always`. Allowed ids are remembered in `approvedClientCallIds`
-for the turn. Cancel/dispose completes the ChatInput as Cancel and answers
-grok `cancelled` (no card if cancelled before MCP).
+uses `ChatInputRequested` (single-select **Allow once** / **Reject**,
+`allowFreeformInput: false`; tool name as inline code; args truncated to ~4 KB
+inside a backtick fence so markdown stays inert), not `pending_confirmation`.
+Answers map to grok `allow_once` / `reject_once` only — never `allow_always` /
+`reject_always` (missing `reject_once` → grok `cancelled`). Allowed id+args
+are remembered in `approvedClientCalls` for the turn. Cancel/dispose completes
+the ChatInput as Cancel and answers grok `cancelled` (no card if cancelled
+before MCP).
 
-At MCP `tools/call`, the host correlates FIFO by tool name + args. If the id
-is not already approved (grok auto-allowed without `request_permission`), the
-same ChatInput is asked first; reject returns MCP `isError` with
-`User declined` and opens no card. On allow, it fires
+At MCP `tools/call`, the host correlates FIFO by tool name + args. Fresh-id
+fallback is always unapproved. A matched id is approved only when stored args
+structurally equal the MCP args (otherwise ask again with the real args).
+Grok auto-allow without `request_permission` also asks first. Reject returns
+MCP `isError` with `User declined` and opens no card. MCP abort during the
+question closes ChatInput as Cancel. On allow, it fires
 `Start{contributor: Client}` then `Ready{confirmed: NotNeeded, toolInput}` on
 grok's id (Client must be set at Start — the reducer ignores a late Client on
 Ready), parks on `pendingClientToolCalls`, and settles when

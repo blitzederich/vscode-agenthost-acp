@@ -16,7 +16,10 @@ import { ContextSizeConfigKey } from '../../../common/agentModelConfiguration.js
 import {
 	createGrokBuildMapState,
 	createGrokContextSizeConfigSchemaProperty,
+	formatGrokClientToolApprovalArgsText,
+	formatGrokClientToolApprovalMessage,
 	GROK_ASK_USER_DISPLAY_NAME,
+	GROK_CLIENT_TOOL_APPROVAL_ARGS_MAX_CHARS,
 	GROK_COPILOT_USAGE_INFO_KEY,
 	GROK_PRESENT_PLAN_DISPLAY_NAME,
 	mapExitPlanContent,
@@ -32,6 +35,7 @@ import {
 	readGrokMaxContextWindow,
 	readGrokModelChangedContextWindow,
 	readGrokTotalTokens,
+	selectClientToolPermissionOptionId,
 	selectPermissionOptionId,
 	toGrokUsageInfo,
 	withGrokContextUsage,
@@ -781,5 +785,54 @@ suite('GrokBuild mapSessionUpdates', () => {
 		assert.strictEqual(startAction.displayName, 'use_tool');
 		assert.strictEqual(startAction.contributor, undefined);
 		assert.ok(start.some(a => a.type === ActionType.ChatToolCallReady));
+	});
+
+	test('selectClientToolPermissionOptionId uses allow_once / reject_once only', () => {
+		const options = [
+			{ optionId: 'allow-edits-session', kind: 'allow_always' },
+			{ optionId: 'allow-once', kind: 'allow_once' },
+			{ optionId: 'reject-always', kind: 'reject_always' },
+			{ optionId: 'reject-once', kind: 'reject_once' },
+		];
+		assert.strictEqual(selectClientToolPermissionOptionId(options, true), 'allow-once');
+		assert.strictEqual(selectClientToolPermissionOptionId(options, false), 'reject-once');
+
+		const noRejectOnce = [
+			{ optionId: 'allow-once', kind: 'allow_once' },
+			{ optionId: 'reject-always', kind: 'reject_always' },
+			{ optionId: 'reject', kind: 'reject' },
+		];
+		assert.strictEqual(selectClientToolPermissionOptionId(noRejectOnce, false), undefined);
+		assert.strictEqual(selectClientToolPermissionOptionId([{ optionId: 'allow-edits-session', kind: 'allow_always' }], true), undefined);
+	});
+
+	test('formatGrokClientToolApprovalMessage bounds huge args and fences markdown', () => {
+		const huge = { blob: 'x'.repeat(500 * 1024) };
+		const hugeMessage = formatGrokClientToolApprovalMessage('get_errors', huge);
+		assert.ok(hugeMessage.length < GROK_CLIENT_TOOL_APPROVAL_ARGS_MAX_CHARS + 512);
+		assert.ok(hugeMessage.includes('…(truncated)'));
+		assert.ok(formatGrokClientToolApprovalArgsText(huge).endsWith('…(truncated)'));
+		assert.ok(formatGrokClientToolApprovalArgsText(huge).length <= GROK_CLIENT_TOOL_APPROVAL_ARGS_MAX_CHARS + '…(truncated)'.length);
+
+		const hostile = {
+			a: '**x**',
+			b: '[x](command:foo)',
+			c: '![](https://e)',
+			d: '```',
+		};
+		const message = formatGrokClientToolApprovalMessage('get_errors', hostile);
+		assert.ok(message.includes('`get_errors`') || message.includes('`` get_errors ``'));
+		const fenceOpen = message.indexOf('```');
+		assert.ok(fenceOpen >= 0);
+		const afterFence = message.slice(fenceOpen);
+		assert.ok(afterFence.includes('**x**'));
+		assert.ok(afterFence.includes('[x](command:foo)'));
+		assert.ok(afterFence.includes('![](https://e)'));
+		assert.ok(afterFence.includes('```'));
+		// Hostile markdown must not appear as raw ChatInput prose before the fence.
+		const beforeFence = message.slice(0, fenceOpen);
+		assert.ok(!beforeFence.includes('**x**'));
+		assert.ok(!beforeFence.includes('command:foo'));
+		assert.ok(!beforeFence.includes('![](https://e)'));
 	});
 });

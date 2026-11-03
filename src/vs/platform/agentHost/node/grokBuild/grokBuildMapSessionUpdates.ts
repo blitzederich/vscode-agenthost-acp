@@ -5,6 +5,7 @@
 
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { URI } from '../../../../base/common/uri.js';
+import { appendEscapedMarkdownCodeBlockFence, appendEscapedMarkdownInlineCode } from '../../../../base/common/htmlContent.js';
 import { localize } from '../../../../nls.js';
 import { AgentPermissionKind, type IAgentToolPendingConfirmationSignal } from '../../common/agent.js';
 import { ContextSizeConfigKey, createContextSizeConfigSchemaPropertyFromLimits } from '../../common/agentModelConfiguration.js';
@@ -38,7 +39,7 @@ export interface IGrokBuildToolCallEntry {
 	readonly toolCallId: string;
 	toolName: string;
 	displayName: string;
-	permissionKind: AgentPermissionKind;
+	readonly permissionKind: AgentPermissionKind;
 	readonly permissionPath?: string;
 	readonly toolKind?: 'subagent' | 'exit_plan' | 'ask_user';
 	readonly subagentDescription?: string;
@@ -1299,22 +1300,53 @@ export function selectPermissionOptionId(
 
 /**
  * Client-tool permission answers for grok: `allow_once` / `reject_once` only.
- * Never selects `allow_always` (session-wide auto-approve).
+ * Never selects `allow_always` or `reject_always`. Missing the once-scoped
+ * option → `undefined` (caller answers grok `cancelled`).
  */
 export function selectClientToolPermissionOptionId(
 	options: readonly { readonly optionId: string; readonly kind: string }[],
 	approved: boolean,
 ): string | undefined {
 	const kind = approved ? 'allow_once' : 'reject_once';
-	const match = options.find(o => o.kind === kind);
-	if (match) {
-		return match.optionId;
+	return options.find(o => o.kind === kind)?.optionId;
+}
+
+/** Cap for JSON args embedded in the client-tool approval ChatInput message. */
+export const GROK_CLIENT_TOOL_APPROVAL_ARGS_MAX_CHARS = 4 * 1024;
+
+/**
+ * Serialize and bound client-tool args for the approval message. Truncation
+ * appends `…(truncated)` so a hostile/huge payload cannot blow up the ChatInput.
+ */
+export function formatGrokClientToolApprovalArgsText(args: Record<string, unknown>): string {
+	let text: string;
+	try {
+		text = JSON.stringify(args);
+	} catch {
+		text = '{}';
 	}
-	// Fall back only within the once-scoped kinds (still never allow_always).
-	if (!approved) {
-		return options.find(o => o.kind === 'reject' || o.kind === 'reject_always')?.optionId;
+	if (text.length > GROK_CLIENT_TOOL_APPROVAL_ARGS_MAX_CHARS) {
+		return `${text.slice(0, GROK_CLIENT_TOOL_APPROVAL_ARGS_MAX_CHARS)}…(truncated)`;
 	}
-	return undefined;
+	return text;
+}
+
+/**
+ * ChatInput approval copy: tool name as inline code, args inside a code fence
+ * longer than any backtick run in the content so markdown/links in args stay inert.
+ */
+export function formatGrokClientToolApprovalMessage(toolName: string, args: Record<string, unknown>): string {
+	const safeName = appendEscapedMarkdownInlineCode(toolName);
+	const fencedArgs = appendEscapedMarkdownCodeBlockFence(
+		formatGrokClientToolApprovalArgsText(args),
+		'json',
+	);
+	return localize(
+		'grokBuild.clientTool.approval.message',
+		"Allow client tool {0} with arguments:\n\n{1}",
+		safeName,
+		fencedArgs,
+	);
 }
 
 /** Whether an ACP session update kind should be ignored by the mapper. */

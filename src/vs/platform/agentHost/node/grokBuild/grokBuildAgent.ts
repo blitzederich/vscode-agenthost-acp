@@ -6,6 +6,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
 import { CancellationError } from '../../../../base/common/errors.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
+import { appendEscapedMarkdownInlineCode } from '../../../../base/common/htmlContent.js';
 import { Disposable, DisposableStore, toDisposable } from '../../../../base/common/lifecycle.js';
 import { structuralEquals } from '../../../../base/common/equals.js';
 import { equals } from '../../../../base/common/objects.js';
@@ -122,6 +123,7 @@ import {
 	readGrokModelChangedContextWindow,
 	readGrokTotalTokens,
 	readGrokTurnCompletedSingleCallTokens,
+	formatGrokClientToolApprovalMessage,
 	selectClientToolPermissionOptionId,
 	selectPermissionOptionId,
 	toGrokUsageInfo,
@@ -421,10 +423,11 @@ interface IGrokBuildChatBacking {
 	 */
 	pendingGrokClientToolCalls: IGrokPendingClientToolCall[];
 	/**
-	 * toolCallIds the user allowed via ChatInput (request_permission or the
-	 * auto-allow gate). Cleared each turn. Never implies `allow_always`.
+	 * toolCallId → args the user allowed via ChatInput (request_permission or
+	 * the auto-allow gate). Cleared each turn. MCP must present structurally
+	 * equal args for the same id; otherwise ask again. Never `allow_always`.
 	 */
-	approvedClientCallIds: Set<string>;
+	approvedClientCalls: Map<string, Record<string, unknown>>;
 	/** Live HTTP MCP server for this chat, when client-tools MCP is enabled. */
 	clientMcpServer?: IGrokClientMcpServerHandle;
 	/** In-flight ensure of {@link clientMcpServer}. */
@@ -513,9 +516,8 @@ type GrokClientToolApprovalOutcome = 'allow' | 'reject' | 'cancelled';
 interface IPendingClientToolApproval {
 	readonly chat: URI;
 	readonly sessionId: string | undefined;
-	readonly turnId: string;
 	readonly toolCallId: string;
-	readonly toolName: string;
+	/** Args shown (and stored on allow) for the approval; compared at MCP. */
 	readonly args: Record<string, unknown>;
 	resolve(outcome: GrokClientToolApprovalOutcome): void;
 }
@@ -1199,9 +1201,9 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			pendingGrokClientToolCalls: sameSession && existing
 				? existing.pendingGrokClientToolCalls
 				: [],
-			approvedClientCallIds: sameSession && existing
-				? existing.approvedClientCallIds
-				: new Set<string>(),
+			approvedClientCalls: sameSession && existing
+				? existing.approvedClientCalls
+				: new Map<string, Record<string, unknown>>(),
 			clientMcpServer: sameSession ? existing?.clientMcpServer : undefined,
 			clientMcpServerInFlight: sameSession ? existing?.clientMcpServerInFlight : undefined,
 		};
@@ -1365,7 +1367,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		backing.activeTurnId = turn;
 		backing.mapState = this._createMapState(backing, turn);
 		backing.pendingGrokClientToolCalls.length = 0;
-		backing.approvedClientCallIds.clear();
+		backing.approvedClientCalls.clear();
 		backing.turnAssistantMarkdown = '';
 		backing.turnUserText = prompt;
 
@@ -2096,40 +2098,13 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			if (pending.chat.toString() !== chat.toString()) {
 				continue;
 			}
-			this._dismissClientToolApproval(requestId, pending, 'cancelled');
+			this._abandonClientToolApproval(requestId, pending);
 		}
 	}
 
 	private _cancelAllPendingClientToolApprovals(): void {
 		for (const [requestId, pending] of [...this._pendingClientToolApprovals]) {
-			this._dismissClientToolApproval(requestId, pending, 'cancelled');
-		}
-	}
-
-	/**
-	 * Resolve a parked client-tool approval as cancelled, dismiss the ChatInput,
-	 * and suppress a pre-MCP failure card for that toolCallId.
-	 */
-	private _dismissClientToolApproval(
-		requestId: string,
-		pending: IPendingClientToolApproval,
-		outcome: GrokClientToolApprovalOutcome,
-	): void {
-		if (!this._pendingClientToolApprovals.has(requestId)) {
-			return;
-		}
-		this._pendingClientToolApprovals.delete(requestId);
-		pending.resolve(outcome);
-		this._fireAction(pending.chat, {
-			type: ActionType.ChatInputCompleted,
-			requestId,
-			response: ChatInputResponseKind.Cancel,
-		});
-		if (outcome === 'cancelled') {
-			const backing = this._backings.get(chatKey(pending.chat));
-			if (backing?.mapState) {
-				markGrokClientToolCancelledBeforeStart(backing.mapState, pending.toolCallId);
-			}
+			this._abandonClientToolApproval(requestId, pending);
 		}
 	}
 
@@ -2162,7 +2137,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		this._pendingClientToolApprovals.delete(requestId);
 		if (outcome === 'allow') {
 			const backing = this._backings.get(chatKey(pending.chat));
-			backing?.approvedClientCallIds.add(pending.toolCallId);
+			backing?.approvedClientCalls.set(pending.toolCallId, pending.args);
 		} else if (outcome === 'cancelled') {
 			const backing = this._backings.get(chatKey(pending.chat));
 			if (backing?.mapState) {
@@ -2170,6 +2145,17 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			}
 		}
 		pending.resolve(outcome);
+	}
+
+	/** Close a parked approval for this chat+toolCallId (e.g. MCP request aborted). */
+	private _abandonClientToolApprovalForCall(chat: URI, toolCallId: string): void {
+		const chatKeyStr = chat.toString();
+		for (const [requestId, pending] of [...this._pendingClientToolApprovals]) {
+			if (pending.chat.toString() !== chatKeyStr || pending.toolCallId !== toolCallId) {
+				continue;
+			}
+			this._abandonClientToolApproval(requestId, pending);
+		}
 	}
 
 	private _resolveClientToolApproval(
@@ -2203,36 +2189,26 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 	private _requestClientToolApproval(
 		chat: URI,
 		sessionId: string | undefined,
-		turnId: string,
 		toolCallId: string,
 		toolName: string,
 		args: Record<string, unknown>,
 	): Promise<GrokClientToolApprovalOutcome> {
 		const requestId = generateUuid();
-		let argsText: string;
-		try {
-			argsText = JSON.stringify(args);
-		} catch {
-			argsText = '{}';
-		}
+		const safeName = appendEscapedMarkdownInlineCode(toolName);
 		const inputRequest = {
 			id: requestId,
-			message: localize(
-				'grokBuild.clientTool.approval.message',
-				"Allow client tool \"{0}\" with arguments: {1}",
-				toolName,
-				argsText,
-			),
+			message: formatGrokClientToolApprovalMessage(toolName, args),
 			questions: [{
 				kind: ChatInputQuestionKind.SingleSelect as const,
 				id: GROK_CLIENT_TOOL_APPROVAL_QUESTION_ID,
 				title: localize('grokBuild.clientTool.approval.title', "Client tool"),
 				message: localize(
 					'grokBuild.clientTool.approval.question',
-					"Run \"{0}\"?",
-					toolName,
+					"Run {0}?",
+					safeName,
 				),
 				required: true,
+				allowFreeformInput: false,
 				options: [
 					{
 						id: GROK_CLIENT_TOOL_ALLOW_ONCE_OPTION_ID,
@@ -2250,9 +2226,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			this._pendingClientToolApprovals.set(requestId, {
 				chat,
 				sessionId,
-				turnId,
 				toolCallId,
-				toolName,
 				args,
 				resolve,
 			});
@@ -2973,7 +2947,6 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			return this._requestClientToolApproval(
 				chat,
 				params.sessionId,
-				turnId,
 				trackedClient.toolCallId,
 				trackedClient.toolName,
 				trackedClient.args,
@@ -3538,7 +3511,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 	private _rejectPendingClientToolCalls(backing: IGrokBuildChatBacking): void {
 		backing.pendingClientToolCalls.rejectAll(new CancellationError());
 		backing.pendingGrokClientToolCalls.length = 0;
-		backing.approvedClientCallIds.clear();
+		backing.approvedClientCalls.clear();
 	}
 
 	private _disposeClientMcp(backing: IGrokBuildChatBacking): void {
@@ -3620,9 +3593,9 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 	}
 
 	/**
-	 * MCP tools/call → ask if not already approved, then open Start{Client} +
-	 * Ready{NotNeeded, toolInput} on grok's matched id (or a fresh fallback id)
-	 * and park on {@link onClientToolCallComplete}.
+	 * MCP tools/call → ask if not already approved with matching args, then
+	 * open Start{Client} + Ready{NotNeeded, toolInput} on grok's matched id
+	 * (or a fresh fallback id) and park on {@link onClientToolCallComplete}.
 	 */
 	private async _invokeClientTool(
 		chat: URI,
@@ -3658,16 +3631,29 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			this._logService.trace('[GrokBuild] client tools/call without matching use_tool card; falling back to separate Client card');
 		}
 
-		if (!backing.approvedClientCallIds.has(toolCallId)) {
-			// Grok auto-allowed (no request_permission) or fallback id — ask here.
-			const outcome = await this._requestClientToolApproval(
-				chat,
-				backing.sessionId,
-				turnId,
-				toolCallId,
-				toolName,
-				args,
-			);
+		// Fresh-id fallback is always unapproved. Matched ids are approved only
+		// when the stored args are structurally equal to the MCP args (blocks
+		// approving A then executing B via FIFO name fallback).
+		const approvedArgs = matched ? backing.approvedClientCalls.get(toolCallId) : undefined;
+		const alreadyApproved = approvedArgs !== undefined && structuralEquals(approvedArgs, args);
+		if (!alreadyApproved) {
+			const onAbortDuringAsk = () => this._abandonClientToolApprovalForCall(chat, toolCallId);
+			signal?.addEventListener('abort', onAbortDuringAsk, { once: true });
+			let outcome: GrokClientToolApprovalOutcome;
+			try {
+				outcome = await this._requestClientToolApproval(
+					chat,
+					backing.sessionId,
+					toolCallId,
+					toolName,
+					args,
+				);
+			} finally {
+				signal?.removeEventListener('abort', onAbortDuringAsk);
+			}
+			if (signal?.aborted) {
+				throw new CancellationError();
+			}
 			if (outcome !== 'allow') {
 				return {
 					success: false,
