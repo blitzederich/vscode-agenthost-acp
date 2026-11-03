@@ -4,7 +4,6 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
-import { Codicon } from '../../../../base/common/codicons.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { findRemoteAgentHostSessionTypeAuthority, GrokBuildAgentHostIcon, isCopilotAgentHostProvider, isCopilotAgentHostSessionType, isGrokBuildAgentHostProvider, isRemoteAgentHostSessionType, parseAgentHostHarness, parseRemoteAgentHostHarness, parseRemoteAgentHostSessionTypeAuthority, remoteAgentHostSessionTypeAuthorityPrefix, remoteAgentHostSessionTypeId } from '../../common/agentHostSessionType.js';
 
@@ -18,8 +17,8 @@ suite('agentHostSessionType', () => {
 		);
 	});
 
-	test('recognizes the Grok Build provider id exactly and shares Codicon.xai', () => {
-		assert.strictEqual(GrokBuildAgentHostIcon.id, Codicon.xai.id);
+	test('recognizes the Grok Build provider id exactly and uses the Grok logomark icon', () => {
+		assert.strictEqual(GrokBuildAgentHostIcon.id, 'grok-build');
 		assert.deepStrictEqual(
 			['grokBuild', 'claude', 'not-grokBuild-extra', 'grokBuildish', ''].map(isGrokBuildAgentHostProvider),
 			[true, false, false, false, false],

@@ -5,7 +5,7 @@
 
 import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../base/test/common/utils.js';
-import { Codicon } from '../../../../../../base/common/codicons.js';
+import { GrokBuildAgentHostIcon } from '../../../../../../platform/agentHost/common/agentHostSessionType.js';
 import { AgentSessionProviders, getAgentSessionProviderIcon } from '../../../browser/agentSessions/agentSessions.js';
 
 suite('Agent session provider presentation', () => {
@@ -23,8 +23,9 @@ suite('Agent session provider presentation', () => {
 		]);
 	});
 
-	test('uses the xAI icon for the Grok Build agent-host session type', () => {
-		assert.strictEqual(getAgentSessionProviderIcon(AgentSessionProviders.AgentHostGrokBuild).id, Codicon.xai.id);
-		assert.strictEqual(getAgentSessionProviderIcon('agent-host-grokBuild').id, Codicon.xai.id);
+	test('uses the Grok logomark icon for the Grok Build agent-host session type', () => {
+		assert.strictEqual(getAgentSessionProviderIcon(AgentSessionProviders.AgentHostGrokBuild).id, GrokBuildAgentHostIcon.id);
+		assert.strictEqual(getAgentSessionProviderIcon('agent-host-grokBuild').id, GrokBuildAgentHostIcon.id);
+		assert.strictEqual(GrokBuildAgentHostIcon.id, 'grok-build');
 	});
 });

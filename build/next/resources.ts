@@ -74,6 +74,9 @@ const desktopResourcePatterns = [
 	'vs/workbench/browser/parts/editor/media/*.png',
 	'vs/workbench/contrib/debug/browser/media/*.png',
 
+	// Grok Build harness logomark icon font (dedicated; not upstream codicons)
+	'vs/platform/agentHost/common/media/grokBuild/*.{woff,ttf,svg}',
+
 	// Sessions - built-in prompts and skills
 	'vs/sessions/prompts/*.prompt.md',
 	'vs/sessions/skills/**/SKILL.md',
@@ -133,6 +136,9 @@ const serverWebResourcePatterns = [
 	'vs/workbench/contrib/extensions/browser/media/*.png',
 	'vs/workbench/services/extensionManagement/common/media/*.svg',
 	'vs/workbench/services/extensionManagement/common/media/*.png',
+
+	// Grok Build harness logomark icon font (dedicated; not upstream codicons)
+	'vs/platform/agentHost/common/media/grokBuild/*.{woff,ttf,svg}',
 ];
 
 // Resources for standalone web target (browser-only, no server)
@@ -161,6 +167,9 @@ const webResourcePatterns = [
 	'vs/workbench/contrib/extensions/browser/media/*.png',
 	'vs/workbench/services/extensionManagement/common/media/*.svg',
 	'vs/workbench/services/extensionManagement/common/media/*.png',
+
+	// Grok Build harness logomark icon font (dedicated; not upstream codicons)
+	'vs/platform/agentHost/common/media/grokBuild/*.{woff,ttf,svg}',
 ];
 
 function getResourcePatternsForTarget(target: BuildTarget): string[] {

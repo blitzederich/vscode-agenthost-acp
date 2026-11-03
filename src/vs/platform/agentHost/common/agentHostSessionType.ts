@@ -3,19 +3,41 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { Codicon } from '../../../base/common/codicons.js';
+import { FileAccess, type AppResourcePath } from '../../../base/common/network.js';
 import { ThemeIcon } from '../../../base/common/themables.js';
+import { localize } from '../../../nls.js';
+import { getIconRegistry, registerIcon } from '../../theme/common/iconRegistry.js';
 import { GROK_BUILD_AGENT_PROVIDER_ID, type AgentProvider } from './agent.js';
 
 const LOCAL_AGENT_HOST_SESSION_TYPE_PREFIX = 'agent-host-';
 const REMOTE_AGENT_HOST_SESSION_TYPE_PREFIX = 'remote-';
 
 /**
+ * Dedicated icon-font id for the official Grok logomark (not upstream codicons).
+ * Font sources live under `common/media/grokBuild/` — see README there.
+ */
+const GROK_BUILD_ICON_FONT_ID = 'grok-build';
+const GROK_BUILD_ICON_FONT_WOFF: AppResourcePath = 'vs/platform/agentHost/common/media/grokBuild/grok-build.woff';
+const GROK_BUILD_ICON_FONT_TTF: AppResourcePath = 'vs/platform/agentHost/common/media/grokBuild/grok-build.ttf';
+/** Private-use code point assigned when generating the single-glyph font. */
+const GROK_BUILD_ICON_FONT_CHARACTER = '\\E001';
+
+const grokBuildIconFont = getIconRegistry().registerIconFont(GROK_BUILD_ICON_FONT_ID, {
+	src: [
+		{ location: FileAccess.asBrowserUri(GROK_BUILD_ICON_FONT_WOFF), format: 'woff' },
+		{ location: FileAccess.asBrowserUri(GROK_BUILD_ICON_FONT_TTF), format: 'truetype' },
+	],
+});
+
+/**
  * Shared icon for the Grok Build agent-host harness / session type.
  * Use this wherever the harness itself is represented (session list, picker,
- * harness presentation). Per-model xAI icons stay independent.
+ * harness presentation). Per-model xAI icons stay independent (`chat-model-provider-xai`).
  */
-export const GrokBuildAgentHostIcon: ThemeIcon = Codicon.xai;
+export const GrokBuildAgentHostIcon: ThemeIcon = registerIcon('grok-build', {
+	fontCharacter: GROK_BUILD_ICON_FONT_CHARACTER,
+	font: { id: GROK_BUILD_ICON_FONT_ID, definition: grokBuildIconFont },
+}, localize('grokBuildAgentHostIcon', 'Icon for the Grok Build agent host harness.'));
 
 /** Identifies the Grok Build agent-host provider id exactly (not a substring match). */
 export function isGrokBuildAgentHostProvider(provider: string): boolean {
