@@ -2962,6 +2962,11 @@ suite('AgentSessions', () => {
 			assert.strictEqual(icon.id, Codicon.xai.id);
 		});
 
+		test('should return detailed AgentHostGrokBuild provider description', () => {
+			const description = getAgentSessionProviderDescription(AgentSessionProviders.AgentHostGrokBuild);
+			assert.strictEqual(description, 'Build and iterate on code with Grok through the Agent Client Protocol.');
+		});
+
 		test('should resolve AgentHostClaude provider from session type', () => {
 			const provider = getAgentSessionProvider(AgentSessionProviders.AgentHostClaude);
 			assert.strictEqual(provider, AgentSessionProviders.AgentHostClaude);
