@@ -343,4 +343,46 @@ suite('ChatContextUsageWidget', () => {
 		assert.deepStrictEqual(getData(), { ...before, sessionCost: 7 });
 	});
 
+	test('clearing before a pending lastRequest hides prior session usage (session switch)', () => {
+		const { widget } = createWidgetWithData();
+		widget.update(createRequest(CONCRETE_MODEL, usage()));
+		assert.strictEqual(widget.isVisible.get(), true);
+		assert.strictEqual(widget.domNode.querySelector('.percentage-label')?.textContent, '50%');
+
+		// Mimic updateContextUsageWidget(): clear, then apply the new session's
+		// lastRequest which has a response but no modelId / usage yet.
+		widget.update(undefined);
+		const pending = {
+			modelId: undefined,
+			response: { usage: undefined, onDidChange: Event.None, session: {} },
+			session: {},
+		} as unknown as IChatRequestModel;
+		widget.update(pending);
+
+		assert.strictEqual(widget.isVisible.get(), false);
+		assert.strictEqual(widget.showDetails(), false);
+	});
+
+	test('pending request without modelId adopts usage once modelId appears via response change', () => {
+		const responseChange = store.add(new Emitter<void>());
+		const { widget } = createWidgetWithData();
+		widget.update(createRequest(CONCRETE_MODEL, usage()));
+		assert.strictEqual(widget.isVisible.get(), true);
+
+		widget.update(undefined);
+		const pending = {
+			modelId: undefined as string | undefined,
+			response: { usage: usage(), onDidChange: responseChange.event, session: {} },
+			session: {},
+		};
+		widget.update(pending as unknown as IChatRequestModel);
+		assert.strictEqual(widget.isVisible.get(), false);
+
+		pending.modelId = CONCRETE_MODEL;
+		responseChange.fire();
+
+		assert.strictEqual(widget.isVisible.get(), true);
+		assert.strictEqual(widget.domNode.querySelector('.percentage-label')?.textContent, '50%');
+	});
+
 });

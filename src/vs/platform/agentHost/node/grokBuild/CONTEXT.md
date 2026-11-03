@@ -61,8 +61,37 @@ Connection is published only after handshake succeeds so concurrent
 Models: from `session/new`; `session/set_model { sessionId, modelId }` on
 create (when `options.model` is set) and `changeModel`. Success
 `_meta.model.Ok`; unknown id → `-32602` / data `"unknown model id"`.
+`IAgentModelInfo.maxContextWindow` comes from model `_meta.contextWindow`
+when set (non-default window, e.g. 500000), else `_meta.totalContextTokens`
+(default 256000).
 
-Usage field is `cachedReadTokens` (not `cachedTokens`).
+Usage: top-level prompt `_meta.inputTokens` / `outputTokens` /
+`cachedReadTokens` are the **last model call** (ChatUsage fields). Nested
+`_meta.usage` is the **turn sum** and is stored as
+`UsageInfo._meta.turnTokenTotals` (Codex shape). Field name is
+`cachedReadTokens` (not `cachedTokens`). Older grok that only sends `usage`
+falls back to those values for ChatUsage.
+
+Context bar (`chat.contextUsage.enabled`): every `session/update` and the
+prompt result carry `_meta.totalTokens` (grok's live context estimate; the
+same number its TUI uses). Non-zero values, plus compaction notifications
+from `_x.ai/session_notification` / replay `_x.ai/session/update` whose
+`update.sessionUpdate` is `auto_compact_completed` (`tokens_after`) or
+`auto_compact_started` (`tokens_used`), publish session
+`_meta['copilot.usageInfo'] = { currentTokens, tokenLimit, messagesLength }`
+merged with existing keys (looked up by `owner.toString()`). `totalTokens: 0`
+(transient after `/compact`) is ignored. `tokenLimit` is the current model's
+`maxContextWindow`, overridden by `model_changed.context_window_selection`
+when present and cleared when that field is omitted or on `changeModel`.
+Restored turns set `message.model` from the pinned `backing.model` or else
+`models.currentModelId` (`cliCurrentModelId`, not written into providerData).
+`providerData.contextTokens` persists the last gauge across restarts when
+the load replay under-reports. On restore, usage is returned on
+`getChatMetadata()._meta['copilot.usageInfo']` (session state does not exist
+yet, so `SessionMetaChanged` is not dispatched). During load replay, a
+single-call `_x.ai/session/update` `turn_completed` (`modelCalls === 1`)
+sets the gauge to `inputTokens + outputTokens`, preferred over under-reported
+`agent_message_chunk` `_meta.totalTokens`.
 
 Session updates that do not become chat actions: `available_commands_update`
 (slash skills, below), `config_option_update`, `session_info_update`,
@@ -131,7 +160,7 @@ Reject ends the prompt with `stopReason: "cancelled"`.
 | `authenticate` | **Implemented** | No-op `false` for unknown resources (CLI auth path) |
 | `getChatMetadata` | **Implemented** | Live backing, or providerData. `activation: 'restore'` attaches the runtime (including discovered/CLI sessions with no providerData, via `session/list` + `session/load`); a passive read does not. A missing session on restore is `AHP_SESSION_NOT_FOUND` with `grokSessionMissingError` (not a silent miss). |
 | `listChatsToMigrate` | **Implemented** | One unfiltered paginated `session/list`. `[]` when list is not advertised. `undefined` when the catalog cannot be read |
-| `recoverLegacyChat` | **Implemented** | Connects first (capabilities are empty before the handshake), then session id from the owner URI, cwd and title from `session/list`, then `session/load`. Provider data includes `models.currentModelId` from that load |
+| `recoverLegacyChat` | **Implemented** | Connects first (capabilities are empty before the handshake), then session id from the owner URI, cwd and title from `session/list`, then `session/load`. `models.currentModelId` is kept as in-memory `cliCurrentModelId` (not pinned into providerData.model) |
 | `setWorkingDirectory` | **Implemented** | Always rejects. grok cannot reload a session at a different cwd (`FS_NOT_FOUND`) |
 | `shutdown` / `dispose` | **Implemented** | Tears down ACP child |
 | All marketplace / canvas / MCP / sandbox / steering / truncate / plugin APIs | Stub | Omitted optional members |

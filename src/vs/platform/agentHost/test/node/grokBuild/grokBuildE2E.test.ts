@@ -32,6 +32,7 @@ import { SessionConfigKey } from '../../../common/sessionConfigKeys.js';
 import { GrokBuildAgent } from '../../../node/grokBuild/grokBuildAgent.js';
 import { GROK_BUILD_ACP_ARGV } from '../../../node/grokBuild/grokBuildLaunchConfig.js';
 import { IAgentConfigurationService } from '../../../node/agentConfigurationService.js';
+import type { AgentHostStateManager } from '../../../node/agentHostStateManager.js';
 
 const FAKE_ACP_AGENT = `#!/usr/bin/env node
 import { createInterface } from 'node:readline';
@@ -285,7 +286,8 @@ suite('Grok Build e2e', () => {
 			getChatConfigValues: options.getChatConfigValues ?? (() => undefined),
 			updateChatConfig: () => undefined,
 		} as unknown as IAgentConfigurationService;
-		const agent = store.add(new GrokBuildAgent(new NullLogService(), new TestProductService() as unknown as IProductService, configurationService));
+		const stateManager = { getSessionState: () => undefined } as unknown as AgentHostStateManager;
+		const agent = store.add(new GrokBuildAgent(new NullLogService(), new TestProductService() as unknown as IProductService, configurationService, stateManager));
 		agent.bindTestBinaryResolver(async () => ({ path: binaryPath, version: '1.0.70' }));
 		try {
 			return await run({ agent, home, root, reportPath });

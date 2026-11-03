@@ -23,6 +23,11 @@ export interface IGrokBuildPersistedChat {
 	 * `session/load` when grok's `currentValue` differs.
 	 */
 	readonly reasoningEffort?: string;
+	/**
+	 * Last non-zero context-window gauge (`_meta.totalTokens` / compaction).
+	 * Seeded on restore when the session/load replay under-reports tokens.
+	 */
+	readonly contextTokens?: number;
 }
 
 export function encodeGrokBuildChat(chat: IGrokBuildPersistedChat): string {
@@ -41,11 +46,17 @@ export function decodeGrokBuildChat(data: string | undefined): IGrokBuildPersist
 			const reasoningEffort = typeof parsed.reasoningEffort === 'string' && parsed.reasoningEffort.length > 0
 				? parsed.reasoningEffort
 				: typeof fromModel === 'string' && fromModel.length > 0 ? fromModel : undefined;
+			const contextTokens = typeof parsed.contextTokens === 'number'
+				&& Number.isFinite(parsed.contextTokens)
+				&& parsed.contextTokens > 0
+				? parsed.contextTokens
+				: undefined;
 			return {
 				sessionId: parsed.sessionId,
 				model: parsed.model,
 				cwd,
 				reasoningEffort,
+				contextTokens,
 			};
 		}
 	} catch {

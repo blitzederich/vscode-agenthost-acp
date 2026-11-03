@@ -3521,7 +3521,11 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 			}
 		}));
 
-		// Initial update
+		// Clear first so a session/model switch cannot keep the previous
+		// session's gauge when the new lastRequest is pending or has no usage.
+		// Same-session pending keep-old behaviour is handled inside update()
+		// after this initial call (subsequent addRequest updates do not clear).
+		this.contextUsageWidget.update(undefined);
 		this.contextUsageWidget.update(model.lastRequest);
 	}
 

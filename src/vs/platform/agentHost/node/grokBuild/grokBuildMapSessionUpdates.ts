@@ -728,16 +728,128 @@ export function mapPendingRequestCancelled(
 	}];
 }
 
-export function mapUsage(turnId: string, usage: AcpUsage | undefined): (SessionAction | ChatAction)[] {
-	if (!usage) {
-		return [];
+/**
+ * Prompt-result / update `_meta` for grok usage. Top-level
+ * `inputTokens` / `outputTokens` / `cachedReadTokens` are the **last model
+ * call**. Nested `usage` (when present) is the **turn sum** across every
+ * model call. Older grok builds may only send `usage`.
+ */
+export type GrokPromptUsageMeta = Record<string, unknown> & {
+	readonly inputTokens?: unknown;
+	readonly outputTokens?: unknown;
+	readonly cachedReadTokens?: unknown;
+	readonly totalTokens?: unknown;
+	readonly usage?: unknown;
+};
+
+export interface IGrokContextUsageInfo {
+	readonly currentTokens: number;
+	readonly tokenLimit: number;
+	readonly messagesLength: number;
+}
+
+/** Session `_meta` key read by {@link import('../../common/meta/copilotd/copilotdMetadataReader.js').readCopilotContextUsage}. */
+export const GROK_COPILOT_USAGE_INFO_KEY = 'copilot.usageInfo';
+
+function readFiniteNumber(value: unknown): number | undefined {
+	return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+/** Positive finite integer, used for context-window limits. */
+export function readGrokPositiveInt(value: unknown): number | undefined {
+	const n = readFiniteNumber(value);
+	return n !== undefined && Number.isInteger(n) && n > 0 ? n : undefined;
+}
+
+/** Non-negative finite integer token count (0 allowed). */
+function readTokenCount(value: unknown): number | undefined {
+	const n = readFiniteNumber(value);
+	return n !== undefined && Number.isInteger(n) && n >= 0 ? n : undefined;
+}
+
+/**
+ * Model context window: `_meta.contextWindow` when a non-default window is
+ * selected (e.g. 500000), else `_meta.totalContextTokens` (default 256000).
+ */
+export function readGrokMaxContextWindow(meta: Record<string, unknown> | undefined): number | undefined {
+	return readGrokPositiveInt(meta?.contextWindow) ?? readGrokPositiveInt(meta?.totalContextTokens);
+}
+
+/**
+ * Live context-size gauge from grok. `0` is ignored (transient after
+ * `/compact`); the next non-zero update restores the bar.
+ */
+export function readGrokTotalTokens(meta: Record<string, unknown> | undefined): number | undefined {
+	const n = readTokenCount(meta?.totalTokens);
+	return n === undefined || n === 0 ? undefined : n;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+	return value !== null && typeof value === 'object' && !Array.isArray(value)
+		? value as Record<string, unknown>
+		: undefined;
+}
+
+function readAcpUsage(value: unknown): AcpUsage | undefined {
+	const record = asRecord(value);
+	if (!record) {
+		return undefined;
 	}
-	const info: UsageInfo = {
-		inputTokens: typeof usage.inputTokens === 'number' ? usage.inputTokens : undefined,
-		outputTokens: typeof usage.outputTokens === 'number' ? usage.outputTokens : undefined,
-		cacheReadTokens: typeof usage.cachedReadTokens === 'number' ? usage.cachedReadTokens : undefined,
+	if (readTokenCount(record.inputTokens) === undefined
+		&& readTokenCount(record.outputTokens) === undefined
+		&& readTokenCount(record.cachedReadTokens) === undefined) {
+		return undefined;
+	}
+	return record as AcpUsage;
+}
+
+function turnTokenTotalsFromUsage(usage: AcpUsage | undefined, modelId: string | undefined): UsageInfo['_meta'] | undefined {
+	if (!usage || !modelId) {
+		return undefined;
+	}
+	const inputTokens = readTokenCount(usage.inputTokens) ?? 0;
+	const cachedTokens = readTokenCount(usage.cachedReadTokens) ?? 0;
+	const outputTokens = readTokenCount(usage.outputTokens) ?? 0;
+	return {
+		turnTokenTotals: [{ model: modelId, inputTokens, cachedTokens, outputTokens }],
 	};
-	if (info.inputTokens === undefined && info.outputTokens === undefined && info.cacheReadTokens === undefined) {
+}
+
+/**
+ * Maps grok prompt `_meta` to AHP {@link UsageInfo}. Prefer last-call
+ * top-level fields; keep turn sums in `_meta.turnTokenTotals` (Codex shape).
+ * Fall back to nested `usage` when top-level fields are absent.
+ */
+export function toGrokUsageInfo(meta: GrokPromptUsageMeta | undefined, modelId?: string): UsageInfo | undefined {
+	if (!meta) {
+		return undefined;
+	}
+	const turnUsage = readAcpUsage(meta.usage);
+	const inputTokens = readTokenCount(meta.inputTokens) ?? readTokenCount(turnUsage?.inputTokens);
+	const outputTokens = readTokenCount(meta.outputTokens) ?? readTokenCount(turnUsage?.outputTokens);
+	const cacheReadTokens = readTokenCount(meta.cachedReadTokens) ?? readTokenCount(turnUsage?.cachedReadTokens);
+	if (inputTokens === undefined && outputTokens === undefined && cacheReadTokens === undefined) {
+		return undefined;
+	}
+	const turnMeta = turnTokenTotalsFromUsage(turnUsage, modelId);
+	return {
+		inputTokens,
+		outputTokens,
+		cacheReadTokens,
+		...(modelId ? { model: modelId } : {}),
+		...(turnMeta ? { _meta: turnMeta } : {}),
+	};
+}
+
+/**
+ * Build a {@link ActionType.ChatUsage} action from grok prompt `_meta`.
+ * Prefer last-call top-level fields; nested `usage` becomes turn totals when
+ * `modelId` is known. A bare {@link AcpUsage} (older fixtures / grok) is
+ * treated as last-call fallback.
+ */
+export function mapUsage(turnId: string, meta: GrokPromptUsageMeta | AcpUsage | undefined, modelId?: string): (SessionAction | ChatAction)[] {
+	const info = toGrokUsageInfo(asRecord(meta) as GrokPromptUsageMeta | undefined, modelId);
+	if (!info) {
 		return [];
 	}
 	return [{
@@ -745,6 +857,93 @@ export function mapUsage(turnId: string, usage: AcpUsage | undefined): (SessionA
 		turnId,
 		usage: info,
 	}];
+}
+
+/** Merge `copilot.usageInfo` into session `_meta` without dropping other keys. */
+export function withGrokContextUsage(meta: Record<string, unknown> | undefined, usage: IGrokContextUsageInfo): Record<string, unknown> {
+	return { ...meta, [GROK_COPILOT_USAGE_INFO_KEY]: usage };
+}
+
+/**
+ * Wire envelope for `_x.ai/session_notification` / replay `_x.ai/session/update`:
+ * `{ sessionId, update: { sessionUpdate: "...", ... } }` where `sessionUpdate`
+ * is the serde discriminator (tag = "sessionUpdate").
+ */
+function readGrokExtensionUpdate(params: unknown): Record<string, unknown> | undefined {
+	const outer = asRecord(params);
+	if (!outer) {
+		return undefined;
+	}
+	return asRecord(outer.update);
+}
+
+/**
+ * Current-context tokens from grok compaction notifications.
+ * Real shapes:
+ * - `update.sessionUpdate === "auto_compact_completed"` → `tokens_after`
+ *   (`tokens_before` is Option and may be absent on older shells)
+ * - `update.sessionUpdate === "auto_compact_started"` → `tokens_used`
+ * Do not read `context_window` from started events as a session override.
+ */
+export function readGrokCompactionCurrentTokens(params: unknown): number | undefined {
+	const update = readGrokExtensionUpdate(params);
+	if (!update) {
+		return undefined;
+	}
+	const kind = update.sessionUpdate;
+	if (kind === 'auto_compact_completed') {
+		return readTokenCount(update.tokens_after);
+	}
+	if (kind === 'auto_compact_started') {
+		const used = readTokenCount(update.tokens_used);
+		return used !== undefined && used > 0 ? used : undefined;
+	}
+	return undefined;
+}
+
+/**
+ * Context-gauge tokens from a single-call `turn_completed` extension update.
+ * `usage.inputTokens + usage.outputTokens` when `modelCalls === 1`. Multi-call
+ * turns (`modelCalls !== 1`) are ignored — their input is a turn sum.
+ * Accepts either the full `{ update }` envelope or the inner update object.
+ */
+export function readGrokTurnCompletedSingleCallTokens(paramsOrUpdate: unknown): number | undefined {
+	const update = readGrokExtensionUpdate(paramsOrUpdate) ?? asRecord(paramsOrUpdate);
+	if (!update || update.sessionUpdate !== 'turn_completed') {
+		return undefined;
+	}
+	const usage = asRecord(update.usage);
+	if (!usage) {
+		return undefined;
+	}
+	if (usage.modelCalls !== 1) {
+		return undefined;
+	}
+	const input = readTokenCount(usage.inputTokens);
+	const output = readTokenCount(usage.outputTokens);
+	if (input === undefined || output === undefined) {
+		return undefined;
+	}
+	return input + output;
+}
+
+/**
+ * `model_changed` window selection from the extension notification update.
+ * Returns `undefined` when the notification is not `model_changed`.
+ * `selection` is the chosen window, or `undefined` when the field is omitted /
+ * null (model default — callers must clear any override).
+ */
+export function readGrokModelChangedContextWindow(params: unknown): { readonly selection: number | undefined } | undefined {
+	const update = readGrokExtensionUpdate(params);
+	if (!update || update.sessionUpdate !== 'model_changed') {
+		return undefined;
+	}
+	const raw = update.context_window_selection;
+	// Absent / null / undefined → model default (caller clears override).
+	if (raw === null || raw === undefined) {
+		return { selection: undefined };
+	}
+	return { selection: readGrokPositiveInt(raw) };
 }
 
 export function mapTurnCompleted(turnId: string, stopReason: AcpStopReason | undefined, duration = 0): (SessionAction | ChatAction)[] {

@@ -308,9 +308,15 @@ export class ChatContextUsageWidget extends Disposable {
 		}
 
 		if (!lastRequest.response || !lastRequest.modelId) {
-			// Pending request keep old data visible if available
+			// Pending request: keep old data visible if available. Subscribe so
+			// a later modelId / usage on this response re-enters update().
 			if (!this._currentData.get()) {
 				this.hide();
+			}
+			if (lastRequest.response) {
+				this._lastRequestDisposable.value = lastRequest.response.onDidChange(() => {
+					this.update(lastRequest);
+				});
 			}
 			return;
 		}
