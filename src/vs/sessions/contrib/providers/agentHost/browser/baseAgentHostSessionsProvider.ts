@@ -33,7 +33,7 @@ import { readSessionArtifacts } from '../../../../../platform/agentHost/common/s
 import { fromAgentHostUri, type AgentHostUriMapper } from '../../../../../platform/agentHost/common/agentHostUri.js';
 import type { IAgentHostManagedWorktree } from '../../../../../platform/agentHost/common/agentHostWorktreeCleanup.js';
 import { Schemas } from '../../../../../base/common/network.js';
-import { isCopilotAgentHostProvider } from '../../../../../platform/agentHost/common/agentHostSessionType.js';
+import { GrokBuildAgentHostIcon, isCopilotAgentHostProvider, isGrokBuildAgentHostProvider } from '../../../../../platform/agentHost/common/agentHostSessionType.js';
 import type { RemoteAgentHostConnectionStatus } from '../../../../../platform/agentHost/common/remoteAgentHostService.js';
 import { AgentHostTransportFailureReason } from '../../../../../platform/agentHost/common/state/sessionTransport.js';
 import { supportsAgentHostArtifactRemoval, supportsAgentHostCreateChatWorkspace } from '../../../../../platform/agentHost/common/agentHostExtensionProtocol.js';
@@ -5304,6 +5304,10 @@ export abstract class BaseAgentHostSessionsProvider extends Disposable implement
 
 		if (provider === 'openai' || provider.includes('codex')) {
 			return Codicon.openai;
+		}
+
+		if (isGrokBuildAgentHostProvider(provider)) {
+			return GrokBuildAgentHostIcon;
 		}
 
 		return undefined;

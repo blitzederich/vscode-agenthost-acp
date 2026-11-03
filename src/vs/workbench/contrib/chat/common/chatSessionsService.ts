@@ -435,6 +435,7 @@ export namespace SessionType {
 	export const AgentHostCopilot = 'agent-host-copilotcli';
 	export const AgentHostClaude = 'agent-host-claude';
 	export const AgentHostCodex = 'agent-host-codex';
+	export const AgentHostGrokBuild = 'agent-host-grokBuild';
 }
 
 /**

@@ -4,8 +4,9 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
+import { Codicon } from '../../../../base/common/codicons.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
-import { findRemoteAgentHostSessionTypeAuthority, isCopilotAgentHostProvider, isCopilotAgentHostSessionType, isRemoteAgentHostSessionType, parseAgentHostHarness, parseRemoteAgentHostHarness, parseRemoteAgentHostSessionTypeAuthority, remoteAgentHostSessionTypeAuthorityPrefix, remoteAgentHostSessionTypeId } from '../../common/agentHostSessionType.js';
+import { findRemoteAgentHostSessionTypeAuthority, GrokBuildAgentHostIcon, isCopilotAgentHostProvider, isCopilotAgentHostSessionType, isGrokBuildAgentHostProvider, isRemoteAgentHostSessionType, parseAgentHostHarness, parseRemoteAgentHostHarness, parseRemoteAgentHostSessionTypeAuthority, remoteAgentHostSessionTypeAuthorityPrefix, remoteAgentHostSessionTypeId } from '../../common/agentHostSessionType.js';
 
 suite('agentHostSessionType', () => {
 	ensureNoDisposablesAreLeakedInTestSuite();
@@ -14,6 +15,14 @@ suite('agentHostSessionType', () => {
 		assert.deepStrictEqual(
 			['copilotcli', 'copilot', 'claude', 'codex', 'copilotcloud', undefined].map(isCopilotAgentHostProvider),
 			[true, true, false, false, false, false],
+		);
+	});
+
+	test('recognizes the Grok Build provider id exactly and shares Codicon.xai', () => {
+		assert.strictEqual(GrokBuildAgentHostIcon.id, Codicon.xai.id);
+		assert.deepStrictEqual(
+			['grokBuild', 'claude', 'not-grokBuild-extra', 'grokBuildish', ''].map(isGrokBuildAgentHostProvider),
+			[true, false, false, false, false],
 		);
 	});
 

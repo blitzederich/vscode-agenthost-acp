@@ -3,10 +3,24 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { type AgentProvider } from './agent.js';
+import { Codicon } from '../../../base/common/codicons.js';
+import { ThemeIcon } from '../../../base/common/themables.js';
+import { GROK_BUILD_AGENT_PROVIDER_ID, type AgentProvider } from './agent.js';
 
 const LOCAL_AGENT_HOST_SESSION_TYPE_PREFIX = 'agent-host-';
 const REMOTE_AGENT_HOST_SESSION_TYPE_PREFIX = 'remote-';
+
+/**
+ * Shared icon for the Grok Build agent-host harness / session type.
+ * Use this wherever the harness itself is represented (session list, picker,
+ * harness presentation). Per-model xAI icons stay independent.
+ */
+export const GrokBuildAgentHostIcon: ThemeIcon = Codicon.xai;
+
+/** Identifies the Grok Build agent-host provider id exactly (not a substring match). */
+export function isGrokBuildAgentHostProvider(provider: string): boolean {
+	return provider === GROK_BUILD_AGENT_PROVIDER_ID;
+}
 
 /** Identifies the Copilot agent family without changing the host's provider ID or implying runtime capabilities. */
 export function isCopilotAgentHostProvider(provider: AgentProvider | undefined): boolean {
