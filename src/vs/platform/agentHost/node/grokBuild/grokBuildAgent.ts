@@ -96,10 +96,12 @@ import {
 	mapTurnCompleted,
 	mapTurnStarted,
 	mapUsage,
+	GROK_COPILOT_USAGE_INFO_KEY,
 	readGrokCompactionCurrentTokens,
 	readGrokMaxContextWindow,
 	readGrokModelChangedContextWindow,
 	readGrokTotalTokens,
+	readGrokTurnCompletedSingleCallTokens,
 	selectPermissionOptionId,
 	toGrokUsageInfo,
 	withGrokContextUsage,
@@ -371,6 +373,13 @@ interface IGrokBuildChatBacking {
 	 * pinned `backing.model` (and must not be written into providerData).
 	 */
 	cliCurrentModelId?: string;
+	/**
+	 * During `session/load` replay: after a single-call `turn_completed` (or
+	 * compaction), ignore further `agent_message_chunk` totalTokens until the
+	 * next `user_message_chunk` so a late/under-reported chunk cannot clobber
+	 * the better gauge for the same turn.
+	 */
+	replaySuppressChunkTotals?: boolean;
 }
 
 interface IPendingPermission {
@@ -959,14 +968,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			if (options?.activation === 'restore') {
 				await this._ensureSessionAttached(backing);
 			}
-			return {
-				chat,
-				startTime: backing.startTime,
-				modifiedTime: backing.modifiedTime,
-				summary: backing.summary,
-				model: modelForTurnRecords(backing),
-				workingDirectories: backing.workingDirectories,
-			};
+			return this._metadataFromBacking(backing);
 		} catch (err) {
 			// ProtocolError so AgentService does not treat a registered external
 			// session's authoritative absence as a transient "not ready" miss.
@@ -1038,6 +1040,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			contextWindowOverride: sameSession ? existing?.contextWindowOverride : undefined,
 			publishedContextUsage: sameSession ? existing?.publishedContextUsage : undefined,
 			cliCurrentModelId: sameSession ? existing?.cliCurrentModelId : undefined,
+			replaySuppressChunkTotals: sameSession ? existing?.replaySuppressChunkTotals : undefined,
 		};
 		this._backings.set(chatKey(chat), backing);
 		this._sessionToChat.set(persisted.sessionId, chat);
@@ -1407,6 +1410,28 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		return true;
 	}
 
+	/**
+	 * During load replay, apply chunk `_meta.totalTokens` unless a better
+	 * same-turn `turn_completed` / compaction gauge already locked chunks out.
+	 */
+	private _noteReplayChunkTotalTokens(backing: IGrokBuildChatBacking, meta: Record<string, unknown> | undefined): boolean {
+		if (backing.replaySuppressChunkTotals) {
+			return false;
+		}
+		return this._noteTotalTokens(backing, meta);
+	}
+
+	/** Single-call `turn_completed` gauge during load replay (multi-call ignored). */
+	private _noteReplayTurnCompletedTokens(backing: IGrokBuildChatBacking, update: unknown): boolean {
+		const total = readGrokTurnCompletedSingleCallTokens(update);
+		if (total === undefined || total === backing.lastTotalTokens) {
+			return false;
+		}
+		backing.lastTotalTokens = total;
+		backing.replaySuppressChunkTotals = true;
+		return true;
+	}
+
 	private _tokenLimitFor(backing: IGrokBuildChatBacking): number | undefined {
 		if (backing.contextWindowOverride !== undefined) {
 			return backing.contextWindowOverride;
@@ -1417,32 +1442,57 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		return match?.maxContextWindow ?? models.find(model => model.maxContextWindow !== undefined)?.maxContextWindow;
 	}
 
+	private _contextUsageFor(backing: IGrokBuildChatBacking): IGrokContextUsageInfo | undefined {
+		const tokenLimit = this._tokenLimitFor(backing);
+		const currentTokens = backing.lastTotalTokens;
+		if (tokenLimit === undefined || currentTokens === undefined) {
+			return undefined;
+		}
+		return {
+			currentTokens,
+			tokenLimit,
+			messagesLength: backing.turns.length,
+		};
+	}
+
+	private _metadataFromBacking(backing: IGrokBuildChatBacking): IAgentChatMetadata {
+		const usage = this._contextUsageFor(backing);
+		return {
+			chat: backing.chat,
+			startTime: backing.startTime,
+			modifiedTime: backing.modifiedTime,
+			summary: backing.summary,
+			model: modelForTurnRecords(backing),
+			workingDirectories: backing.workingDirectories,
+			...(usage ? { _meta: { [GROK_COPILOT_USAGE_INFO_KEY]: usage } } : {}),
+		};
+	}
+
 	/**
 	 * Publishes `_meta['copilot.usageInfo']` for the chat context bar.
 	 * Merges with existing session `_meta` keys. No-ops when tokenLimit is
-	 * unknown, currentTokens is unset, or the payload is unchanged.
+	 * unknown, currentTokens is unset, the payload is unchanged, or the host
+	 * session state does not exist yet (restore publishes via getChatMetadata
+	 * `_meta` instead — recording publishedContextUsage here would stick dedupe).
 	 */
 	private _publishContextUsage(backing: IGrokBuildChatBacking): void {
 		const owner = backing.ownerRef?.get();
 		if (!owner) {
 			return;
 		}
-		const tokenLimit = this._tokenLimitFor(backing);
-		const currentTokens = backing.lastTotalTokens;
-		if (tokenLimit === undefined || currentTokens === undefined) {
+		const usage = this._contextUsageFor(backing);
+		if (!usage) {
 			return;
 		}
-		const usage: IGrokContextUsageInfo = {
-			currentTokens,
-			tokenLimit,
-			messagesLength: backing.turns.length,
-		};
 		if (equals(backing.publishedContextUsage, usage)) {
 			return;
 		}
 		// Protocol URI keys are strings; a URI object never hits the session map.
-		const existing = this._stateManager.getSessionState(owner.toString())?._meta;
-		const nextMeta = withGrokContextUsage(existing, usage);
+		const existingState = this._stateManager.getSessionState(owner.toString());
+		if (!existingState) {
+			return;
+		}
+		const nextMeta = withGrokContextUsage(existingState._meta, usage);
 		backing.publishedContextUsage = usage;
 		this._onDidChatProgress.fire({
 			kind: 'action',
@@ -1847,7 +1897,10 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 				}
 				await this._reapplyReasoningEffort(client, backing);
 				backing.modifiedTime = Date.now();
-				// Prefer last replayed totalTokens; otherwise the persisted contextTokens seed.
+				backing.replaySuppressChunkTotals = undefined;
+				// Prefer last replayed gauge (turn_completed / chunk / compaction);
+				// otherwise the persisted contextTokens seed. No-ops when the host
+				// session state is not created yet — usage rides on getChatMetadata._meta.
 				this._publishContextUsage(backing);
 			} catch (err) {
 				if (isGrokFsNotFound(err)) {
@@ -2259,8 +2312,12 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			const replayChat = this._sessionToChat.get(params.sessionId);
 			const replayBacking = replayChat ? this._backings.get(chatKey(replayChat)) : undefined;
 			if (replayBacking) {
-				this._noteTotalTokens(replayBacking, params.update?._meta);
-				this._noteTotalTokens(replayBacking, params._meta);
+				if (params.update?.sessionUpdate === 'user_message_chunk') {
+					replayBacking.replaySuppressChunkTotals = false;
+				}
+				this._noteReplayTurnCompletedTokens(replayBacking, params.update);
+				this._noteReplayChunkTotalTokens(replayBacking, params.update?._meta);
+				this._noteReplayChunkTotalTokens(replayBacking, params._meta);
 			}
 			return;
 		}
@@ -2316,6 +2373,19 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		const chat = this._sessionToChat.get(sessionId);
 		const backing = chat ? this._backings.get(chatKey(chat)) : undefined;
 		if (!backing) {
+			return;
+		}
+		const replaying = this._historyReplays.has(sessionId);
+		if (replaying) {
+			// Load replay: prefer single-call turn_completed over chunk totalTokens.
+			// Publish happens via getChatMetadata._meta after load (session state
+			// does not exist yet).
+			this._noteReplayTurnCompletedTokens(backing, params);
+			const compactionTokens = readGrokCompactionCurrentTokens(params);
+			if (compactionTokens !== undefined) {
+				backing.lastTotalTokens = compactionTokens;
+				backing.replaySuppressChunkTotals = true;
+			}
 			return;
 		}
 		const compactionTokens = readGrokCompactionCurrentTokens(params);

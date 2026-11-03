@@ -86,7 +86,12 @@ when present and cleared when that field is omitted or on `changeModel`.
 Restored turns set `message.model` from the pinned `backing.model` or else
 `models.currentModelId` (`cliCurrentModelId`, not written into providerData).
 `providerData.contextTokens` persists the last gauge across restarts when
-the load replay under-reports.
+the load replay under-reports. On restore, usage is returned on
+`getChatMetadata()._meta['copilot.usageInfo']` (session state does not exist
+yet, so `SessionMetaChanged` is not dispatched). During load replay, a
+single-call `_x.ai/session/update` `turn_completed` (`modelCalls === 1`)
+sets the gauge to `inputTokens + outputTokens`, preferred over under-reported
+`agent_message_chunk` `_meta.totalTokens`.
 
 Session updates that do not become chat actions: `available_commands_update`
 (slash skills, below), `config_option_update`, `session_info_update`,

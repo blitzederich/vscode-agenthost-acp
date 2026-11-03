@@ -25,6 +25,7 @@ import {
 } from '../../../node/grokBuild/acpClient.js';
 import { decodeGrokBuildChat, encodeGrokBuildChat } from '../../../node/grokBuild/grokBuildChatBacking.js';
 import { GrokBuildAgent, mergeRestoredTurns } from '../../../node/grokBuild/grokBuildAgent.js';
+import { GROK_COPILOT_USAGE_INFO_KEY } from '../../../node/grokBuild/grokBuildMapSessionUpdates.js';
 import { GROK_PERMISSION_PRESET_ALLOW_EDITS, GROK_PERMISSION_PRESET_ASK, GROK_PERMISSION_PRESET_KEY, GROK_THINKING_LEVEL_KEY, grokPathPrefixRejectedError, grokPlanModeFailedError, grokSlashCommandRejectedError, grokSlashCommandsUnavailableError } from '../../../node/grokBuild/grokBuildUx.js';
 import { IAgentConfigurationService, type IAgentChatConfigurationChangeEvent, type IAgentChatConfigurationTarget } from '../../../node/agentConfigurationService.js';
 import type { AgentHostStateManager } from '../../../node/agentHostStateManager.js';
@@ -303,6 +304,7 @@ suite('GrokBuildAgent', () => {
 		readonly updateChatConfig?: (target: IAgentChatConfigurationTarget, patch: Record<string, unknown>) => void;
 		readonly configPatches?: Array<{ target: IAgentChatConfigurationTarget; patch: Record<string, unknown> }>;
 		readonly sessionMeta?: Record<string, unknown>;
+		readonly getSessionMeta?: () => Record<string, unknown> | undefined;
 		readonly onGetSessionState?: (key: unknown) => void;
 	}): GrokBuildAgent {
 		const configurationService = {
@@ -315,9 +317,8 @@ suite('GrokBuildAgent', () => {
 		const stateManager = {
 			getSessionState: (key: unknown) => {
 				configuration?.onGetSessionState?.(key);
-				return configuration?.sessionMeta !== undefined
-					? { _meta: configuration.sessionMeta }
-					: undefined;
+				const meta = configuration?.getSessionMeta?.() ?? configuration?.sessionMeta;
+				return meta !== undefined ? { _meta: meta } : undefined;
 			},
 		} as unknown as AgentHostStateManager;
 		return store.add(new GrokBuildAgent(log, new TestProductService() as unknown as IProductService, configurationService, stateManager));
@@ -539,7 +540,238 @@ suite('GrokBuildAgent', () => {
 		});
 	});
 
-	test('session/load restore sets message.model from currentModelId and publishes usage before metadata resolves', async () => {
+	test('restore without session state returns usage in metadata._meta; prefers turn_completed over chunk totalTokens', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		// Host session state does not exist yet during getChatMetadata(restore).
+		const agent = createAgent();
+		agent.bindTestClient(client, LIVE_CAPABILITIES);
+		const signals: AgentSignal[] = [];
+		store.add(agent.onDidChatProgress(s => signals.push(s)));
+
+		const sessionId = 'sess-cli-restore-usage';
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: `/chat/${sessionId}` });
+		const context = chatContextForSession(chat, sessionId);
+		const restoring = agent.getChatMetadata(chat, context, undefined, { activation: 'restore' });
+		const list = await readNextMessage(peer.outbound);
+		assert.strictEqual(list.method, 'session/list');
+		peer.push({
+			jsonrpc: '2.0',
+			id: list.id,
+			result: {
+				sessions: [{ sessionId, cwd: '/tmp/cli', title: 'CLI', updatedAt: '2026-03-01T00:00:00.000Z' }],
+			},
+		});
+		const load = await readNextMessage(peer.outbound);
+		assert.strictEqual(load.method, 'session/load');
+
+		pushUpdate(peer, sessionId, {
+			sessionUpdate: 'user_message_chunk',
+			content: { type: 'text', text: 'hi' },
+			_meta: { promptIndex: 0 },
+		});
+		pushUpdate(peer, sessionId, {
+			sessionUpdate: 'agent_message_chunk',
+			content: { type: 'text', text: 'yo' },
+			_meta: { promptIndex: 0, totalTokens: 1935 },
+		});
+		peer.push({
+			jsonrpc: '2.0',
+			method: '_x.ai/session/update',
+			params: {
+				sessionId,
+				update: {
+					sessionUpdate: 'turn_completed',
+					usage: { inputTokens: 20598, outputTokens: 32, modelCalls: 1 },
+				},
+			},
+		});
+		peer.push({
+			jsonrpc: '2.0',
+			id: load.id,
+			result: {
+				models: {
+					currentModelId: 'grok-4.7',
+					availableModels: [{ modelId: 'grok-4.7', name: 'Grok 4.7', _meta: { totalContextTokens: 256000 } }],
+				},
+				configOptions: [],
+			},
+		});
+		const metadata = await restoring;
+
+		assert.strictEqual(
+			signals.some(s => s.kind === 'action' && s.action.type === ActionType.SessionMetaChanged),
+			false,
+			'SessionMetaChanged must not fire before the host creates session state',
+		);
+		assert.deepStrictEqual(metadata?._meta?.[GROK_COPILOT_USAGE_INFO_KEY], {
+			currentTokens: 20630,
+			tokenLimit: 256000,
+			messagesLength: 1,
+		});
+		assert.strictEqual((await agent.chats.getMessages(chat, context)).at(-1)?.message.model?.id, 'grok-4.7');
+	});
+
+	test('after restore, live totalTokens publishes once session state exists (dedupe not stuck)', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const sessionMetaHolder: { meta: Record<string, unknown> | undefined } = { meta: undefined };
+		const agent = createAgent(new NullLogService(), {
+			getSessionMeta: () => sessionMetaHolder.meta,
+		});
+		agent.bindTestClient(client, LIVE_CAPABILITIES);
+		const signals: AgentSignal[] = [];
+		store.add(agent.onDidChatProgress(s => signals.push(s)));
+
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/restore-then-live' });
+		const context = chatContext(chat);
+		const providerData = encodeGrokBuildChat({ sessionId: 'sess-restore-live', cwd: '/tmp/proj' });
+		const restoring = agent.getChatMetadata(chat, context, providerData, { activation: 'restore' });
+		const load = await readNextMessage(peer.outbound);
+		pushUpdate(peer, 'sess-restore-live', {
+			sessionUpdate: 'user_message_chunk',
+			content: { type: 'text', text: 'a' },
+			_meta: { promptIndex: 0 },
+		});
+		pushUpdate(peer, 'sess-restore-live', {
+			sessionUpdate: 'agent_message_chunk',
+			content: { type: 'text', text: 'b' },
+			_meta: { promptIndex: 0, totalTokens: 1935 },
+		});
+		peer.push({
+			jsonrpc: '2.0',
+			method: '_x.ai/session/update',
+			params: {
+				sessionId: 'sess-restore-live',
+				update: {
+					sessionUpdate: 'turn_completed',
+					usage: { inputTokens: 20598, outputTokens: 32, modelCalls: 1 },
+				},
+			},
+		});
+		peer.push({
+			jsonrpc: '2.0',
+			id: load.id,
+			result: {
+				models: {
+					currentModelId: 'grok-4.7',
+					availableModels: [{ modelId: 'grok-4.7', name: 'Grok 4.7', _meta: { totalContextTokens: 256000 } }],
+				},
+				configOptions: [],
+			},
+		});
+		await answerSessionList(peer);
+		const metadata = await restoring;
+		assert.deepStrictEqual(metadata?._meta?.[GROK_COPILOT_USAGE_INFO_KEY], {
+			currentTokens: 20630,
+			tokenLimit: 256000,
+			messagesLength: 1,
+		});
+		assert.strictEqual(signals.filter(s => s.kind === 'action' && s.action.type === ActionType.SessionMetaChanged).length, 0);
+
+		// Host creates the session and applies metadata._meta.
+		sessionMetaHolder.meta = { ...(metadata?._meta ?? {}) };
+		const published = Event.toPromise(Event.filter(agent.onDidChatProgress, s =>
+			s.kind === 'action' && s.action.type === ActionType.SessionMetaChanged));
+		pushUpdate(peer, 'sess-restore-live', {
+			sessionUpdate: 'agent_message_chunk',
+			content: { type: 'text', text: '!' },
+			_meta: { totalTokens: 21000 },
+		});
+		await published;
+		const liveMeta = signals.filter(s => s.kind === 'action' && s.action.type === ActionType.SessionMetaChanged).at(-1);
+		assert.ok(liveMeta && liveMeta.kind === 'action' && liveMeta.action.type === ActionType.SessionMetaChanged);
+		assert.deepStrictEqual(liveMeta.action._meta?.[GROK_COPILOT_USAGE_INFO_KEY], {
+			currentTokens: 21000,
+			tokenLimit: 256000,
+			messagesLength: 1,
+		});
+	});
+
+	test('restore with contextTokens and empty replay seeds metadata usage from providerData', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client, LIVE_CAPABILITIES);
+
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/seed-context' });
+		const context = chatContext(chat);
+		const providerData = encodeGrokBuildChat({ sessionId: 'sess-seed', cwd: '/tmp/proj', contextTokens: 21866 });
+		const restoring = agent.getChatMetadata(chat, context, providerData, { activation: 'restore' });
+		const load = await readNextMessage(peer.outbound);
+		peer.push({
+			jsonrpc: '2.0',
+			id: load.id,
+			result: {
+				models: {
+					currentModelId: 'grok-4.7',
+					availableModels: [{ modelId: 'grok-4.7', name: 'Grok 4.7', _meta: { totalContextTokens: 256000 } }],
+				},
+				configOptions: [],
+			},
+		});
+		await answerSessionList(peer);
+		const metadata = await restoring;
+		assert.deepStrictEqual(metadata?._meta?.[GROK_COPILOT_USAGE_INFO_KEY], {
+			currentTokens: 21866,
+			tokenLimit: 256000,
+			messagesLength: 0,
+		});
+	});
+
+	test('replay turn_completed with modelCalls > 1 does not override chunk totalTokens', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client, LIVE_CAPABILITIES);
+
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/multi-call' });
+		const context = chatContext(chat);
+		const providerData = encodeGrokBuildChat({ sessionId: 'sess-multi', cwd: '/tmp/proj' });
+		const restoring = agent.getChatMetadata(chat, context, providerData, { activation: 'restore' });
+		const load = await readNextMessage(peer.outbound);
+		pushUpdate(peer, 'sess-multi', {
+			sessionUpdate: 'user_message_chunk',
+			content: { type: 'text', text: 'hi' },
+			_meta: { promptIndex: 0 },
+		});
+		pushUpdate(peer, 'sess-multi', {
+			sessionUpdate: 'agent_message_chunk',
+			content: { type: 'text', text: 'yo' },
+			_meta: { promptIndex: 0, totalTokens: 14581 },
+		});
+		peer.push({
+			jsonrpc: '2.0',
+			method: '_x.ai/session/update',
+			params: {
+				sessionId: 'sess-multi',
+				update: {
+					sessionUpdate: 'turn_completed',
+					usage: { inputTokens: 131894, outputTokens: 331, modelCalls: 5 },
+				},
+			},
+		});
+		peer.push({
+			jsonrpc: '2.0',
+			id: load.id,
+			result: {
+				models: {
+					currentModelId: 'grok-4.7',
+					availableModels: [{ modelId: 'grok-4.7', name: 'Grok 4.7', _meta: { totalContextTokens: 256000 } }],
+				},
+				configOptions: [],
+			},
+		});
+		await answerSessionList(peer);
+		const metadata = await restoring;
+		assert.deepStrictEqual(metadata?._meta?.[GROK_COPILOT_USAGE_INFO_KEY], {
+			currentTokens: 14581,
+			tokenLimit: 256000,
+			messagesLength: 1,
+		});
+	});
+
+	test('session/load restore sets message.model from currentModelId without session state', async () => {
 		const peer = store.add(makeFakePeer());
 		const client = store.add(new AcpClient(peer.transport));
 		const agent = createAgent();
@@ -579,11 +811,11 @@ suite('GrokBuildAgent', () => {
 		await answerSessionList(peer);
 		const metadata = await restoring;
 
-		const metaBeforeResolve = signals.filter(s => s.kind === 'action' && s.action.type === ActionType.SessionMetaChanged);
-		assert.ok(metaBeforeResolve.length >= 1);
-		const usageMeta = metaBeforeResolve.at(-1);
-		assert.ok(usageMeta && usageMeta.kind === 'action' && usageMeta.action.type === ActionType.SessionMetaChanged);
-		assert.deepStrictEqual(usageMeta.action._meta?.['copilot.usageInfo'], {
+		assert.strictEqual(
+			signals.some(s => s.kind === 'action' && s.action.type === ActionType.SessionMetaChanged),
+			false,
+		);
+		assert.deepStrictEqual(metadata?._meta?.[GROK_COPILOT_USAGE_INFO_KEY], {
 			currentTokens: 14581,
 			tokenLimit: 256000,
 			messagesLength: 1,

@@ -902,6 +902,32 @@ export function readGrokCompactionCurrentTokens(params: unknown): number | undef
 }
 
 /**
+ * Context-gauge tokens from a single-call `turn_completed` extension update.
+ * `usage.inputTokens + usage.outputTokens` when `modelCalls === 1`. Multi-call
+ * turns (`modelCalls !== 1`) are ignored — their input is a turn sum.
+ * Accepts either the full `{ update }` envelope or the inner update object.
+ */
+export function readGrokTurnCompletedSingleCallTokens(paramsOrUpdate: unknown): number | undefined {
+	const update = readGrokExtensionUpdate(paramsOrUpdate) ?? asRecord(paramsOrUpdate);
+	if (!update || update.sessionUpdate !== 'turn_completed') {
+		return undefined;
+	}
+	const usage = asRecord(update.usage);
+	if (!usage) {
+		return undefined;
+	}
+	if (usage.modelCalls !== 1) {
+		return undefined;
+	}
+	const input = readTokenCount(usage.inputTokens);
+	const output = readTokenCount(usage.outputTokens);
+	if (input === undefined || output === undefined) {
+		return undefined;
+	}
+	return input + output;
+}
+
+/**
  * `model_changed` window selection from the extension notification update.
  * Returns `undefined` when the notification is not `model_changed`.
  * `selection` is the chosen window, or `undefined` when the field is omitted /
