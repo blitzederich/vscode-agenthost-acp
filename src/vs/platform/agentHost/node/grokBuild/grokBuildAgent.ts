@@ -104,6 +104,7 @@ import {
 	readGrokCompactionCurrentTokens,
 	readGrokMaxContextWindow,
 	readGrokModelChangedContextWindow,
+	readGrokPositiveInt,
 	readGrokTotalTokens,
 	readGrokTurnCompletedSingleCallTokens,
 	selectPermissionOptionId,
@@ -131,6 +132,7 @@ import {
 	GROK_REASONING_CONFIG_ID,
 	rejectedGrokSlashCommand,
 	modeIdForSessionMode,
+	modelWithContextSize,
 	modelWithThinkingLevel,
 	readAvailableCommands,
 	readPermissionPreset,
@@ -366,8 +368,10 @@ interface IGrokBuildChatBacking {
 	 */
 	lastTotalTokens?: number;
 	/**
-	 * Window selected via `model_changed.context_window_selection`.
-	 * Cleared when that field is omitted/null or on `changeModel`.
+	 * Non-default window for this chat (usage `tokenLimit`). Set from
+	 * `changeModel`, `model_changed.context_window_selection`, or
+	 * `session/load` `_meta.contextWindow`. Cleared when the selection is
+	 * the model default. Never written into the shared `_models` list.
 	 */
 	contextWindowOverride?: number;
 	/** Last published `copilot.usageInfo` (dedupe). */
@@ -1457,10 +1461,12 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 
 	/**
 	 * Resolve the context-window size to send on `session/set_model`.
-	 * Unsupported sizes are ignored (preserve current). Default size omits
-	 * `_meta` so grok returns to its default (256k). Unchanged selections
-	 * still include `_meta` when non-default so a later `set_model` does not
-	 * reset the window.
+	 * Unsupported sizes are ignored (preserve current). When the model
+	 * offers more than one window and the effective size is one of them,
+	 * always send `_meta.contextWindow` — including the default 256k.
+	 * Omitting `_meta` preserves grok's current window (`Preserve`), so a
+	 * switch from 500k → 256k or onto another multi-window model must send
+	 * the target size explicitly.
 	 */
 	private _resolveContextWindowForSetModel(
 		model: ModelSelection | undefined,
@@ -1485,24 +1491,32 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			const current = currentOverride ?? defaultSize ?? modelInfo?.maxContextWindow;
 			return {
 				effective: current,
-				meta: current !== undefined && defaultSize !== undefined && current !== defaultSize
-					? { contextWindow: current }
-					: undefined,
+				meta: this._contextWindowMeta(offered, current),
 				changed: false,
 				ignored: true,
 			};
 		}
 		const effective = supported ? wanted : (currentOverride ?? defaultSize);
 		const current = currentOverride ?? defaultSize;
-		const meta = effective !== undefined && defaultSize !== undefined && effective !== defaultSize
-			? { contextWindow: effective }
-			: undefined;
 		return {
 			effective,
-			meta,
+			meta: this._contextWindowMeta(offered, effective),
 			changed: effective !== undefined && effective !== current,
 			ignored: false,
 		};
+	}
+
+	/**
+	 * `_meta.contextWindow` when the model offers multiple sizes and the
+	 * value is one of them (including the default). Otherwise omit `_meta`.
+	 */
+	private _contextWindowMeta(
+		offered: readonly unknown[] | undefined,
+		window: number | undefined,
+	): { readonly contextWindow: number } | undefined {
+		return window !== undefined && Array.isArray(offered) && offered.length > 1 && offered.includes(window)
+			? { contextWindow: window }
+			: undefined;
 	}
 
 	private _setModelParams(
@@ -1515,16 +1529,22 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			: { sessionId, modelId };
 	}
 
-	/** Apply a selected window to the backing override and published model max. */
+	/**
+	 * Apply a selected window to this chat only: per-session override for
+	 * usage `tokenLimit`, and `model.config.contextSize` for the picker.
+	 * Does not mutate the shared `_models` list (another chat's choice must
+	 * not change published `maxContextWindow`).
+	 */
 	private _applyContextWindowSelection(backing: IGrokBuildChatBacking, modelId: string, effective: number | undefined): void {
 		const modelInfo = this._models.get().find(candidate => candidate.id === modelId);
 		const prop = modelInfo?.configSchema?.properties?.[ContextSizeConfigKey];
 		const defaultSize = typeof prop?.default === 'number' ? prop.default : undefined;
+		const offered = prop?.enum;
 		backing.contextWindowOverride = effective !== undefined && defaultSize !== undefined && effective !== defaultSize
 			? effective
 			: undefined;
-		if (effective !== undefined) {
-			this._setModelMaxContextWindow(modelId, effective);
+		if (effective !== undefined && Array.isArray(offered) && offered.includes(effective)) {
+			backing.model = modelWithContextSize(backing.model ?? { id: modelId }, effective);
 		}
 	}
 
@@ -1544,27 +1564,17 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		return modelInfo?.maxContextWindow;
 	}
 
-	private _setModelMaxContextWindow(modelId: string, window: number): void {
-		const models = this._models.get();
-		let changed = false;
-		const next = models.map(model => {
-			if (model.id !== modelId || model.maxContextWindow === window) {
-				return model;
-			}
-			changed = true;
-			return { ...model, maxContextWindow: window };
-		});
-		if (changed) {
-			this._models.set(next, undefined);
-		}
-	}
-
 	private _tokenLimitFor(backing: IGrokBuildChatBacking): number | undefined {
 		if (backing.contextWindowOverride !== undefined) {
 			return backing.contextWindowOverride;
 		}
+		const selection = modelForTurnRecords(backing);
+		const fromConfig = getModelContextSize(selection);
+		if (fromConfig !== undefined) {
+			return fromConfig;
+		}
 		const models = this._models.get();
-		const id = modelForTurnRecords(backing)?.id;
+		const id = selection?.id;
 		const match = id ? models.find(model => model.id === id) : undefined;
 		return match?.maxContextWindow ?? models.find(model => model.maxContextWindow !== undefined)?.maxContextWindow;
 	}
@@ -2023,6 +2033,11 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 					backing.summary = history.title;
 				}
 				await this._reapplyReasoningEffort(client, backing);
+				const loadContextWindow = readGrokPositiveInt(result._meta?.contextWindow);
+				const applyModelId = backing.model?.id ?? (typeof modelId === 'string' && modelId.length > 0 ? modelId : undefined);
+				if (loadContextWindow !== undefined && applyModelId) {
+					this._applyContextWindowSelection(backing, applyModelId, loadContextWindow);
+				}
 				backing.modifiedTime = Date.now();
 				backing.replaySuppressChunkTotals = undefined;
 				// Prefer last replayed gauge (turn_completed / chunk / compaction);
@@ -2054,6 +2069,12 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 					backing.cliCurrentModelId = resumeModelId;
 				}
 				await this._reapplyReasoningEffort(client, backing);
+				const resumeContextWindow = readGrokPositiveInt(result._meta?.contextWindow);
+				const resumeApplyModelId = backing.model?.id
+					?? (typeof resumeModelId === 'string' && resumeModelId.length > 0 ? resumeModelId : undefined);
+				if (resumeContextWindow !== undefined && resumeApplyModelId) {
+					this._applyContextWindowSelection(backing, resumeApplyModelId, resumeContextWindow);
+				}
 			} catch (err) {
 				rethrowAcpFailure(err);
 			}
@@ -2523,12 +2544,14 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		const modelWindow = readGrokModelChangedContextWindow(params);
 		if (modelWindow) {
 			// Absent / null selection means the model default — clear the override.
-			if (modelWindow.selection !== backing.contextWindowOverride) {
-				backing.contextWindowOverride = modelWindow.selection;
-				const modelId = backing.model?.id;
-				const effective = modelWindow.selection ?? this._defaultContextWindow(modelId);
+			const modelId = backing.model?.id ?? backing.cliCurrentModelId;
+			const effective = modelWindow.selection ?? this._defaultContextWindow(modelId);
+			const previous = backing.contextWindowOverride ?? this._defaultContextWindow(modelId);
+			if (effective !== previous || getModelContextSize(backing.model) !== effective) {
 				if (modelId && effective !== undefined) {
-					this._setModelMaxContextWindow(modelId, effective);
+					this._applyContextWindowSelection(backing, modelId, effective);
+				} else {
+					backing.contextWindowOverride = undefined;
 				}
 				this._publishContextUsage(backing);
 			}
