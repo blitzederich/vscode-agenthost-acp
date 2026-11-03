@@ -36,23 +36,31 @@ import type {
 
 export interface IGrokBuildToolCallEntry {
 	readonly toolCallId: string;
-	readonly toolName: string;
+	toolName: string;
 	displayName: string;
-	readonly permissionKind: AgentPermissionKind;
+	permissionKind: AgentPermissionKind;
 	readonly permissionPath?: string;
 	readonly toolKind?: 'subagent' | 'exit_plan' | 'ask_user';
 	readonly subagentDescription?: string;
 	/** Plan markdown attached when `_x.ai/exit_plan_mode` arrives. */
 	planContent?: string;
 	/**
-	 * Workbench client tool correlated on grok's toolCallId. Display name is
-	 * the target tool (no `client__`); Client contributor is stamped only when
-	 * MCP `tools/call` fires Ready — not at Start — so grok's permission uses
-	 * the normal non-client confirmation path.
+	 * Workbench client tool correlated on grok's toolCallId. While our `client`
+	 * MCP server is attached, ACP updates for this id are tracked only — the
+	 * Client card is opened at MCP `tools/call` (Start with contributor Client).
+	 * A failure before that opens one non-Client card instead.
 	 */
 	clientTool?: IGrokClientToolTarget;
-	/** Owning workbench client id when {@link clientTool} is set (for MCP Ready). */
-	clientId?: string;
+	/**
+	 * True once {@link GrokBuildAgent} fired Start{contributor: Client} for this
+	 * id. Later grok Complete/Failed updates are ignored (workbench owns Complete).
+	 */
+	clientExecutionStarted?: boolean;
+	/**
+	 * User cancelled the approval ChatInput before MCP — do not open a card if
+	 * grok later sends a terminal update for this id.
+	 */
+	cancelledBeforeClientStart?: boolean;
 	started: boolean;
 	completed: boolean;
 }
@@ -70,12 +78,10 @@ export interface IGrokBuildMapState {
 	todoSource?: 'tool' | 'plan';
 	/**
 	 * True when this chat's HTTP `client` MCP server is attached. Client-tool
-	 * `use_tool` cards are only rewritten (stripped display name, deferred
-	 * Ready) in that case so a user's own MCP server named `client` is left alone.
+	 * `use_tool` / `client__*` ACP updates are tracked only (no card until MCP
+	 * or a pre-MCP failure) so a user's own MCP server named `client` is left alone.
 	 */
 	clientMcpAttached?: boolean;
-	/** Resolve the workbench client that owns a client-tool name. */
-	clientToolOwnerOf?: (toolName: string) => string | undefined;
 }
 
 /** Host display title for grok's `exit_plan_mode` / `_x.ai/exit_plan_mode` tool card. */
@@ -85,7 +91,6 @@ export const GROK_ASK_USER_DISPLAY_NAME = localize('grokBuild.tool.askUser', "As
 
 export function createGrokBuildMapState(turnId: string, options?: {
 	readonly clientMcpAttached?: boolean;
-	readonly clientToolOwnerOf?: (toolName: string) => string | undefined;
 }): IGrokBuildMapState {
 	return {
 		turnId,
@@ -94,7 +99,6 @@ export function createGrokBuildMapState(turnId: string, options?: {
 		toolCalls: new Map(),
 		planSnapshots: 0,
 		clientMcpAttached: options?.clientMcpAttached,
-		clientToolOwnerOf: options?.clientToolOwnerOf,
 	};
 }
 
@@ -527,6 +531,10 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 	}
 
 	const clientTarget = state.clientMcpAttached ? parseGrokClientToolTarget(update) : undefined;
+	const existingEntry = state.toolCalls.get(toolCallId);
+	if (clientTarget || existingEntry?.clientTool) {
+		return mapTrackedClientToolCall(state, update, clientTarget);
+	}
 
 	const xaiName = xaiToolMeta(update)?.name;
 	if (xaiName === 'todo_write' || update.title === 'todo_write') {
@@ -540,23 +548,12 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 		}
 	}
 
-	const identity = clientTarget
-		? {
-			toolName: clientTarget.toolName,
-			displayName: clientTarget.toolName,
-			permissionKind: AgentPermissionKind.CustomTool,
-			permissionPath: undefined as string | undefined,
-			isEdit: false,
-			toolKind: undefined as 'subagent' | 'exit_plan' | 'ask_user' | undefined,
-			subagentDescription: undefined as string | undefined,
-		}
-		: resolveToolIdentity(update);
-	let entry = state.toolCalls.get(toolCallId);
+	const identity = resolveToolIdentity(update);
+	let entry = existingEntry;
 	const actions: (SessionAction | ChatAction)[] = [];
 	const meta = () => toolCallMeta(entry!);
 
 	if (!entry) {
-		const clientId = clientTarget ? state.clientToolOwnerOf?.(clientTarget.toolName) : undefined;
 		entry = {
 			toolCallId,
 			toolName: identity.toolName,
@@ -565,33 +562,26 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 			permissionPath: identity.permissionPath,
 			toolKind: identity.toolKind,
 			subagentDescription: identity.subagentDescription,
-			...(clientTarget ? { clientTool: clientTarget, ...(clientId ? { clientId } : {}) } : {}),
 			started: false,
 			completed: false,
 		};
 		state.toolCalls.set(toolCallId, entry);
-	} else if (clientTarget || update.title || identity.displayName !== entry.displayName || identity.toolKind) {
+	} else if (update.title || identity.displayName !== entry.displayName || identity.toolKind) {
 		const stickyKind = isStickyToolKind(entry.toolKind)
 			? entry.toolKind
 			: (isStickyToolKind(identity.toolKind) ? identity.toolKind : undefined);
-		const clientId = entry.clientId
-			?? (clientTarget ? state.clientToolOwnerOf?.(clientTarget.toolName) : undefined);
 		entry = {
 			...entry,
 			displayName: stickyKind
 				? stickyDisplayName(stickyKind)
-				: (clientTarget ? clientTarget.toolName : (update.title ?? identity.displayName)),
+				: (update.title ?? identity.displayName),
 			permissionPath: identity.permissionPath ?? entry.permissionPath,
 			permissionKind: identity.permissionKind,
-			toolName: clientTarget
-				? clientTarget.toolName
-				: identity.toolKind === 'subagent' || isStickyToolKind(identity.toolKind)
-					? identity.toolName
-					: identity.isEdit ? 'file_edit' : entry.toolName,
+			toolName: identity.toolKind === 'subagent' || isStickyToolKind(identity.toolKind)
+				? identity.toolName
+				: identity.isEdit ? 'file_edit' : entry.toolName,
 			toolKind: identity.toolKind ?? entry.toolKind,
 			subagentDescription: identity.subagentDescription ?? entry.subagentDescription,
-			...(clientTarget ? { clientTool: clientTarget } : {}),
-			...(clientId ? { clientId } : {}),
 		};
 		state.toolCalls.set(toolCallId, entry);
 	}
@@ -609,9 +599,6 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 				toolCallId,
 				toolName: entry.toolName,
 				displayName: entry.displayName,
-				// No Client contributor at Start: grok's permission must use the
-				// normal confirmation UI. Client ownership is stamped on Ready
-				// when MCP tools/call arrives (see GrokBuildAgent._invokeClientTool).
 				...(callMeta ? { _meta: callMeta } : {}),
 			},
 			...(input ? [{
@@ -621,12 +608,7 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 				content: input,
 				...(callMeta ? { _meta: callMeta } : {}),
 			}] : []),
-		);
-		// Client tools stay Streaming until grok's permission Ready and/or MCP
-		// tools/call Ready(NotNeeded+Client). Ready(NotNeeded) here would skip
-		// grok's allow/reject prompt.
-		if (!entry.clientTool) {
-			actions.push({
+			{
 				type: ActionType.ChatToolCallReady,
 				turnId: state.turnId,
 				toolCallId,
@@ -634,9 +616,9 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 				toolInput: input,
 				confirmed: ToolCallConfirmationReason.NotNeeded,
 				...(callMeta ? { _meta: callMeta } : {}),
-			});
-		}
-	} else if (update.title && update.sessionUpdate === 'tool_call_update' && !isStickyToolKind(entry.toolKind) && !entry.clientTool) {
+			},
+		);
+	} else if (update.title && update.sessionUpdate === 'tool_call_update' && !isStickyToolKind(entry.toolKind)) {
 		// Refresh invocation presentation when Grok upgrades the title (e.g. edit path).
 		const input = toolInputText(update, entry);
 		if (input) {
@@ -705,20 +687,6 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 			...(status === 'failed' ? { error: { message: failureMessage } } : {}),
 		};
 		const callMeta = meta();
-		// Client cards skip Ready at Start and stay Streaming until permission /
-		// MCP. Complete ignores Streaming, so leave Streaming via Ready NotNeeded
-		// first (no Client — execution never started).
-		if (entry.clientTool) {
-			actions.push({
-				type: ActionType.ChatToolCallReady,
-				turnId: state.turnId,
-				toolCallId,
-				invocationMessage: entry.displayName,
-				toolInput: toolInputText(update, entry),
-				confirmed: ToolCallConfirmationReason.NotNeeded,
-				...(callMeta ? { _meta: callMeta } : {}),
-			});
-		}
 		actions.push({
 			type: ActionType.ChatToolCallComplete,
 			turnId: state.turnId,
@@ -729,6 +697,137 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 	}
 
 	return actions;
+}
+
+/**
+ * Track grok `use_tool` / `client__*` ACP updates without opening a card.
+ * MCP `tools/call` opens the Client card; a terminal failure before that opens
+ * one non-Client card (Start → Ready NotNeeded → Complete failed).
+ */
+function mapTrackedClientToolCall(
+	state: IGrokBuildMapState,
+	update: AcpToolCallUpdate,
+	clientTarget: IGrokClientToolTarget | undefined,
+): (SessionAction | ChatAction)[] {
+	const toolCallId = update.toolCallId!;
+	let entry = state.toolCalls.get(toolCallId);
+	const target = clientTarget ?? entry?.clientTool;
+	if (!entry && target) {
+		entry = {
+			toolCallId,
+			toolName: target.toolName,
+			displayName: target.toolName,
+			permissionKind: AgentPermissionKind.CustomTool,
+			clientTool: target,
+			started: false,
+			completed: false,
+		};
+		state.toolCalls.set(toolCallId, entry);
+	} else if (entry && target) {
+		entry.clientTool = target;
+		entry.toolName = target.toolName;
+		entry.displayName = target.toolName;
+	}
+	if (!entry) {
+		return [];
+	}
+
+	const status = (update.status ?? '').toLowerCase();
+	const terminal = status === 'completed' || status === 'failed' || status === 'cancelled';
+	if (entry.clientExecutionStarted || entry.cancelledBeforeClientStart) {
+		if (terminal) {
+			entry.completed = true;
+		}
+		return [];
+	}
+
+	if (!terminal || entry.completed) {
+		return [];
+	}
+
+	// Failure (or cancel) before MCP tools/call — one non-Client card so the
+	// turn does not end with a Streaming part.
+	entry.completed = true;
+	entry.started = true;
+	state.markdownPartId = undefined;
+	const input = toolInputText(update, entry);
+	const contentMessage = textFromToolCallContent(update.content);
+	const rawOutputText = rawOutputAsText(update.rawOutput);
+	const outputText = rawOutputText ?? contentMessage;
+	const failureMessage = outputText || 'Tool call failed';
+	const success = status === 'completed';
+	const result: ToolCallResult = {
+		success,
+		pastTenseMessage: success
+			? entry.displayName
+			: (status === 'cancelled'
+				? cancelledToolMessage(entry.displayName)
+				: `${entry.displayName} failed`),
+		content: outputText
+			? [{ type: ToolResultContentType.Text, text: outputText }]
+			: [],
+		...(!success ? { error: { message: failureMessage } } : {}),
+	};
+	return [
+		{
+			type: ActionType.ChatToolCallStart,
+			turnId: state.turnId,
+			toolCallId,
+			toolName: entry.toolName,
+			displayName: entry.displayName,
+		},
+		{
+			type: ActionType.ChatToolCallReady,
+			turnId: state.turnId,
+			toolCallId,
+			invocationMessage: entry.displayName,
+			toolInput: input,
+			confirmed: ToolCallConfirmationReason.NotNeeded,
+		},
+		{
+			type: ActionType.ChatToolCallComplete,
+			turnId: state.turnId,
+			toolCallId,
+			result,
+		},
+	];
+}
+
+/**
+ * Mark a tracked client-tool id as having an open Client card (Start already
+ * fired from MCP tools/call). Subsequent grok terminal updates are ignored.
+ */
+export function markGrokClientToolExecutionStarted(state: IGrokBuildMapState, toolCallId: string, toolName: string, args: Record<string, unknown>): void {
+	let entry = state.toolCalls.get(toolCallId);
+	if (!entry) {
+		entry = {
+			toolCallId,
+			toolName,
+			displayName: toolName,
+			permissionKind: AgentPermissionKind.CustomTool,
+			clientTool: { toolName, args },
+			started: true,
+			completed: false,
+			clientExecutionStarted: true,
+		};
+		state.toolCalls.set(toolCallId, entry);
+		return;
+	}
+	entry.started = true;
+	entry.clientExecutionStarted = true;
+	entry.clientTool = { toolName, args };
+	entry.toolName = toolName;
+	entry.displayName = toolName;
+}
+
+/** Suppress a pre-MCP failure card after the user cancels the approval ChatInput. */
+export function markGrokClientToolCancelledBeforeStart(state: IGrokBuildMapState, toolCallId: string): void {
+	const entry = state.toolCalls.get(toolCallId);
+	if (!entry) {
+		return;
+	}
+	entry.cancelledBeforeClientStart = true;
+	entry.completed = true;
 }
 
 function rawOutputAsText(rawOutput: unknown): string | undefined {
@@ -1147,8 +1246,6 @@ export function mapPermissionRequest(
 		confirmationTitle: title,
 		...(params.description ? { confirmationMessage: params.description } : {}),
 		...(path ? { toolInput: path } : {}),
-		// Never stamp Client here: workbench rewrites Client PendingConfirmation
-		// into ToolClientExecution and auto-answers per VS Code tool policy.
 	};
 
 	return {
@@ -1198,6 +1295,26 @@ export function selectPermissionOptionId(
 	// Last resort: first option whose kind string contains allow/reject.
 	const fuzzy = options.find(o => approved ? o.kind.includes('allow') : o.kind.includes('reject'));
 	return fuzzy?.optionId ?? options[0]?.optionId;
+}
+
+/**
+ * Client-tool permission answers for grok: `allow_once` / `reject_once` only.
+ * Never selects `allow_always` (session-wide auto-approve).
+ */
+export function selectClientToolPermissionOptionId(
+	options: readonly { readonly optionId: string; readonly kind: string }[],
+	approved: boolean,
+): string | undefined {
+	const kind = approved ? 'allow_once' : 'reject_once';
+	const match = options.find(o => o.kind === kind);
+	if (match) {
+		return match.optionId;
+	}
+	// Fall back only within the once-scoped kinds (still never allow_always).
+	if (!approved) {
+		return options.find(o => o.kind === 'reject' || o.kind === 'reject_always')?.optionId;
+	}
+	return undefined;
 }
 
 /** Whether an ACP session update kind should be ignored by the mapper. */

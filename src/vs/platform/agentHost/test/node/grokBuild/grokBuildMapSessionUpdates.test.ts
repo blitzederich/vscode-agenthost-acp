@@ -25,6 +25,7 @@ import {
 	mapTurnCompleted,
 	mapTurnStarted,
 	mapUsage,
+	markGrokClientToolExecutionStarted,
 	readGrokCompactionCurrentTokens,
 	readGrokContextWindows,
 	readGrokCurrentModelContextWindow,
@@ -680,11 +681,8 @@ suite('GrokBuild mapSessionUpdates', () => {
 		});
 	});
 
-	test('maps live use_tool client__ cards with stripped display name and no Client at Start', () => {
-		const state = createGrokBuildMapState('turn-client', {
-			clientMcpAttached: true,
-			clientToolOwnerOf: name => name === 'workspace_echo' ? 'workbench-1' : undefined,
-		});
+	test('tracks live use_tool client__ without emitting a card until pre-MCP failure', () => {
+		const state = createGrokBuildMapState('turn-client', { clientMcpAttached: true });
 		const start = mapSessionUpdate(state, {
 			sessionId: 's',
 			update: {
@@ -697,14 +695,9 @@ suite('GrokBuild mapSessionUpdates', () => {
 				_meta: { 'x.ai/tool': { name: 'use_tool', namespace: 'grok_build' } },
 			},
 		});
-		assert.strictEqual(start.length, 2);
-		assert.strictEqual(start[0]!.type, ActionType.ChatToolCallStart);
-		assert.strictEqual((start[0] as { toolName: string }).toolName, 'workspace_echo');
-		assert.strictEqual((start[0] as { displayName: string }).displayName, 'workspace_echo');
-		assert.strictEqual((start[0] as { contributor?: unknown }).contributor, undefined, 'Client stamped only at MCP Ready');
-		assert.strictEqual(start[1]!.type, ActionType.ChatToolCallDelta);
-		assert.ok(!start.some(a => a.type === ActionType.ChatToolCallReady), 'Ready deferred to permission / MCP');
-		assert.strictEqual(state.toolCalls.get('grok-client-1')?.clientId, 'workbench-1');
+		assert.deepStrictEqual(start, []);
+		assert.strictEqual(state.toolCalls.get('grok-client-1')?.toolName, 'workspace_echo');
+		assert.strictEqual(state.toolCalls.get('grok-client-1')?.started, false);
 
 		const titled = mapSessionUpdate(state, {
 			sessionId: 's',
@@ -717,61 +710,52 @@ suite('GrokBuild mapSessionUpdates', () => {
 			},
 		});
 		assert.deepStrictEqual(titled, []);
-		assert.strictEqual(state.toolCalls.get('grok-client-1')?.displayName, 'workspace_echo');
 
-		const done = mapSessionUpdate(state, {
+		const failed = mapSessionUpdate(state, {
 			sessionId: 's',
 			update: {
 				sessionUpdate: 'tool_call_update',
 				toolCallId: 'grok-client-1',
 				title: 'client__workspace_echo',
-				status: 'completed',
-				rawOutput: { type: 'MCP', tool_name: 'workspace_echo', server_name: 'client', output: 'ok' },
+				status: 'failed',
+				rawOutput: { error: 'boom before mcp' },
 			},
 		});
-		// Ready NotNeeded first so Complete is accepted from Streaming.
-		assert.strictEqual(done.length, 2);
-		assert.strictEqual(done[0]!.type, ActionType.ChatToolCallReady);
-		assert.strictEqual((done[0] as { confirmed?: string }).confirmed, 'not-needed');
-		assert.strictEqual((done[0] as { contributor?: unknown }).contributor, undefined);
-		assert.strictEqual(done[1]!.type, ActionType.ChatToolCallComplete);
-		assert.strictEqual((done[1] as { result: { success: boolean } }).result.success, true);
+		assert.strictEqual(failed.length, 3);
+		assert.strictEqual(failed[0]!.type, ActionType.ChatToolCallStart);
+		assert.strictEqual((failed[0] as { toolName: string }).toolName, 'workspace_echo');
+		assert.strictEqual((failed[0] as { contributor?: unknown }).contributor, undefined);
+		assert.strictEqual(failed[1]!.type, ActionType.ChatToolCallReady);
+		assert.strictEqual((failed[1] as { confirmed?: string }).confirmed, 'not-needed');
+		assert.strictEqual(failed[2]!.type, ActionType.ChatToolCallComplete);
+		assert.strictEqual((failed[2] as { result: { success: boolean } }).result.success, false);
 	});
 
-	test('mapPermissionRequest for client use_tool omits Client contributor', () => {
-		const state = createGrokBuildMapState('turn-perm', {
-			clientMcpAttached: true,
-			clientToolOwnerOf: () => 'workbench-1',
-		});
+	test('ignores grok terminal updates after Client execution started', () => {
+		const state = createGrokBuildMapState('turn-client-done', { clientMcpAttached: true });
 		mapSessionUpdate(state, {
 			sessionId: 's',
 			update: {
 				sessionUpdate: 'tool_call',
-				toolCallId: 'perm-1',
+				toolCallId: 'grok-client-2',
 				title: 'use_tool',
 				status: 'pending',
-				rawInput: { tool_name: 'client__get_errors', tool_input: { filePaths: ['/a.ts'] } },
+				rawInput: { tool_name: 'client__workspace_echo', tool_input: { msg: 'hi' } },
 				_meta: { 'x.ai/tool': { name: 'use_tool', namespace: 'grok_build' } },
 			},
 		});
-		const mapped = mapPermissionRequest(
-			URI.file('/chat'),
-			'turn-perm',
-			{
-				sessionId: 's',
-				toolCall: { toolCallId: 'perm-1', title: 'use_tool' },
-				options: [
-					{ optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
-					{ optionId: 'reject-once', name: 'Reject', kind: 'reject_once' },
-				],
+		markGrokClientToolExecutionStarted(state, 'grok-client-2', 'workspace_echo', { msg: 'hi' });
+		const done = mapSessionUpdate(state, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'tool_call_update',
+				toolCallId: 'grok-client-2',
+				title: 'client__workspace_echo',
+				status: 'completed',
+				rawOutput: { type: 'MCP', output: 'ok' },
 			},
-			state,
-		);
-		assert.ok(mapped);
-		assert.strictEqual(mapped.signal.state.contributor, undefined);
-		assert.strictEqual(mapped.signal.state.toolName, 'get_errors');
-		assert.strictEqual(mapped.signal.state.displayName, 'get_errors');
-		assert.ok(mapped.signal.state.confirmationTitle);
+		});
+		assert.deepStrictEqual(done, []);
 	});
 
 	test('leaves use_tool client__ untouched when our client MCP server is off', () => {

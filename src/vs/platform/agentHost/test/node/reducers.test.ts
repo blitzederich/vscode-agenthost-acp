@@ -440,7 +440,7 @@ suite('chatReducer – summaryStatus with tool call confirmations and input requ
 		});
 	});
 
-	test('ChatToolCallReady can establish but not change client execution ownership', () => {
+	test('ChatToolCallReady cannot change client execution ownership', () => {
 		const readyContributor = (startContributor: ToolCallContributor | undefined, contributor: ToolCallContributor) => {
 			let state = chatReducer(makeChat(), chatTurnStarted('turn-1', 'hello', '2025-01-01T00:00:00.000Z'));
 			state = chatReducer(state, chatToolCallStart('turn-1', 'tc-1', 'tool', 'Tool', { contributor: startContributor }));
@@ -472,7 +472,7 @@ suite('chatReducer – summaryStatus with tool call confirmations and input requ
 				{ kind: ToolCallContributorKind.Client, clientId: 'client-1' },
 			),
 		], [
-			{ kind: ToolCallContributorKind.Client, clientId: 'client-1' },
+			undefined,
 			{ kind: ToolCallContributorKind.MCP, customizationId: 'mcp-1' },
 			{ kind: ToolCallContributorKind.Client, clientId: 'client-1' },
 			{ kind: ToolCallContributorKind.Client, clientId: 'client-1' },

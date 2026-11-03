@@ -168,7 +168,7 @@ Reject ends the prompt with `stopReason: "cancelled"`.
 | `respondToPermissionRequest` | **Implemented** | Maps approve → `allow_once` / deny → `reject_once`. Preset `allowEdits` answers `allow-once` for edit prompts that offer `allow-edits-session`, before this method runs. It never selects `allow-edits-session` |
 | `getOrCreateActiveClient` / `removeActiveClient` | **Implemented** | Writes into `ActiveClientToolSet`; refreshes the client-tools HTTP MCP `tools/list` snapshot |
 | `onClientToolCallComplete` | **Implemented** | Resolves a parked HTTP MCP `tools/call` for the workbench client-tools server |
-| `respondToUserInputRequest` | **Implemented** | Resolves parked `_x.ai/exit_plan_mode` plan reviews (approve / revise+feedback / abandon) and `_x.ai/ask_user_question` prompts (accepted answers / skip_interview / cancelled) |
+| `respondToUserInputRequest` | **Implemented** | Resolves parked `_x.ai/exit_plan_mode` plan reviews (approve / revise+feedback / abandon), `_x.ai/ask_user_question` prompts (accepted answers / skip_interview / cancelled), and client-tool Allow once / Reject ChatInputs |
 | `resolveChatConfig` / `getInheritedChatConfig` / `chatConfigCompletions` | **Implemented** | Schema is mode (`interactive` \| `plan`) plus `grokPermissionPreset` (`ask` default, `allowEdits`). Completions stay empty |
 | `getChatCustomizations` | **Implemented** | Host customizations plus a read-only Grok Build skill directory from `available_commands_update` |
 | `getProtectedResources` | **Implemented** | `[]` — CLI owns grok.com auth; never GitHub-gated |
@@ -255,17 +255,30 @@ Tools come from the session's `ActiveClientToolSet` (workbench
 `agentHostActiveClientService`), not from custom LSP wrappers. Grok surfaces
 them as `client__<tool>` through search_tool/use_tool. Live 1.0.70 first emits
 ACP `tool_call` with title/`x.ai` name `use_tool` and
-`rawInput.tool_name: 'client__<tool>'`, then `session/request_permission`
-(no auto-approve), then MCP `tools/call`. The host keeps grok's toolCallId as
-the single card (display name strips `client__`). Client contributor is **not**
-stamped at Start — grok's permission uses the normal non-client confirmation
-UI. When MCP `tools/call` arrives, the host correlates FIFO by tool name +
-args, fires `Ready{confirmed: NotNeeded, contributor: Client, toolInput}`,
-parks on `pendingClientToolCalls`, and settles when `onClientToolCallComplete`
-runs. That Ready also covers auto-allow (no `request_permission`). A failure
-before permission emits Ready NotNeeded then Complete so the card is not left
-Streaming. Without our `client` MCP server attached, a user's own server named
-`client` is left alone.
+`rawInput.tool_name: 'client__<tool>'`, then usually
+`session/request_permission`, then MCP `tools/call`.
+
+While our `client` MCP is attached, those ACP updates are **tracked only**
+(`pendingGrokClientToolCalls`) — no Start/Delta/Ready for grok's id. Approval
+uses `ChatInputRequested` (single-select **Allow once** / **Reject**, message
+shows the VS Code tool name and `rawInput.tool_input` args), not
+`pending_confirmation`. Answers map to grok `allow_once` / `reject_once` only
+— never `allow_always`. Allowed ids are remembered in `approvedClientCallIds`
+for the turn. Cancel/dispose completes the ChatInput as Cancel and answers
+grok `cancelled` (no card if cancelled before MCP).
+
+At MCP `tools/call`, the host correlates FIFO by tool name + args. If the id
+is not already approved (grok auto-allowed without `request_permission`), the
+same ChatInput is asked first; reject returns MCP `isError` with
+`User declined` and opens no card. On allow, it fires
+`Start{contributor: Client}` then `Ready{confirmed: NotNeeded, toolInput}` on
+grok's id (Client must be set at Start — the reducer ignores a late Client on
+Ready), parks on `pendingClientToolCalls`, and settles when
+`onClientToolCallComplete` runs. Grok's later Complete/Failed updates for that
+id are ignored (workbench owns Complete). A grok failure before MCP opens
+exactly one non-Client card: Start → Ready NotNeeded → Complete(failed).
+Without our `client` MCP server attached, a user's own server named `client`
+is left alone.
 
 Mid-session tool-set changes update the live `tools/list` snapshot
 (`listChanged: true`). grok 1.0.70 does not advertise
