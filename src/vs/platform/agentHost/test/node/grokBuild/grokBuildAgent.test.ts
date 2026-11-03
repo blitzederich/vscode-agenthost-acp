@@ -14,12 +14,14 @@ import { URI } from '../../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../../log/common/log.js';
 import type { IProductService } from '../../../../product/common/productService.js';
-import { AgentSession, fixedChatOwnerRef, GROK_BUILD_AGENT_PROVIDER_ID, type AgentSignal, type IAgentChatContext, type IAgentDiscoveredChat } from '../../../common/agent.js';
+import { AgentSession, fixedChatOwnerRef, GROK_BUILD_AGENT_PROVIDER_ID, type AgentSignal, type IAgentChatContext, type IAgentDiscoveredChat, type IAgentToolPendingConfirmationSignal } from '../../../common/agent.js';
 import type { ChatInputRequestWithPlanReview } from '../../../common/agentHostPlanReview.js';
 import { ChatInputRequestPurpose, readChatInputRequestPurpose } from '../../../common/meta/agentChatInputRequestMeta.js';
 import { readUsageInfoMeta } from '../../../common/meta/agentUsageMeta.js';
-import { ActionType } from '../../../common/state/sessionActions.js';
-import { ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, ChatInputResponseKind, CustomizationType, ResponsePartKind, TurnState, type ChatInputAnswer, type ChatInputRequest, type Turn } from '../../../common/state/sessionState.js';
+import { chatReducer } from '../../../common/state/protocol/reducers.js';
+import { ActionType, type ChatAction } from '../../../common/state/sessionActions.js';
+import { ConfirmationOptionKind } from '../../../common/state/protocol/state.js';
+import { ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, ChatInputResponseKind, ChatOriginKind, CustomizationType, MessageKind, ResponsePartKind, SessionStatus, ToolCallCancellationReason, ToolCallConfirmationReason, ToolCallContributorKind, ToolCallStatus, ToolResultContentType, TurnState, type ChatInputAnswer, type ChatInputRequest, type ChatState, type ToolCallState, type Turn } from '../../../common/state/sessionState.js';
 import {
 	AcpClient,
 	type IAcpTransport,
@@ -37,7 +39,6 @@ import { GROK_CLIENT_MCP_SERVER_NAME } from '../../../node/grokBuild/grokBuildCl
 import type { AcpAgentCapabilities } from '../../../node/grokBuild/protocol/acpTypes.js';
 import { AHP_SESSION_NOT_FOUND, ProtocolError } from '../../../common/state/sessionProtocol.js';
 import { AgentHostGrokBuildClientToolsMcpEnabledConfigKey } from '../../../common/agentHostSchema.js';
-import { ToolCallContributorKind, ToolResultContentType } from '../../../common/state/sessionState.js';
 
 class TestProductService {
 	readonly _serviceBrand: undefined;
@@ -4071,12 +4072,12 @@ suite('GrokBuildAgent', () => {
 			&& s.action.type === ActionType.ChatToolCallStart
 			&& (s.action as { toolName?: string }).toolName === 'workspace_echo'
 		);
-		assert.strictEqual(starts.length, 1, 'expected a single Client tool card');
+		assert.strictEqual(starts.length, 1, 'expected a single use_tool card');
 		const start = starts[0]!;
 		assert.ok(start.kind === 'action' && start.action.type === ActionType.ChatToolCallStart);
 		assert.strictEqual(start.action.toolCallId, grokToolCallId);
 		assert.strictEqual(start.action.displayName, 'workspace_echo');
-		assert.deepStrictEqual(start.action.contributor, { kind: ToolCallContributorKind.Client, clientId: 'workbench-1' });
+		assert.strictEqual(start.action.contributor, undefined, 'Client stamped only at MCP Ready');
 
 		peer.push({
 			jsonrpc: '2.0',
@@ -4089,7 +4090,9 @@ suite('GrokBuildAgent', () => {
 			},
 		});
 		await new Promise(r => setTimeout(r, 20));
-		assert.ok(signals.some(s => s.kind === 'pending_confirmation'));
+		const permSignal = signals.find(s => s.kind === 'pending_confirmation');
+		assert.ok(permSignal && permSignal.kind === 'pending_confirmation');
+		assert.strictEqual(permSignal.state.contributor, undefined, 'permission must use non-client path');
 		agent.respondToPermissionRequest(grokToolCallId, true);
 		const permReply = await readNextMessage(peer.outbound);
 		assert.strictEqual(permReply.id, 42);
@@ -4116,6 +4119,16 @@ suite('GrokBuildAgent', () => {
 			1,
 			'MCP must reuse grok toolCallId — no second card',
 		);
+		const clientReady = signals.find(s =>
+			s.kind === 'action'
+			&& s.action.type === ActionType.ChatToolCallReady
+			&& (s.action as { toolCallId?: string }).toolCallId === grokToolCallId
+			&& (s.action as { confirmed?: string }).confirmed === 'not-needed'
+			&& (s.action as { contributor?: { kind?: string } }).contributor?.kind === ToolCallContributorKind.Client
+		);
+		assert.ok(clientReady && clientReady.kind === 'action' && clientReady.action.type === ActionType.ChatToolCallReady);
+		assert.strictEqual(clientReady.action.toolInput, JSON.stringify({ msg: 'ping' }));
+		assert.deepStrictEqual(clientReady.action.contributor, { kind: ToolCallContributorKind.Client, clientId: 'workbench-1' });
 
 		agent.onClientToolCallComplete(chat, grokToolCallId, {
 			success: true,
@@ -4554,6 +4567,489 @@ suite('GrokBuildAgent', () => {
 				resolve();
 			});
 			req.end();
+		});
+	});
+
+	/**
+	 * Folds live grok wire signals through {@link chatReducer} using the same
+	 * ChatToolCallReady shape {@link AgentSideEffects} dispatches for a
+	 * non-auto-approved pending_confirmation (confirmationTitle + options,
+	 * no Client contributor). Catches reducer bugs that signal-only tests miss.
+	 */
+	suite('client tools via chatReducer + AgentSideEffects permission Ready', () => {
+		function makeChatState(): ChatState {
+			const now = new Date().toISOString();
+			return {
+				resource: 'ahp-chat://grok-client-reducer',
+				title: 'Test',
+				status: SessionStatus.Idle,
+				modifiedAt: now,
+				origin: { kind: ChatOriginKind.User },
+				turns: [],
+				activeTurn: undefined,
+			};
+		}
+
+		function permissionReadyLikeSideEffects(turnId: string, signal: IAgentToolPendingConfirmationSignal): ChatAction {
+			assert.ok(signal.state.confirmationTitle);
+			assert.strictEqual(signal.state.contributor, undefined);
+			return {
+				type: ActionType.ChatToolCallReady,
+				turnId,
+				toolCallId: signal.state.toolCallId,
+				invocationMessage: signal.state.invocationMessage,
+				toolInput: signal.state.toolInput,
+				confirmationTitle: signal.state.confirmationTitle,
+				options: [
+					{ id: 'allow-session', label: 'Allow in this Session', kind: ConfirmationOptionKind.Approve, group: 1 },
+					{ id: 'allow-once', label: 'Allow Once', kind: ConfirmationOptionKind.Approve },
+					{ id: 'skip', label: 'Skip', kind: ConfirmationOptionKind.Deny, group: 2 },
+				],
+			};
+		}
+
+		function findTool(chat: ChatState, toolCallId: string): ToolCallState | undefined {
+			const part = chat.activeTurn?.responseParts.find(
+				p => p.kind === ResponsePartKind.ToolCall && p.toolCall.toolCallId === toolCallId,
+			);
+			return part?.kind === ResponsePartKind.ToolCall ? part.toolCall : undefined;
+		}
+
+		function foldSignals(chat: ChatState, signals: AgentSignal[], turnId: string): ChatState {
+			let next = chat;
+			for (const signal of signals.splice(0)) {
+				if (signal.kind === 'action') {
+					next = chatReducer(next, signal.action as ChatAction);
+				} else if (signal.kind === 'pending_confirmation') {
+					next = chatReducer(next, permissionReadyLikeSideEffects(turnId, signal));
+				}
+			}
+			return next;
+		}
+
+		test('allow_once → MCP: prompt shown, toolInput at Client Ready, one completed card', async () => {
+			const peer = store.add(makeFakePeer());
+			const client = store.add(new AcpClient(peer.transport));
+			const agent = createAgent();
+			agent.bindTestClient(client);
+			const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/reducer-allow' });
+			const context = chatContext(chat);
+			const args = { filePaths: ['/a.ts'] };
+			agent.getOrCreateActiveClient(chat, context, { clientId: 'workbench-1' }).tools = [{
+				name: 'get_errors',
+				description: 'errors',
+				inputSchema: { type: 'object', properties: { filePaths: { type: 'array' } } },
+			}];
+
+			const signals: AgentSignal[] = [];
+			store.add(agent.onDidChatProgress(s => signals.push(s)));
+
+			const createPromise = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp/proj')] });
+			const sessionNew = await readNextMessage(peer.outbound);
+			assertClientToolsMcpServer(sessionNew.params.mcpServers);
+			const mcp = sessionNew.params.mcpServers[0]!;
+			peerPushSession(peer, sessionNew.id, 'sess-reducer-allow');
+			await createPromise;
+
+			const turnId = 'turn-reducer-allow';
+			const sendPromise = agent.chats.sendMessage(chat, 'hi', [URI.file('/tmp/proj')], undefined, turnId, undefined, context);
+			const prompt = await readNextMessage(peer.outbound);
+
+			let chatState = chatReducer(makeChatState(), {
+				type: ActionType.ChatTurnStarted,
+				turnId,
+				startedAt: new Date().toISOString(),
+				message: { text: 'hi', origin: { kind: MessageKind.User } },
+			});
+
+			const grokToolCallId = 'grok-reducer-allow';
+			peer.push({
+				jsonrpc: '2.0',
+				method: 'session/update',
+				params: {
+					sessionId: 'sess-reducer-allow',
+					update: {
+						sessionUpdate: 'tool_call',
+						toolCallId: grokToolCallId,
+						title: 'use_tool',
+						status: 'pending',
+						rawInput: { tool_name: 'client__get_errors', tool_input: args },
+						_meta: { 'x.ai/tool': { name: 'use_tool', namespace: 'grok_build' } },
+					},
+				},
+			});
+			await new Promise(r => setTimeout(r, 20));
+			chatState = foldSignals(chatState, signals, turnId);
+
+			let tc = findTool(chatState, grokToolCallId);
+			assert.ok(tc);
+			assert.strictEqual(tc.status, ToolCallStatus.Streaming);
+			assert.strictEqual(tc.displayName, 'get_errors');
+			assert.strictEqual(tc.contributor, undefined);
+
+			peer.push({
+				jsonrpc: '2.0',
+				id: 42,
+				method: 'session/request_permission',
+				params: {
+					sessionId: 'sess-reducer-allow',
+					toolCall: { toolCallId: grokToolCallId, title: 'use_tool' },
+					options: LIVE_PERMISSION_OPTIONS,
+				},
+			});
+			await new Promise(r => setTimeout(r, 20));
+			chatState = foldSignals(chatState, signals, turnId);
+
+			tc = findTool(chatState, grokToolCallId);
+			assert.ok(tc);
+			assert.strictEqual(tc.status, ToolCallStatus.PendingConfirmation);
+			assert.strictEqual(tc.contributor, undefined, 'non-client permission path');
+			assert.ok(tc.status === ToolCallStatus.PendingConfirmation && tc.confirmationTitle && tc.options?.length);
+
+			chatState = chatReducer(chatState, {
+				type: ActionType.ChatToolCallConfirmed,
+				turnId,
+				toolCallId: grokToolCallId,
+				approved: true,
+				confirmed: ToolCallConfirmationReason.UserAction,
+				selectedOptionId: 'allow-once',
+			});
+			agent.respondToPermissionRequest(grokToolCallId, true);
+			const permReply = await readNextMessage(peer.outbound);
+			assert.strictEqual(permReply.result.outcome.optionId, 'allow-once');
+			assert.strictEqual(findTool(chatState, grokToolCallId)?.status, ToolCallStatus.Running);
+			assert.strictEqual(findTool(chatState, grokToolCallId)?.contributor, undefined);
+
+			const callPromise = fetch(mcp.url, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json', Authorization: mcp.headers[0]!.value },
+				body: JSON.stringify({
+					jsonrpc: '2.0',
+					id: 2,
+					method: 'tools/call',
+					params: { name: 'get_errors', arguments: args },
+				}),
+			});
+			await new Promise(r => setTimeout(r, 30));
+			chatState = foldSignals(chatState, signals, turnId);
+
+			tc = findTool(chatState, grokToolCallId);
+			assert.ok(tc);
+			assert.strictEqual(tc.status, ToolCallStatus.Running);
+			assert.deepStrictEqual(tc.contributor, { kind: ToolCallContributorKind.Client, clientId: 'workbench-1' });
+			assert.strictEqual('toolInput' in tc ? tc.toolInput : undefined, JSON.stringify(args));
+
+			agent.onClientToolCallComplete(chat, grokToolCallId, {
+				success: true,
+				pastTenseMessage: 'got errors',
+				content: [{ type: ToolResultContentType.Text, text: 'no errors' }],
+			});
+			chatState = chatReducer(chatState, {
+				type: ActionType.ChatToolCallComplete,
+				turnId,
+				toolCallId: grokToolCallId,
+				result: {
+					success: true,
+					pastTenseMessage: 'got errors',
+					content: [{ type: ToolResultContentType.Text, text: 'no errors' }],
+				},
+			});
+			const callRes = await callPromise;
+			assert.strictEqual(callRes.status, 200);
+
+			peer.push({
+				jsonrpc: '2.0',
+				method: 'session/update',
+				params: {
+					sessionId: 'sess-reducer-allow',
+					update: {
+						sessionUpdate: 'tool_call_update',
+						toolCallId: grokToolCallId,
+						title: 'client__get_errors',
+						status: 'completed',
+						rawOutput: { type: 'MCP', output: 'no errors' },
+					},
+				},
+			});
+			await new Promise(r => setTimeout(r, 20));
+			chatState = foldSignals(chatState, signals, turnId);
+
+			const cards = (chatState.activeTurn?.responseParts ?? []).filter(p => p.kind === ResponsePartKind.ToolCall);
+			assert.strictEqual(cards.length, 1);
+			assert.strictEqual(cards[0]!.kind === ResponsePartKind.ToolCall ? cards[0].toolCall.status : undefined, ToolCallStatus.Completed);
+
+			peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
+			await sendPromise;
+		});
+
+		test('reject → no MCP call, card ended', async () => {
+			const peer = store.add(makeFakePeer());
+			const client = store.add(new AcpClient(peer.transport));
+			const agent = createAgent();
+			agent.bindTestClient(client);
+			const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/reducer-reject' });
+			const context = chatContext(chat);
+			agent.getOrCreateActiveClient(chat, context, { clientId: 'workbench-1' }).tools = [{
+				name: 'get_errors',
+				description: 'errors',
+				inputSchema: { type: 'object', properties: {} },
+			}];
+
+			const signals: AgentSignal[] = [];
+			store.add(agent.onDidChatProgress(s => signals.push(s)));
+
+			const createPromise = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp/proj')] });
+			const sessionNew = await readNextMessage(peer.outbound);
+			peerPushSession(peer, sessionNew.id, 'sess-reducer-reject');
+			await createPromise;
+
+			const turnId = 'turn-reducer-reject';
+			const sendPromise = agent.chats.sendMessage(chat, 'hi', [URI.file('/tmp/proj')], undefined, turnId, undefined, context);
+			const prompt = await readNextMessage(peer.outbound);
+
+			let chatState = chatReducer(makeChatState(), {
+				type: ActionType.ChatTurnStarted,
+				turnId,
+				startedAt: new Date().toISOString(),
+				message: { text: 'hi', origin: { kind: MessageKind.User } },
+			});
+
+			const grokToolCallId = 'grok-reducer-reject';
+			peer.push({
+				jsonrpc: '2.0',
+				method: 'session/update',
+				params: {
+					sessionId: 'sess-reducer-reject',
+					update: {
+						sessionUpdate: 'tool_call',
+						toolCallId: grokToolCallId,
+						title: 'use_tool',
+						status: 'pending',
+						rawInput: { tool_name: 'client__get_errors', tool_input: { filePaths: ['/a.ts'] } },
+						_meta: { 'x.ai/tool': { name: 'use_tool', namespace: 'grok_build' } },
+					},
+				},
+			});
+			peer.push({
+				jsonrpc: '2.0',
+				id: 77,
+				method: 'session/request_permission',
+				params: {
+					sessionId: 'sess-reducer-reject',
+					toolCall: { toolCallId: grokToolCallId, title: 'use_tool' },
+					options: LIVE_PERMISSION_OPTIONS,
+				},
+			});
+			await new Promise(r => setTimeout(r, 20));
+			chatState = foldSignals(chatState, signals, turnId);
+			assert.strictEqual(findTool(chatState, grokToolCallId)?.status, ToolCallStatus.PendingConfirmation);
+
+			chatState = chatReducer(chatState, {
+				type: ActionType.ChatToolCallConfirmed,
+				turnId,
+				toolCallId: grokToolCallId,
+				approved: false,
+				reason: ToolCallCancellationReason.Denied,
+			});
+			agent.respondToPermissionRequest(grokToolCallId, false);
+			await readNextMessage(peer.outbound);
+
+			peer.push({
+				jsonrpc: '2.0',
+				method: 'session/update',
+				params: {
+					sessionId: 'sess-reducer-reject',
+					update: {
+						sessionUpdate: 'tool_call_update',
+						toolCallId: grokToolCallId,
+						title: 'client__get_errors',
+						status: 'failed',
+						rawOutput: { error: 'rejected' },
+					},
+				},
+			});
+			await new Promise(r => setTimeout(r, 20));
+			chatState = foldSignals(chatState, signals, turnId);
+
+			const tc = findTool(chatState, grokToolCallId);
+			assert.ok(tc);
+			assert.ok(
+				tc.status === ToolCallStatus.Cancelled || tc.status === ToolCallStatus.Completed,
+				`expected terminal, got ${tc.status}`,
+			);
+
+			peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
+			await sendPromise;
+		});
+
+		test('grok failed before permission → card terminal (not Streaming)', async () => {
+			const peer = store.add(makeFakePeer());
+			const client = store.add(new AcpClient(peer.transport));
+			const agent = createAgent();
+			agent.bindTestClient(client);
+			const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/reducer-fail' });
+			const context = chatContext(chat);
+			agent.getOrCreateActiveClient(chat, context, { clientId: 'workbench-1' }).tools = [{
+				name: 'get_errors',
+				description: 'errors',
+				inputSchema: { type: 'object', properties: {} },
+			}];
+
+			const signals: AgentSignal[] = [];
+			store.add(agent.onDidChatProgress(s => signals.push(s)));
+
+			const createPromise = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp/proj')] });
+			const sessionNew = await readNextMessage(peer.outbound);
+			peerPushSession(peer, sessionNew.id, 'sess-reducer-fail');
+			await createPromise;
+
+			const turnId = 'turn-reducer-fail';
+			const sendPromise = agent.chats.sendMessage(chat, 'hi', [URI.file('/tmp/proj')], undefined, turnId, undefined, context);
+			const prompt = await readNextMessage(peer.outbound);
+
+			let chatState = chatReducer(makeChatState(), {
+				type: ActionType.ChatTurnStarted,
+				turnId,
+				startedAt: new Date().toISOString(),
+				message: { text: 'hi', origin: { kind: MessageKind.User } },
+			});
+
+			const grokToolCallId = 'grok-reducer-fail';
+			peer.push({
+				jsonrpc: '2.0',
+				method: 'session/update',
+				params: {
+					sessionId: 'sess-reducer-fail',
+					update: {
+						sessionUpdate: 'tool_call',
+						toolCallId: grokToolCallId,
+						title: 'use_tool',
+						status: 'pending',
+						rawInput: { tool_name: 'client__get_errors', tool_input: {} },
+						_meta: { 'x.ai/tool': { name: 'use_tool', namespace: 'grok_build' } },
+					},
+				},
+			});
+			peer.push({
+				jsonrpc: '2.0',
+				method: 'session/update',
+				params: {
+					sessionId: 'sess-reducer-fail',
+					update: {
+						sessionUpdate: 'tool_call_update',
+						toolCallId: grokToolCallId,
+						title: 'client__get_errors',
+						status: 'failed',
+						rawOutput: { error: 'boom before permission' },
+					},
+				},
+			});
+			await new Promise(r => setTimeout(r, 20));
+			chatState = foldSignals(chatState, signals, turnId);
+
+			const tc = findTool(chatState, grokToolCallId);
+			assert.ok(tc);
+			assert.strictEqual(tc.status, ToolCallStatus.Completed);
+			assert.strictEqual(tc.status === ToolCallStatus.Completed ? tc.success : undefined, false);
+
+			peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
+			await sendPromise;
+		});
+
+		test('no request_permission (auto-allow) → MCP tools/call still executes', async () => {
+			const peer = store.add(makeFakePeer());
+			const client = store.add(new AcpClient(peer.transport));
+			const agent = createAgent();
+			agent.bindTestClient(client);
+			const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/reducer-auto' });
+			const context = chatContext(chat);
+			const args = { filePaths: ['/a.ts'] };
+			agent.getOrCreateActiveClient(chat, context, { clientId: 'workbench-1' }).tools = [{
+				name: 'get_errors',
+				description: 'errors',
+				inputSchema: { type: 'object', properties: { filePaths: { type: 'array' } } },
+			}];
+
+			const signals: AgentSignal[] = [];
+			store.add(agent.onDidChatProgress(s => signals.push(s)));
+
+			const createPromise = agent.chats.createChat(chat, context, { workingDirectories: [URI.file('/tmp/proj')] });
+			const sessionNew = await readNextMessage(peer.outbound);
+			assertClientToolsMcpServer(sessionNew.params.mcpServers);
+			const mcp = sessionNew.params.mcpServers[0]!;
+			peerPushSession(peer, sessionNew.id, 'sess-reducer-auto');
+			await createPromise;
+
+			const turnId = 'turn-reducer-auto';
+			const sendPromise = agent.chats.sendMessage(chat, 'hi', [URI.file('/tmp/proj')], undefined, turnId, undefined, context);
+			const prompt = await readNextMessage(peer.outbound);
+
+			let chatState = chatReducer(makeChatState(), {
+				type: ActionType.ChatTurnStarted,
+				turnId,
+				startedAt: new Date().toISOString(),
+				message: { text: 'hi', origin: { kind: MessageKind.User } },
+			});
+
+			const grokToolCallId = 'grok-reducer-auto';
+			peer.push({
+				jsonrpc: '2.0',
+				method: 'session/update',
+				params: {
+					sessionId: 'sess-reducer-auto',
+					update: {
+						sessionUpdate: 'tool_call',
+						toolCallId: grokToolCallId,
+						title: 'use_tool',
+						status: 'pending',
+						rawInput: { tool_name: 'client__get_errors', tool_input: args },
+						_meta: { 'x.ai/tool': { name: 'use_tool', namespace: 'grok_build' } },
+					},
+				},
+			});
+			await new Promise(r => setTimeout(r, 20));
+			chatState = foldSignals(chatState, signals, turnId);
+			assert.strictEqual(findTool(chatState, grokToolCallId)?.status, ToolCallStatus.Streaming);
+
+			const callPromise = fetch(mcp.url, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json', Authorization: mcp.headers[0]!.value },
+				body: JSON.stringify({
+					jsonrpc: '2.0',
+					id: 2,
+					method: 'tools/call',
+					params: { name: 'get_errors', arguments: args },
+				}),
+			});
+			await new Promise(r => setTimeout(r, 30));
+			chatState = foldSignals(chatState, signals, turnId);
+
+			const tc = findTool(chatState, grokToolCallId);
+			assert.ok(tc);
+			assert.strictEqual(tc.status, ToolCallStatus.Running);
+			assert.deepStrictEqual(tc.contributor, { kind: ToolCallContributorKind.Client, clientId: 'workbench-1' });
+			assert.strictEqual('toolInput' in tc ? tc.toolInput : undefined, JSON.stringify(args));
+
+			agent.onClientToolCallComplete(chat, grokToolCallId, {
+				success: true,
+				pastTenseMessage: 'ok',
+				content: [{ type: ToolResultContentType.Text, text: 'done' }],
+			});
+			chatState = chatReducer(chatState, {
+				type: ActionType.ChatToolCallComplete,
+				turnId,
+				toolCallId: grokToolCallId,
+				result: {
+					success: true,
+					pastTenseMessage: 'ok',
+					content: [{ type: ToolResultContentType.Text, text: 'done' }],
+				},
+			});
+			const callRes = await callPromise;
+			assert.strictEqual(callRes.status, 200);
+
+			peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
+			await sendPromise;
 		});
 	});
 });

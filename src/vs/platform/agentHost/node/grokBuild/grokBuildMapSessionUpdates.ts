@@ -11,7 +11,7 @@ import { ContextSizeConfigKey, createContextSizeConfigSchemaPropertyFromLimits }
 import { grokBuildTodoListMetaKey, toToolCallMeta } from '../../common/meta/agentToolCallMeta.js';
 import type { ConfigPropertySchema, ConfigSchema } from '../../common/state/protocol/common/state.js';
 import { ActionType, type ChatAction, type SessionAction } from '../../common/state/sessionActions.js';
-import { createErrorResponsePart, MessageKind, ResponsePartKind, ToolCallConfirmationReason, ToolCallContributorKind, ToolCallStatus, ToolResultContentType, type ToolCallPendingConfirmationState, type ToolCallResult, type UsageInfo } from '../../common/state/sessionState.js';
+import { createErrorResponsePart, MessageKind, ResponsePartKind, ToolCallConfirmationReason, ToolCallStatus, ToolResultContentType, type ToolCallPendingConfirmationState, type ToolCallResult, type UsageInfo } from '../../common/state/sessionState.js';
 import {
 	GROK_SUBAGENT_TOOL_NAME,
 	GROK_TODO_TOOL_NAME,
@@ -45,11 +45,13 @@ export interface IGrokBuildToolCallEntry {
 	/** Plan markdown attached when `_x.ai/exit_plan_mode` arrives. */
 	planContent?: string;
 	/**
-	 * Workbench client tool owned end-to-end on grok's toolCallId (Client
-	 * contributor). When set, Ready is deferred to grok's permission prompt.
+	 * Workbench client tool correlated on grok's toolCallId. Display name is
+	 * the target tool (no `client__`); Client contributor is stamped only when
+	 * MCP `tools/call` fires Ready — not at Start — so grok's permission uses
+	 * the normal non-client confirmation path.
 	 */
 	clientTool?: IGrokClientToolTarget;
-	/** Owning workbench client id when {@link clientTool} is set. */
+	/** Owning workbench client id when {@link clientTool} is set (for MCP Ready). */
 	clientId?: string;
 	started: boolean;
 	completed: boolean;
@@ -68,8 +70,8 @@ export interface IGrokBuildMapState {
 	todoSource?: 'tool' | 'plan';
 	/**
 	 * True when this chat's HTTP `client` MCP server is attached. Client-tool
-	 * `use_tool` cards are only rewritten / Client-stamped in that case so a
-	 * user's own MCP server named `client` is left alone.
+	 * `use_tool` cards are only rewritten (stripped display name, deferred
+	 * Ready) in that case so a user's own MCP server named `client` is left alone.
 	 */
 	clientMcpAttached?: boolean;
 	/** Resolve the workbench client that owns a client-tool name. */
@@ -518,21 +520,6 @@ function formatUnified(oldText: string, newText: string): string {
 	return lines.join('\n');
 }
 
-/**
- * Whether this ACP tool_call / tool_call_update targets a workbench client
- * tool served by our attached `client` MCP server. Detects the live 1.0.70
- * first event (`use_tool` + `rawInput.tool_name: 'client__…'`) and the later
- * `client__…` title form. When {@link IGrokBuildMapState.clientMcpAttached}
- * is false, returns false so a user's own MCP server named `client` is
- * left alone.
- */
-export function isGrokClientToolCallUpdate(update: AcpToolCallUpdate, clientMcpAttached = true): boolean {
-	if (!clientMcpAttached) {
-		return false;
-	}
-	return parseGrokClientToolTarget(update) !== undefined;
-}
-
 function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (SessionAction | ChatAction)[] {
 	const toolCallId = update.toolCallId;
 	if (!toolCallId) {
@@ -622,9 +609,9 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 				toolCallId,
 				toolName: entry.toolName,
 				displayName: entry.displayName,
-				...(entry.clientId
-					? { contributor: { kind: ToolCallContributorKind.Client as const, clientId: entry.clientId } }
-					: {}),
+				// No Client contributor at Start: grok's permission must use the
+				// normal confirmation UI. Client ownership is stamped on Ready
+				// when MCP tools/call arrives (see GrokBuildAgent._invokeClientTool).
 				...(callMeta ? { _meta: callMeta } : {}),
 			},
 			...(input ? [{
@@ -635,9 +622,9 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 				...(callMeta ? { _meta: callMeta } : {}),
 			}] : []),
 		);
-		// Client tools stay Streaming until grok's session/request_permission
-		// Ready; Ready(NotNeeded) here would publish ToolClientExecution before
-		// the user approves.
+		// Client tools stay Streaming until grok's permission Ready and/or MCP
+		// tools/call Ready(NotNeeded+Client). Ready(NotNeeded) here would skip
+		// grok's allow/reject prompt.
 		if (!entry.clientTool) {
 			actions.push({
 				type: ActionType.ChatToolCallReady,
@@ -718,6 +705,20 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 			...(status === 'failed' ? { error: { message: failureMessage } } : {}),
 		};
 		const callMeta = meta();
+		// Client cards skip Ready at Start and stay Streaming until permission /
+		// MCP. Complete ignores Streaming, so leave Streaming via Ready NotNeeded
+		// first (no Client — execution never started).
+		if (entry.clientTool) {
+			actions.push({
+				type: ActionType.ChatToolCallReady,
+				turnId: state.turnId,
+				toolCallId,
+				invocationMessage: entry.displayName,
+				toolInput: toolInputText(update, entry),
+				confirmed: ToolCallConfirmationReason.NotNeeded,
+				...(callMeta ? { _meta: callMeta } : {}),
+			});
+		}
 		actions.push({
 			type: ActionType.ChatToolCallComplete,
 			turnId: state.turnId,
@@ -1146,9 +1147,8 @@ export function mapPermissionRequest(
 		confirmationTitle: title,
 		...(params.description ? { confirmationMessage: params.description } : {}),
 		...(path ? { toolInput: path } : {}),
-		...(entry?.clientId
-			? { contributor: { kind: ToolCallContributorKind.Client as const, clientId: entry.clientId } }
-			: {}),
+		// Never stamp Client here: workbench rewrites Client PendingConfirmation
+		// into ToolClientExecution and auto-answers per VS Code tool policy.
 	};
 
 	return {

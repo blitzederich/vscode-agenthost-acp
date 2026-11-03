@@ -50,7 +50,13 @@ function refineToolCallContributor(
 		return current;
 	}
 	if (next.kind === ToolCallContributorKind.Client) {
-		log?.(`Ignoring late client contributor '${next.clientId}' because client execution ownership must be established at tool call start`);
+		// Allow establishing Client ownership on Ready when Start left it unset
+		// (e.g. grok `use_tool` permission first, MCP `tools/call` Ready later).
+		// Reject replacing a non-Client contributor with Client.
+		if (!current) {
+			return next;
+		}
+		log?.(`Ignoring late client contributor '${next.clientId}' because client execution ownership must be established before a non-client contributor is set`);
 		return current;
 	}
 	return next;

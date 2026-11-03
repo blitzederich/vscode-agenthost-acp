@@ -3339,13 +3339,12 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 	}
 
 	/**
-	 * MCP tools/call → park on {@link onClientToolCallComplete}. Prefer grok's
-	 * ACP `use_tool` toolCallId (Client contributor already on that card, like
-	 * Claude reusing `tool_use_id`). Fall back to a separate Client card when
-	 * no pending use_tool matches.
+	 * MCP tools/call → stamp Client on grok's matched `use_tool` card via
+	 * Ready(NotNeeded, toolInput), then park on {@link onClientToolCallComplete}.
+	 * Falls back to a separate Client card when no pending use_tool matches.
 	 *
-	 * Grok still gates the call with session/request_permission before this
-	 * HTTP endpoint runs (no auto-approve).
+	 * Grok usually gates with session/request_permission before this endpoint;
+	 * Ready here also covers auto-allow (no permission event).
 	 */
 	private async _invokeClientTool(
 		chat: URI,
@@ -3381,6 +3380,13 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			this._logService.trace('[GrokBuild] client tools/call without matching use_tool card; falling back to separate Client card');
 		}
 
+		let toolInput: string;
+		try {
+			toolInput = JSON.stringify(args);
+		} catch {
+			toolInput = '{}';
+		}
+
 		const onAbort = () => {
 			backing.pendingClientToolCalls.respond(toolCallId, {
 				success: false,
@@ -3392,16 +3398,20 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		signal?.addEventListener('abort', onAbort, { once: true });
 		try {
 			if (matched) {
-				// Card already owned by grok's toolCallId (Client contributor from
-				// the mapper). Park only — workbench invokes via ToolClientExecution
-				// after permission Confirmed → Running.
-				return await backing.pendingClientToolCalls.register(toolCallId);
-			}
-			let toolInput: string;
-			try {
-				toolInput = JSON.stringify(args);
-			} catch {
-				toolInput = '{}';
+				// Permission (if any) already used the non-client path. Stamp Client
+				// + real args now so ToolClientExecution runs with toolInput.
+				// Ready accepts Streaming or Running (after Confirmed).
+				return await backing.pendingClientToolCalls.registerAndFire(toolCallId, () => {
+					this._fireAction(chat, {
+						type: ActionType.ChatToolCallReady,
+						turnId,
+						toolCallId,
+						invocationMessage: localize('grokBuild.clientTool.invoking', "Calling {0}", toolName),
+						toolInput,
+						confirmed: ToolCallConfirmationReason.NotNeeded,
+						contributor: { kind: ToolCallContributorKind.Client, clientId: ownerClientId },
+					});
+				});
 			}
 			return await backing.pendingClientToolCalls.registerAndFire(toolCallId, () => {
 				this._fireAction(chat, {

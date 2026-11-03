@@ -257,10 +257,15 @@ them as `client__<tool>` through search_tool/use_tool. Live 1.0.70 first emits
 ACP `tool_call` with title/`x.ai` name `use_tool` and
 `rawInput.tool_name: 'client__<tool>'`, then `session/request_permission`
 (no auto-approve), then MCP `tools/call`. The host keeps grok's toolCallId as
-the single card (display name strips `client__`, Client contributor),
-correlates MCP FIFO by tool name + args, parks on `pendingClientToolCalls`,
-and settles when `onClientToolCallComplete` runs. Without our `client` MCP
-server attached, a user's own server named `client` is left alone.
+the single card (display name strips `client__`). Client contributor is **not**
+stamped at Start — grok's permission uses the normal non-client confirmation
+UI. When MCP `tools/call` arrives, the host correlates FIFO by tool name +
+args, fires `Ready{confirmed: NotNeeded, contributor: Client, toolInput}`,
+parks on `pendingClientToolCalls`, and settles when `onClientToolCallComplete`
+runs. That Ready also covers auto-allow (no `request_permission`). A failure
+before permission emits Ready NotNeeded then Complete so the card is not left
+Streaming. Without our `client` MCP server attached, a user's own server named
+`client` is left alone.
 
 Mid-session tool-set changes update the live `tools/list` snapshot
 (`listChanged: true`). grok 1.0.70 does not advertise
