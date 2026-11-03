@@ -21,6 +21,7 @@ import {
 	type IGrokTodoItem,
 } from './grokBuildUx.js';
 import type {
+	AcpModelState,
 	AcpPermissionOption,
 	AcpRequestPermissionParams,
 	AcpSessionUpdate,
@@ -770,11 +771,30 @@ function readTokenCount(value: unknown): number | undefined {
 }
 
 /**
- * Model context window: `_meta.contextWindow` when a non-default window is
- * selected (e.g. 500000), else `_meta.totalContextTokens` (default 256000).
+ * Published model `maxContextWindow`: the model default from
+ * `_meta.totalContextTokens`. Per-session `_meta.contextWindow` on a model
+ * entry (e.g. a restored 500k selection) must not change the shared list.
  */
 export function readGrokMaxContextWindow(meta: Record<string, unknown> | undefined): number | undefined {
-	return readGrokPositiveInt(meta?.contextWindow) ?? readGrokPositiveInt(meta?.totalContextTokens);
+	return readGrokPositiveInt(meta?.totalContextTokens);
+}
+
+/**
+ * Selected window on the current model entry in a `session/load` or
+ * `session/resume` models payload. Live grok puts it at
+ * `availableModels[i]._meta.contextWindow` where `modelId === currentModelId`;
+ * result `_meta` does not carry `contextWindow`.
+ */
+export function readGrokCurrentModelContextWindow(models: AcpModelState | undefined): number | undefined {
+	if (!models) {
+		return undefined;
+	}
+	const currentId = models.currentModelId;
+	if (typeof currentId !== 'string' || currentId.length === 0) {
+		return undefined;
+	}
+	const entry = models.availableModels?.find(model => model.modelId === currentId);
+	return readGrokPositiveInt(entry?._meta?.contextWindow);
 }
 
 /**

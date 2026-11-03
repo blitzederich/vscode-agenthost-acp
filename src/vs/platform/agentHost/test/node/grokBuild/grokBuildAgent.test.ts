@@ -440,7 +440,8 @@ suite('GrokBuildAgent', () => {
 		await createPromise;
 		const models = agent.models.get();
 		assert.strictEqual(models.find(m => m.id === 'grok-4.7')?.maxContextWindow, 256000);
-		assert.strictEqual(models.find(m => m.id === 'grok-4.7-500k')?.maxContextWindow, 500000);
+		// Session `_meta.contextWindow` must not raise the published model default.
+		assert.strictEqual(models.find(m => m.id === 'grok-4.7-500k')?.maxContextWindow, 256000);
 		assert.deepStrictEqual(models.find(m => m.id === 'grok-4.7')?.configSchema?.properties?.[ContextSizeConfigKey]?.enum, [256000, 500000]);
 		assert.strictEqual(models.find(m => m.id === 'grok-4.7-500k')?.configSchema?.properties?.[ContextSizeConfigKey], undefined);
 		assert.strictEqual(models.find(m => m.id === 'grok-single')?.configSchema?.properties?.[ContextSizeConfigKey], undefined);
@@ -634,7 +635,7 @@ suite('GrokBuildAgent', () => {
 		assert.strictEqual(usageB?.tokenLimit, 256000);
 	});
 
-	test('session/load _meta.contextWindow restores model.config.contextSize', async () => {
+	test('session/load current-model contextWindow + replay model_changed restore contextSize', async () => {
 		const peer = store.add(makeFakePeer());
 		const client = store.add(new AcpClient(peer.transport));
 		const agent = createAgent();
@@ -646,6 +647,15 @@ suite('GrokBuildAgent', () => {
 		const restoring = agent.getChatMetadata(chat, context, providerData, { activation: 'restore' });
 		const load = await readNextMessage(peer.outbound);
 		assert.strictEqual(load.method, 'session/load');
+		// Live grok: model_changed arrives while history is replaying, before the load result.
+		peer.push({
+			jsonrpc: '2.0',
+			method: '_x.ai/session_notification',
+			params: {
+				sessionId: 'sess-ctx-load',
+				update: { sessionUpdate: 'model_changed', model_id: 'grok-4.7', context_window_selection: 500000 },
+			},
+		});
 		peer.push({
 			jsonrpc: '2.0',
 			id: load.id,
@@ -653,18 +663,125 @@ suite('GrokBuildAgent', () => {
 				models: {
 					currentModelId: 'grok-4.7',
 					availableModels: [
-						{ modelId: 'grok-4.7', name: 'Grok 4.7', _meta: { totalContextTokens: 256000, contextWindows: [256000, 500000] } },
+						{
+							modelId: 'grok-4.7',
+							name: 'Grok 4.7',
+							_meta: { totalContextTokens: 256000, contextWindows: [256000, 500000], contextWindow: 500000 },
+						},
 					],
 				},
 				configOptions: [],
-				_meta: { contextWindow: 500000 },
+				// Live result _meta has no contextWindow (sessionId, x.ai/sessionConfig, …).
+				_meta: { sessionId: 'sess-ctx-load', codebaseIndexed: true },
 			},
 		});
 		await answerSessionList(peer);
 		const metadata = await restoring;
 		assert.strictEqual(metadata?.model?.config?.[ContextSizeConfigKey], 500000);
 		assert.strictEqual(agent.chats.getModel?.(chat, context)?.config?.[ContextSizeConfigKey], 500000);
+		assert.strictEqual((metadata?._meta?.[GROK_COPILOT_USAGE_INFO_KEY] as { tokenLimit?: number } | undefined)?.tokenLimit, undefined);
 		assert.strictEqual(agent.models.get()[0]?.maxContextWindow, 256000);
+
+		// Reasoning-only change must still send the restored 500k window.
+		const change = agent.chats.changeModel!(chat, {
+			id: 'grok-4.7',
+			config: { [GROK_THINKING_LEVEL_KEY]: 'low' },
+		}, context);
+		const setModel = await readNextMessage(peer.outbound);
+		assert.strictEqual(setModel.method, 'session/set_model');
+		assert.deepStrictEqual(setModel.params?._meta, { contextWindow: 500000 });
+		peer.push({ jsonrpc: '2.0', id: setModel.id, result: {} });
+		const setConfig = await readNextMessage(peer.outbound);
+		assert.strictEqual(setConfig.method, 'session/set_config_option');
+		assert.deepStrictEqual(setConfig.params, { sessionId: 'sess-ctx-load', configId: 'reasoning_effort', value: 'low' });
+		peer.push({ jsonrpc: '2.0', id: setConfig.id, result: {} });
+		await change;
+		assert.strictEqual(agent.chats.getModel?.(chat, context)?.config?.[ContextSizeConfigKey], 500000);
+		assert.strictEqual(agent.models.get()[0]?.maxContextWindow, 256000);
+	});
+
+	test('loading a 500k chat leaves another chat at tokenLimit 256000', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent(new NullLogService(), { sessionMeta: {} });
+		agent.bindTestClient(client, LIVE_CAPABILITIES);
+		const signals: AgentSignal[] = [];
+		store.add(agent.onDidChatProgress(s => signals.push(s)));
+
+		const multiModel = {
+			currentModelId: 'grok-4.7',
+			availableModels: [
+				{ modelId: 'grok-4.7', name: 'Grok 4.7', _meta: { totalContextTokens: 256000, contextWindows: [256000, 500000] } },
+			],
+		};
+
+		const chatA = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/ctx-iso-a' });
+		const contextA = chatContext(chatA);
+		const createA = agent.chats.createChat(chatA, contextA, { workingDirectories: [URI.file('/tmp/a')] });
+		const sessionNewA = await readNextMessage(peer.outbound);
+		peer.push({
+			jsonrpc: '2.0',
+			id: sessionNewA.id,
+			result: { sessionId: 'sess-ctx-iso-a', models: multiModel },
+		});
+		await createA;
+		assert.strictEqual(agent.models.get()[0]?.maxContextWindow, 256000);
+
+		const sendA = agent.chats.sendMessage(chatA, 'a', [URI.file('/tmp/a')], undefined, 'turn-iso-a', undefined, contextA);
+		const promptA = await readNextMessage(peer.outbound);
+		assert.strictEqual(promptA.method, 'session/prompt');
+		peer.push({
+			jsonrpc: '2.0',
+			method: 'session/update',
+			params: {
+				sessionId: 'sess-ctx-iso-a',
+				update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'a' }, _meta: { totalTokens: 100 } },
+			},
+		});
+		peer.push({ jsonrpc: '2.0', id: promptA.id, result: { stopReason: 'end_turn', _meta: { totalTokens: 100 } } });
+		await sendA;
+		const usageABefore = (await agent.getChatMetadata(chatA, contextA))?._meta?.[GROK_COPILOT_USAGE_INFO_KEY] as { tokenLimit?: number } | undefined;
+		assert.strictEqual(usageABefore?.tokenLimit, 256000);
+
+		const chatB = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/ctx-iso-b' });
+		const contextB = chatContext(chatB);
+		const restoringB = agent.getChatMetadata(chatB, contextB, encodeGrokBuildChat({ sessionId: 'sess-ctx-iso-b', cwd: '/tmp/b' }), { activation: 'restore' });
+		const loadB = await readNextMessage(peer.outbound);
+		assert.strictEqual(loadB.method, 'session/load');
+		peer.push({
+			jsonrpc: '2.0',
+			method: '_x.ai/session_notification',
+			params: {
+				sessionId: 'sess-ctx-iso-b',
+				update: { sessionUpdate: 'model_changed', model_id: 'grok-4.7', context_window_selection: 500000 },
+			},
+		});
+		peer.push({
+			jsonrpc: '2.0',
+			id: loadB.id,
+			result: {
+				models: {
+					currentModelId: 'grok-4.7',
+					availableModels: [
+						{
+							modelId: 'grok-4.7',
+							name: 'Grok 4.7',
+							_meta: { totalContextTokens: 256000, contextWindows: [256000, 500000], contextWindow: 500000 },
+						},
+					],
+				},
+				configOptions: [],
+				_meta: { sessionId: 'sess-ctx-iso-b' },
+			},
+		});
+		await answerSessionList(peer);
+		const metadataB = await restoringB;
+		assert.strictEqual(metadataB?.model?.config?.[ContextSizeConfigKey], 500000);
+		assert.strictEqual(agent.models.get()[0]?.maxContextWindow, 256000);
+
+		const usageAAfter = (await agent.getChatMetadata(chatA, contextA))?._meta?.[GROK_COPILOT_USAGE_INFO_KEY] as { tokenLimit?: number } | undefined;
+		assert.strictEqual(usageAAfter?.tokenLimit, 256000);
+		assert.strictEqual(agent.chats.getModel?.(chatA, contextA)?.config?.[ContextSizeConfigKey], undefined);
 	});
 
 	test('totalTokens and compaction publish merged copilot.usageInfo; 0 ignored', async () => {

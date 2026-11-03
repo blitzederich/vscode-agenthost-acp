@@ -102,9 +102,9 @@ import {
 	mergeGrokModelConfigSchema,
 	GROK_COPILOT_USAGE_INFO_KEY,
 	readGrokCompactionCurrentTokens,
+	readGrokCurrentModelContextWindow,
 	readGrokMaxContextWindow,
 	readGrokModelChangedContextWindow,
-	readGrokPositiveInt,
 	readGrokTotalTokens,
 	readGrokTurnCompletedSingleCallTokens,
 	selectPermissionOptionId,
@@ -1548,6 +1548,61 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		}
 	}
 
+	/**
+	 * Restore the chat's window from the current model entry after load/resume
+	 * (`models.availableModels[i]._meta.contextWindow`). Result `_meta` does
+	 * not carry this on live grok 1.0.70.
+	 */
+	private _applyRestoredContextWindow(backing: IGrokBuildChatBacking, models: AcpModelState | undefined): void {
+		const window = readGrokCurrentModelContextWindow(models);
+		const modelId = backing.model?.id
+			?? (typeof models?.currentModelId === 'string' && models.currentModelId.length > 0 ? models.currentModelId : undefined)
+			?? backing.cliCurrentModelId;
+		if (window !== undefined && modelId) {
+			this._applyContextWindowSelection(backing, modelId, window);
+		}
+	}
+
+	/**
+	 * `model_changed.context_window_selection` for this chat. During load
+	 * replay the shared model list may not be published yet, so stash the
+	 * raw selection (override + contextSize) without publishing usage.
+	 */
+	private _noteModelChangedContextWindow(backing: IGrokBuildChatBacking, params: unknown, publishUsage: boolean): void {
+		const modelWindow = readGrokModelChangedContextWindow(params);
+		if (!modelWindow) {
+			return;
+		}
+		const modelId = backing.model?.id ?? backing.cliCurrentModelId;
+		const modelInfo = modelId ? this._models.get().find(candidate => candidate.id === modelId) : undefined;
+		const hasSchema = Array.isArray(modelInfo?.configSchema?.properties?.[ContextSizeConfigKey]?.enum);
+		if (hasSchema) {
+			// Absent / null selection means the model default — clear the override.
+			const effective = modelWindow.selection ?? this._defaultContextWindow(modelId);
+			const previous = backing.contextWindowOverride ?? this._defaultContextWindow(modelId);
+			if (effective !== previous || getModelContextSize(backing.model) !== effective) {
+				if (modelId && effective !== undefined) {
+					this._applyContextWindowSelection(backing, modelId, effective);
+				} else {
+					backing.contextWindowOverride = undefined;
+				}
+				if (publishUsage) {
+					this._publishContextUsage(backing);
+				}
+			}
+			return;
+		}
+		// Replay before session/load publishes models: keep the raw selection.
+		if (modelWindow.selection !== undefined) {
+			backing.contextWindowOverride = modelWindow.selection;
+			if (modelId) {
+				backing.model = modelWithContextSize(backing.model ?? { id: modelId }, modelWindow.selection);
+			}
+		} else {
+			backing.contextWindowOverride = undefined;
+		}
+	}
+
 	private _defaultContextWindow(modelId: string | undefined): number | undefined {
 		if (!modelId) {
 			return undefined;
@@ -2033,11 +2088,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 					backing.summary = history.title;
 				}
 				await this._reapplyReasoningEffort(client, backing);
-				const loadContextWindow = readGrokPositiveInt(result._meta?.contextWindow);
-				const applyModelId = backing.model?.id ?? (typeof modelId === 'string' && modelId.length > 0 ? modelId : undefined);
-				if (loadContextWindow !== undefined && applyModelId) {
-					this._applyContextWindowSelection(backing, applyModelId, loadContextWindow);
-				}
+				this._applyRestoredContextWindow(backing, result.models);
 				backing.modifiedTime = Date.now();
 				backing.replaySuppressChunkTotals = undefined;
 				// Prefer last replayed gauge (turn_completed / chunk / compaction);
@@ -2069,12 +2120,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 					backing.cliCurrentModelId = resumeModelId;
 				}
 				await this._reapplyReasoningEffort(client, backing);
-				const resumeContextWindow = readGrokPositiveInt(result._meta?.contextWindow);
-				const resumeApplyModelId = backing.model?.id
-					?? (typeof resumeModelId === 'string' && resumeModelId.length > 0 ? resumeModelId : undefined);
-				if (resumeContextWindow !== undefined && resumeApplyModelId) {
-					this._applyContextWindowSelection(backing, resumeApplyModelId, resumeContextWindow);
-				}
+				this._applyRestoredContextWindow(backing, result.models);
 			} catch (err) {
 				rethrowAcpFailure(err);
 			}
@@ -2527,13 +2573,15 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		if (replaying) {
 			// Load replay: prefer single-call turn_completed over chunk totalTokens.
 			// Publish happens via getChatMetadata._meta after load (session state
-			// does not exist yet).
+			// does not exist yet). Still record model_changed window selection —
+			// it arrives before the session/load result.
 			this._noteReplayTurnCompletedTokens(backing, params);
 			const compactionTokens = readGrokCompactionCurrentTokens(params);
 			if (compactionTokens !== undefined) {
 				backing.lastTotalTokens = compactionTokens;
 				backing.replaySuppressChunkTotals = true;
 			}
+			this._noteModelChangedContextWindow(backing, params, false);
 			return;
 		}
 		const compactionTokens = readGrokCompactionCurrentTokens(params);
@@ -2541,21 +2589,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			backing.lastTotalTokens = compactionTokens;
 			this._publishContextUsage(backing);
 		}
-		const modelWindow = readGrokModelChangedContextWindow(params);
-		if (modelWindow) {
-			// Absent / null selection means the model default — clear the override.
-			const modelId = backing.model?.id ?? backing.cliCurrentModelId;
-			const effective = modelWindow.selection ?? this._defaultContextWindow(modelId);
-			const previous = backing.contextWindowOverride ?? this._defaultContextWindow(modelId);
-			if (effective !== previous || getModelContextSize(backing.model) !== effective) {
-				if (modelId && effective !== undefined) {
-					this._applyContextWindowSelection(backing, modelId, effective);
-				} else {
-					backing.contextWindowOverride = undefined;
-				}
-				this._publishContextUsage(backing);
-			}
-		}
+		this._noteModelChangedContextWindow(backing, params, true);
 	}
 
 	private _handlePermissionRequest(params: AcpRequestPermissionParams): Promise<AcpServerRequestHandlerResult<AcpRequestPermissionResult>> {

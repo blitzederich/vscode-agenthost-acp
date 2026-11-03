@@ -27,6 +27,7 @@ import {
 	mapUsage,
 	readGrokCompactionCurrentTokens,
 	readGrokContextWindows,
+	readGrokCurrentModelContextWindow,
 	readGrokMaxContextWindow,
 	readGrokModelChangedContextWindow,
 	readGrokTotalTokens,
@@ -588,12 +589,28 @@ suite('GrokBuild mapSessionUpdates', () => {
 		}]);
 	});
 
-	test('maxContextWindow from totalContextTokens or contextWindow', () => {
+	test('maxContextWindow from totalContextTokens only (ignores session contextWindow)', () => {
 		assert.strictEqual(readGrokMaxContextWindow({ totalContextTokens: 256000 }), 256000);
-		assert.strictEqual(readGrokMaxContextWindow({ totalContextTokens: 256000, contextWindow: 500000 }), 500000);
+		assert.strictEqual(readGrokMaxContextWindow({ totalContextTokens: 256000, contextWindow: 500000 }), 256000);
+		assert.strictEqual(readGrokMaxContextWindow({ contextWindow: 500000 }), undefined);
 		assert.strictEqual(readGrokMaxContextWindow({ totalContextTokens: 0 }), undefined);
 		assert.strictEqual(readGrokMaxContextWindow({ contextWindow: -1 }), undefined);
 		assert.strictEqual(readGrokMaxContextWindow(undefined), undefined);
+	});
+
+	test('current model entry _meta.contextWindow is the restored selection', () => {
+		assert.strictEqual(readGrokCurrentModelContextWindow({
+			currentModelId: 'grok-4.7',
+			availableModels: [
+				{ modelId: 'other', _meta: { contextWindow: 256000 } },
+				{ modelId: 'grok-4.7', _meta: { totalContextTokens: 256000, contextWindows: [256000, 500000], contextWindow: 500000 } },
+			],
+		}), 500000);
+		assert.strictEqual(readGrokCurrentModelContextWindow({
+			currentModelId: 'grok-4.7',
+			availableModels: [{ modelId: 'grok-4.7', _meta: { totalContextTokens: 256000, contextWindows: [256000, 500000] } }],
+		}), undefined);
+		assert.strictEqual(readGrokCurrentModelContextWindow(undefined), undefined);
 	});
 
 	test('contextSize schema only when contextWindows offers more than one size', () => {

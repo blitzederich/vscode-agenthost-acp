@@ -61,22 +61,24 @@ Connection is published only after handshake succeeds so concurrent
 Models: from `session/new`; `session/set_model { sessionId, modelId }` on
 create (when `options.model` is set) and `changeModel`. Success
 `_meta.model.Ok`; unknown id → `-32602` / data `"unknown model id"`.
-`IAgentModelInfo.maxContextWindow` comes from model `_meta.contextWindow`
-when set (non-default window, e.g. 500000), else `_meta.totalContextTokens`
-(default 256000). When `_meta.contextWindows` lists more than one size
-(e.g. `[256000, 500000]`), the model picker gets a Codex-style
-`contextSize` schema from
+`IAgentModelInfo.maxContextWindow` is the model default from
+`_meta.totalContextTokens` (typically 256000) — never a per-session
+`_meta.contextWindow` on a model entry. When `_meta.contextWindows` lists
+more than one size (e.g. `[256000, 500000]`), the model picker gets a
+Codex-style `contextSize` schema from
 `createContextSizeConfigSchemaPropertyFromLimits(totalContextTokens, max(windows))`,
 merged with reasoning effort. Selecting a size always calls
 `session/set_model` with `_meta.contextWindow` set to that offered size
 (including the default 256000): omitting `_meta` preserves grok's current
 window (`resolve_switch_window` → Preserve). Unsupported sizes are ignored.
-The published model list's `maxContextWindow` stays at the model default;
-per-chat `contextWindowOverride` / `model.config.contextSize` narrow
+Per-chat `contextWindowOverride` / `model.config.contextSize` narrow
 `copilot.usageInfo.tokenLimit` and the picker. After a switch,
 `_x.ai/session_notification` `model_changed` `context_window_selection`
-(and `session/load` / `session/resume` `_meta.contextWindow`) update that
-chat's override, `contextSize`, and usage `tokenLimit`.
+(including during load history replay) and the current model entry's
+`_meta.contextWindow` on `session/load` / `session/resume` update that
+chat's override, `contextSize`, and usage `tokenLimit`. Live result
+`_meta` does not carry `contextWindow` (keys include `sessionId`,
+`x.ai/sessionConfig`, …).
 
 Usage: top-level prompt `_meta.inputTokens` / `outputTokens` /
 `cachedReadTokens` are the **last model call** (ChatUsage fields). Nested
@@ -218,7 +220,7 @@ Launch argv is unchanged: `--permission-mode` stays `default`. Presets and plan 
 | Item | Behavior |
 |------|----------|
 | Reasoning effort | `configOptions` entry `reasoning_effort` (category `thought_level`) becomes the model `thinkingLevel` schema. Live values are `xhigh`, `high`, `medium`, and `low`. The default is `high`. It persists across `session/load` and `session/set_model`. `changeModel` / create apply it with `session/set_config_option { sessionId, configId: "reasoning_effort", value }`. The value is stored on provider data. After `session/load` or `session/resume`, it is sent again only when grok's `currentValue` differs. |
-| Context size | Model `_meta.contextWindows` with more than one entry adds `contextSize` to the model config schema (alongside reasoning effort). `changeModel` / create always send `session/set_model` `_meta.contextWindow` when the effective size is an offered multi-window value (including the default 256000); omitting `_meta` preserves grok's current window. Per-chat override / `contextSize` drive usage `tokenLimit` and the picker without mutating the shared model list. `session/load` `_meta.contextWindow` and `model_changed.context_window_selection` restore that chat's selection. |
+| Context size | Model `_meta.contextWindows` with more than one entry adds `contextSize` to the model config schema (alongside reasoning effort). `changeModel` / create always send `session/set_model` `_meta.contextWindow` when the effective size is an offered multi-window value (including the default 256000); omitting `_meta` preserves grok's current window. Per-chat override / `contextSize` drive usage `tokenLimit` and the picker without mutating the shared model list. The current model entry's `_meta.contextWindow` on `session/load` / `session/resume`, and `model_changed.context_window_selection` (including during load replay, before the load result), restore that chat's selection. |
 | Slash commands | `available_commands_update` entries are `{ name, description, input: null \| { hint }, _meta? }`. A non-array is ignored. They become a read-only skill directory. A prompt is a slash command only when its first token starts with `/`. A token that contains a second `/` (`/Users/x/a.ts explain`) is a path and is rejected ("A message must not start with a path."). The deny-list is the part before the first `:`, compared case-insensitively, so `/yolo:on` and `/always-approve:on` stay rejected and are hidden from the skill directory (`always-approve`, `yolo`, `auto`, `plugins`, `plugin`, `reload-plugins`, `feedback`, `statusline`, `hooks-trust`, `hooks-add`, `settings`). Otherwise the full token up to the first whitespace, without the leading `/`, must exactly match an advertised command, case-insensitively. `/bundled:imagine` is that full name; splitting on `:` would leave `bundled` and reject a command grok advertises. grok 1.0.70 sends `available_commands_update` only after the first prompt, so a slash command as the first message of a new chat is rejected ("Slash commands become available after the first message."). Denied names still use the deny message before that list arrives. An empty advertised list is authoritative. A slash command on a later line is plain text and is forwarded. Live grok 1.0.70 honours `/yolo` as an unadvertised alias of `/always-approve`. |
 | Plan | Live turns send both a `todo_write` tool call (`rawInput { todos: [{ id, content, status }], merge }`, `_meta["x.ai/tool"].kind` `"plan"`) and ACP `plan` updates (`entries: [{ content, priority, status }]`). The first source that yields todos owns the turn; the other is dropped, so the widget is not updated three times. Each snapshot is one completed `manage_todo_list` call (`pending` → `not-started`, `in_progress` → `in-progress`, `completed` → `completed`) stamped with `_meta["grokBuild.todoList"]: true`. The chat todo widget reads that marker, not the tool name alone. |
 | Plan mode | Session config `mode` is `interactive` (default) or `plan`, the same picker Codex uses. `session/new` does not include `modes`. `plan` calls `session/set_mode { modeId: "plan" }`. `interactive` calls `{ modeId: "default" }`. The request returns `{}` for any id; plan also emits `current_mode_update { currentModeId: "plan" }`. Neither relaunches the CLI. `appliedModeId` is cleared whenever the loaded connection generation changes, and mode is applied again after every successful `session/load` or `session/resume`. If the chat is in plan mode and `session/set_mode` fails, the prompt fails. Leaving plan mode uses grok's agent→client `_x.ai/exit_plan_mode` request (`sessionId`, `toolCallId`, `planContent`), not `session/request_permission`. The host shows the Copilot plan-review UI (approve "Implement plan" / abandon / feedback; never autopilot). Reply `{ outcome: "approved" }` or `"abandoned"` or `"revise"` (+ optional `feedback`). Unknown session / no active turn / decline / skip / cancel → `revise` (never default to approved). Approve/abandon then wait for `current_mode_update` `default`, set `appliedModeId` to `default`, and write chat config `mode` to `interactive` so the next prompt does not force plan back on. Cancel/teardown resolves pending reviews as `revise`, dismisses the review UI, and locally marks the `exit_plan_mode` tool card cancelled (grok sends no update for it). Tool cards with `_meta["x.ai/tool"].kind` `exit_plan` use a "Present plan" title, hide `{}` / `{ variant: "ExitPlanMode" }` input, and surface plan markdown plus ACP `{ type: "content", content: { type: "text" } }` result text (including as the failure message instead of a generic "Tool call failed"). |
