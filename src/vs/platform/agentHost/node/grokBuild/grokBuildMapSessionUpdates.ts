@@ -6,6 +6,7 @@
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { URI } from '../../../../base/common/uri.js';
 import { appendEscapedMarkdownCodeBlockFence, appendEscapedMarkdownInlineCode } from '../../../../base/common/htmlContent.js';
+import { isHighSurrogate, isLowSurrogate } from '../../../../base/common/strings.js';
 import { localize } from '../../../../nls.js';
 import { AgentPermissionKind, type IAgentToolPendingConfirmationSignal } from '../../common/agent.js';
 import { ContextSizeConfigKey, createContextSizeConfigSchemaPropertyFromLimits } from '../../common/agentModelConfiguration.js';
@@ -1312,11 +1313,27 @@ export function selectClientToolPermissionOptionId(
 }
 
 /** Cap for JSON args embedded in the client-tool approval ChatInput message. */
-export const GROK_CLIENT_TOOL_APPROVAL_ARGS_MAX_CHARS = 4 * 1024;
+export const GROK_CLIENT_TOOL_APPROVAL_ARGS_MAX_CHARS = 32 * 1024;
 
 /**
- * Serialize and bound client-tool args for the approval message. Truncation
- * appends `…(truncated)` so a hostile/huge payload cannot blow up the ChatInput.
+ * Truncate `text` to at most `maxChars` UTF-16 code units without splitting a
+ * surrogate pair (so an emoji straddling the limit is dropped as a whole).
+ */
+export function truncateGrokClientToolApprovalArgsText(text: string, maxChars: number = GROK_CLIENT_TOOL_APPROVAL_ARGS_MAX_CHARS): string {
+	if (text.length <= maxChars) {
+		return text;
+	}
+	let end = maxChars;
+	if (end > 0 && isHighSurrogate(text.charCodeAt(end - 1)) && isLowSurrogate(text.charCodeAt(end))) {
+		end -= 1;
+	}
+	return text.slice(0, end);
+}
+
+/**
+ * Serialize and bound client-tool args for the approval message. A hostile/huge
+ * payload is cut at {@link GROK_CLIENT_TOOL_APPROVAL_ARGS_MAX_CHARS} on a
+ * code-point boundary; the ChatInput message adds a size marker after the fence.
  */
 export function formatGrokClientToolApprovalArgsText(args: Record<string, unknown>): string {
 	let text: string;
@@ -1325,28 +1342,42 @@ export function formatGrokClientToolApprovalArgsText(args: Record<string, unknow
 	} catch {
 		text = '{}';
 	}
-	if (text.length > GROK_CLIENT_TOOL_APPROVAL_ARGS_MAX_CHARS) {
-		return `${text.slice(0, GROK_CLIENT_TOOL_APPROVAL_ARGS_MAX_CHARS)}…(truncated)`;
-	}
-	return text;
+	return truncateGrokClientToolApprovalArgsText(text);
 }
 
 /**
  * ChatInput approval copy: tool name as inline code, args inside a code fence
  * longer than any backtick run in the content so markdown/links in args stay inert.
+ * When args exceed the inline cap, a plain localized size line follows the fence.
  */
 export function formatGrokClientToolApprovalMessage(toolName: string, args: Record<string, unknown>): string {
+	let fullText: string;
+	try {
+		fullText = JSON.stringify(args);
+	} catch {
+		fullText = '{}';
+	}
+	const shownText = truncateGrokClientToolApprovalArgsText(fullText);
 	const safeName = appendEscapedMarkdownInlineCode(toolName);
-	const fencedArgs = appendEscapedMarkdownCodeBlockFence(
-		formatGrokClientToolApprovalArgsText(args),
-		'json',
-	);
-	return localize(
+	const fencedArgs = appendEscapedMarkdownCodeBlockFence(shownText, 'json');
+	const message = localize(
 		'grokBuild.clientTool.approval.message',
 		"Allow client tool {0} with arguments:\n\n{1}",
 		safeName,
 		fencedArgs,
 	);
+	if (shownText.length >= fullText.length) {
+		return message;
+	}
+	const shownKb = GROK_CLIENT_TOOL_APPROVAL_ARGS_MAX_CHARS / 1024;
+	const totalKb = Math.ceil(fullText.length / 1024);
+	const truncationNote = localize(
+		'grokBuild.clientTool.approval.argsTruncated',
+		"Shown {0} KB of {1} KB",
+		shownKb,
+		totalKb,
+	);
+	return `${message}\n\n${truncationNote}`;
 }
 
 /** Whether an ACP session update kind should be ignored by the mapper. */

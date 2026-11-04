@@ -20,6 +20,7 @@ import {
 	formatGrokClientToolApprovalMessage,
 	GROK_ASK_USER_DISPLAY_NAME,
 	GROK_CLIENT_TOOL_APPROVAL_ARGS_MAX_CHARS,
+	truncateGrokClientToolApprovalArgsText,
 	GROK_COPILOT_USAGE_INFO_KEY,
 	GROK_PRESENT_PLAN_DISPLAY_NAME,
 	mapExitPlanContent,
@@ -809,10 +810,29 @@ suite('GrokBuild mapSessionUpdates', () => {
 	test('formatGrokClientToolApprovalMessage bounds huge args and fences markdown', () => {
 		const huge = { blob: 'x'.repeat(500 * 1024) };
 		const hugeMessage = formatGrokClientToolApprovalMessage('get_errors', huge);
+		const hugeArgs = formatGrokClientToolApprovalArgsText(huge);
+		assert.strictEqual(hugeArgs.length, GROK_CLIENT_TOOL_APPROVAL_ARGS_MAX_CHARS);
 		assert.ok(hugeMessage.length < GROK_CLIENT_TOOL_APPROVAL_ARGS_MAX_CHARS + 512);
-		assert.ok(hugeMessage.includes('…(truncated)'));
-		assert.ok(formatGrokClientToolApprovalArgsText(huge).endsWith('…(truncated)'));
-		assert.ok(formatGrokClientToolApprovalArgsText(huge).length <= GROK_CLIENT_TOOL_APPROVAL_ARGS_MAX_CHARS + '…(truncated)'.length);
+		assert.ok(hugeMessage.includes('Shown 32 KB of'));
+		assert.ok(!hugeMessage.includes('…(truncated)'));
+		assert.ok(!hugeArgs.includes('…(truncated)'));
+
+		const underLimit = { ok: true, n: 1 };
+		const underMessage = formatGrokClientToolApprovalMessage('get_errors', underLimit);
+		const underArgs = formatGrokClientToolApprovalArgsText(underLimit);
+		assert.strictEqual(underArgs, JSON.stringify(underLimit));
+		assert.ok(!underMessage.includes('Shown 32 KB of'));
+		assert.ok(!underMessage.includes('…(truncated)'));
+
+		// High surrogate of 😀 at index MAX-1 would be orphaned by a naive slice(0, MAX).
+		const prefix = 'a'.repeat(GROK_CLIENT_TOOL_APPROVAL_ARGS_MAX_CHARS - 1);
+		const emoji = '😀'; // U+1F600 → two UTF-16 code units
+		const straddling = prefix + emoji + 'tail';
+		const straddlingArgs = truncateGrokClientToolApprovalArgsText(straddling);
+		assert.strictEqual(straddlingArgs, prefix);
+		assert.strictEqual(straddlingArgs.length, GROK_CLIENT_TOOL_APPROVAL_ARGS_MAX_CHARS - 1);
+		assert.ok(!straddlingArgs.includes('\uD83D'));
+		assert.ok(!straddlingArgs.includes(emoji));
 
 		const hostile = {
 			a: '**x**',
