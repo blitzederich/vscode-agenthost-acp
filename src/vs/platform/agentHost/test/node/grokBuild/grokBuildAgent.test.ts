@@ -1560,6 +1560,8 @@ suite('GrokBuildAgent', () => {
 		const passive = await agent.getChatMetadata(chat, context, providerData);
 		assert.strictEqual(passive?.model?.id, 'grok-4.7');
 		assert.strictEqual(passive?.workingDirectories?.[0].fsPath, '/tmp/proj');
+		assert.strictEqual(passive?.startTime, 0);
+		assert.strictEqual(passive?.modifiedTime, 0);
 		assert.strictEqual(await readIfAny(peer.outbound), undefined);
 
 		const restoring = agent.getChatMetadata(chat, context, providerData, { activation: 'restore' });
@@ -1571,6 +1573,202 @@ suite('GrokBuildAgent', () => {
 		await answerSessionList(peer);
 		const metadata = await restoring;
 		assert.strictEqual(metadata?.summary, 'Restored');
+	});
+
+	test('restore/load without a turn keeps pre-load modifiedTime; list clamps grok load bump', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client, LIVE_CAPABILITIES);
+
+		const sessionId = 'sess-mtime-load';
+		const preLoadIso = '2026-01-15T12:00:00.000Z';
+		const preLoadMs = Date.parse(preLoadIso);
+		const postLoadIso = '2026-11-04T18:00:00.000Z';
+		const before = Date.now();
+
+		// Seed the list cache with the authentic pre-load updatedAt.
+		const seedList = agent.listChatsToMigrate();
+		const seedReq = await readNextMessage(peer.outbound);
+		assert.strictEqual(seedReq.method, 'session/list');
+		peer.push({
+			jsonrpc: '2.0',
+			id: seedReq.id,
+			result: { sessions: [{ sessionId, cwd: '/tmp/proj', title: 'Old', updatedAt: preLoadIso }] },
+		});
+		await seedList;
+
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/mtime-load' });
+		const context = chatContext(chat);
+		const restoring = agent.getChatMetadata(chat, context, encodeGrokBuildChat({ sessionId, cwd: '/tmp/proj' }), { activation: 'restore' });
+		const load = await readNextMessage(peer.outbound);
+		assert.strictEqual(load.method, 'session/load');
+		pushUpdate(peer, sessionId, { sessionUpdate: 'session_info_update', title: 'Replay title' });
+		peer.push({ jsonrpc: '2.0', id: load.id, result: {} });
+		const metadata = await restoring;
+		assert.strictEqual(metadata?.modifiedTime, preLoadMs);
+		assert.ok((metadata?.modifiedTime ?? 0) < before, 'restore must not stamp Date.now()');
+		// Listed title wins over a replayed session_info_update title.
+		assert.strictEqual(metadata?.summary, 'Old');
+
+		// Grok's post-load list returns a bumped updatedAt; listing must keep the pre-load time.
+		const listed = agent.listChatsToMigrate();
+		const listReq = await readNextMessage(peer.outbound);
+		assert.strictEqual(listReq.method, 'session/list');
+		peer.push({
+			jsonrpc: '2.0',
+			id: listReq.id,
+			result: { sessions: [{ sessionId, cwd: '/tmp/proj', title: 'Old', updatedAt: postLoadIso }] },
+		});
+		const chats = await listed;
+		assert.ok(Array.isArray(chats));
+		const row = chats.find(entry => entry.summary === 'Old');
+		assert.ok(row);
+		assert.strictEqual(row.modifiedTime, preLoadMs);
+		assert.strictEqual(row.startTime, preLoadMs);
+	});
+
+	test('completed turn bumps modifiedTime and clears the pre-load list override', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client, LIVE_CAPABILITIES);
+
+		const sessionId = 'sess-mtime-turn';
+		const preLoadIso = '2026-02-01T00:00:00.000Z';
+		const preLoadMs = Date.parse(preLoadIso);
+		const postLoadIso = '2026-11-04T20:00:00.000Z';
+
+		const seedList = agent.listChatsToMigrate();
+		const seedReq = await readNextMessage(peer.outbound);
+		peer.push({
+			jsonrpc: '2.0',
+			id: seedReq.id,
+			result: { sessions: [{ sessionId, cwd: '/tmp/proj', title: 'Turn chat', updatedAt: preLoadIso }] },
+		});
+		await seedList;
+
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/mtime-turn' });
+		const context = chatContext(chat);
+		const restoring = agent.getChatMetadata(chat, context, encodeGrokBuildChat({ sessionId, cwd: '/tmp/proj' }), { activation: 'restore' });
+		const load = await readNextMessage(peer.outbound);
+		peer.push({ jsonrpc: '2.0', id: load.id, result: {} });
+		await restoring;
+
+		const beforeSend = Date.now();
+		const send = agent.chats.sendMessage(chat, 'hi', [URI.file('/tmp/proj')], undefined, 'turn-mtime', undefined, context);
+		const prompt = await readNextMessage(peer.outbound);
+		assert.strictEqual(prompt.method, 'session/prompt');
+		peer.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
+		await send;
+		const after = await agent.getChatMetadata(chat, context);
+		assert.ok((after?.modifiedTime ?? 0) >= beforeSend);
+		assert.notStrictEqual(after?.modifiedTime, preLoadMs);
+
+		const listed = agent.listChatsToMigrate();
+		const listReq = await readNextMessage(peer.outbound);
+		peer.push({
+			jsonrpc: '2.0',
+			id: listReq.id,
+			result: { sessions: [{ sessionId, cwd: '/tmp/proj', title: 'Turn chat', updatedAt: postLoadIso }] },
+		});
+		const chats = await listed;
+		assert.ok(Array.isArray(chats));
+		const row = chats.find(entry => entry.summary === 'Turn chat');
+		assert.ok(row);
+		// Override cleared: listing follows grok's updatedAt again.
+		assert.strictEqual(row.modifiedTime, Date.parse(postLoadIso));
+	});
+
+	test('invalid or missing updatedAt lists as 0, never Date.now()', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client, LIVE_CAPABILITIES);
+		const before = Date.now();
+
+		const listed = agent.listChatsToMigrate();
+		const listReq = await readNextMessage(peer.outbound);
+		peer.push({
+			jsonrpc: '2.0',
+			id: listReq.id,
+			result: {
+				sessions: [
+					{ sessionId: 'sess-no-updated', cwd: '/tmp/a', title: 'No stamp' },
+					{ sessionId: 'sess-bad-updated', cwd: '/tmp/b', title: 'Bad stamp', updatedAt: 'not-a-date' },
+				],
+			},
+		});
+		const chats = await listed;
+		assert.ok(Array.isArray(chats));
+		assert.strictEqual(chats.length, 2);
+		for (const entry of chats) {
+			assert.strictEqual(entry.modifiedTime, 0);
+			assert.strictEqual(entry.startTime, 0);
+			assert.ok(entry.modifiedTime < before);
+		}
+	});
+
+	test('changeModel and title updates do not bump modifiedTime', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client, LIVE_CAPABILITIES);
+
+		const sessionId = 'sess-mtime-model';
+		const preLoadIso = '2026-03-01T00:00:00.000Z';
+		const preLoadMs = Date.parse(preLoadIso);
+
+		const seedList = agent.listChatsToMigrate();
+		const seedReq = await readNextMessage(peer.outbound);
+		peer.push({
+			jsonrpc: '2.0',
+			id: seedReq.id,
+			result: {
+				sessions: [{ sessionId, cwd: '/tmp/proj', title: 'Model chat', updatedAt: preLoadIso }],
+			},
+		});
+		await seedList;
+
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/mtime-model' });
+		const context = chatContext(chat);
+		const restoring = agent.getChatMetadata(chat, context, encodeGrokBuildChat({
+			sessionId,
+			cwd: '/tmp/proj',
+			model: { id: 'grok-4.7' },
+		}), { activation: 'restore' });
+		const load = await readNextMessage(peer.outbound);
+		peer.push({
+			jsonrpc: '2.0',
+			id: load.id,
+			result: {
+				models: {
+					currentModelId: 'grok-4.7',
+					availableModels: [
+						{ modelId: 'grok-4.7', name: 'Grok 4.7' },
+						{ modelId: 'grok-4.7-build-fast', name: 'Grok 4.7 Fast' },
+					],
+				},
+			},
+		});
+		await restoring;
+		assert.strictEqual((await agent.getChatMetadata(chat, context))?.modifiedTime, preLoadMs);
+
+		pushUpdate(peer, sessionId, { sessionUpdate: 'session_info_update', title: 'Renamed live' });
+		// Title updates are applied synchronously on the notification path.
+		await new Promise(resolve => setImmediate(resolve));
+		const afterTitle = await agent.getChatMetadata(chat, context);
+		assert.strictEqual(afterTitle?.summary, 'Renamed live');
+		assert.strictEqual(afterTitle?.modifiedTime, preLoadMs);
+
+		const change = agent.chats.changeModel!(chat, { id: 'grok-4.7-build-fast' }, context);
+		const setModel = await readNextMessage(peer.outbound);
+		assert.strictEqual(setModel.method, 'session/set_model');
+		peer.push({ jsonrpc: '2.0', id: setModel.id, result: {} });
+		await change;
+		const afterModel = await agent.getChatMetadata(chat, context);
+		assert.strictEqual(afterModel?.model?.id, 'grok-4.7-build-fast');
+		assert.strictEqual(afterModel?.modifiedTime, preLoadMs);
 	});
 
 	test('session/resume is used only when loadSession is absent and does not replay history', async () => {

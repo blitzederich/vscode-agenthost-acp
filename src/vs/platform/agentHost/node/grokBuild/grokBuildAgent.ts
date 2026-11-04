@@ -806,6 +806,12 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 	private readonly _historyReplays = new Map<string, IGrokHistoryReplay>();
 	/** `session/list` rows, keyed by ACP session id. Discovery fills this; recovery reads cwd and title from it. */
 	private readonly _listedSessions = new Map<string, AcpSessionInfo>();
+	/**
+	 * Pre-`session/load` / `session/resume` `updatedAt` from the cached list row.
+	 * Grok bumps list `updatedAt` on every load; listing uses
+	 * `min(recorded, grok updatedAt)` until a real turn clears the entry.
+	 */
+	private readonly _preLoadUpdatedAt = new Map<string, number>();
 	private _discoveryPromise: Promise<void> | undefined;
 	private _testClient: IAcpClient | undefined;
 	private _reasoningOption: AcpConfigOption | undefined;
@@ -1085,11 +1091,12 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 					this._rememberOwner(backing, context);
 					await this._ensureSessionAttached(backing);
 				} else {
-					const now = Date.now();
+					// Passive unread metadata: never invent Date.now() or the row
+					// jumps to the top of the sessions list until a real turn.
 					return {
 						chat,
-						startTime: now,
-						modifiedTime: now,
+						startTime: 0,
+						modifiedTime: 0,
 						model: decoded.model,
 						workingDirectories: decoded.cwd ? [URI.file(decoded.cwd)] : undefined,
 					};
@@ -1151,6 +1158,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		}
 		this._backings.clear();
 		this._sessionToChat.clear();
+		this._preLoadUpdatedAt.clear();
 		this._pendingPermissions.clear();
 		this._pendingPlanReviews.clear();
 		this._pendingAskUserQuestions.clear();
@@ -1160,13 +1168,17 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		super.dispose();
 	}
 
-	private _storeBacking(chat: URI, persisted: IGrokBuildPersistedChat, workingDirectories: readonly URI[] | undefined): IGrokBuildChatBacking {
-		const now = Date.now();
+	/**
+	 * @param initTimes Brand-new `session/new` chats pass creation times. Restores
+	 * omit this and take the cached `session/list` `updatedAt` (or 0) — never `Date.now()`.
+	 */
+	private _storeBacking(chat: URI, persisted: IGrokBuildPersistedChat, workingDirectories: readonly URI[] | undefined, initTimes?: { readonly startTime: number; readonly modifiedTime: number }): IGrokBuildChatBacking {
 		const existing = this._backings.get(chatKey(chat));
 		const sameSession = existing?.sessionId === persisted.sessionId;
 		if (existing && !sameSession) {
 			// New session id for this chat — drop the prior HTTP MCP listener.
 			this._disposeClientMcp(existing);
+			this._clearPreLoadUpdatedAt(existing.sessionId);
 			if (this._sessionToChat.get(existing.sessionId)?.toString() === chat.toString()) {
 				this._sessionToChat.delete(existing.sessionId);
 			}
@@ -1174,13 +1186,20 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		const directories = workingDirectories
 			?? (sameSession ? existing?.workingDirectories : undefined)
 			?? (persisted.cwd ? [URI.file(persisted.cwd)] : undefined);
+		const listedMs = this._listedUpdatedAtMs(persisted.sessionId);
+		const startTime = sameSession && existing
+			? existing.startTime
+			: (initTimes?.startTime ?? listedMs ?? 0);
+		const modifiedTime = sameSession && existing
+			? existing.modifiedTime
+			: (initTimes?.modifiedTime ?? listedMs ?? 0);
 		const backing: IGrokBuildChatBacking = {
 			chat,
 			sessionId: persisted.sessionId,
 			model: modelWithThinkingLevel(persisted.model ?? (sameSession ? existing?.model : undefined), persisted.reasoningEffort ?? (sameSession ? existing?.reasoningEffort : undefined)),
 			summary: sameSession ? existing?.summary : undefined,
-			startTime: sameSession && existing ? existing.startTime : now,
-			modifiedTime: now,
+			startTime,
+			modifiedTime,
 			workingDirectories: directories,
 			turns: sameSession && existing ? existing.turns : [],
 			loadedGeneration: sameSession ? existing?.loadedGeneration : undefined,
@@ -1230,8 +1249,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 	private _toListedChat(session: AcpSessionInfo): IAgentListedChat {
 		const sessionUri = AgentSession.uri(this.id, session.sessionId);
 		const chat = URI.parse(deriveLegacyDefaultChat(sessionUri));
-		const parsed = session.updatedAt ? Date.parse(session.updatedAt) : Number.NaN;
-		const modifiedTime = Number.isFinite(parsed) ? parsed : Date.now();
+		const modifiedTime = this._effectiveListedModifiedTime(session);
 		const cwd = typeof session.cwd === 'string' && session.cwd.length > 0 ? URI.file(session.cwd) : undefined;
 		const summary = typeof session.title === 'string' && session.title.trim().length > 0 ? session.title : undefined;
 		return {
@@ -1242,6 +1260,61 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			summary,
 			workingDirectories: cwd ? [cwd] : undefined,
 		};
+	}
+
+	/** Parse grok `updatedAt`; invalid/missing → undefined (callers use 0, never Date.now()). */
+	private _parseUpdatedAtMs(updatedAt: string | null | undefined): number | undefined {
+		if (!updatedAt) {
+			return undefined;
+		}
+		const parsed = Date.parse(updatedAt);
+		return Number.isFinite(parsed) ? parsed : undefined;
+	}
+
+	private _listedUpdatedAtMs(sessionId: string): number | undefined {
+		return this._parseUpdatedAtMs(this._listedSessions.get(sessionId)?.updatedAt);
+	}
+
+	/**
+	 * List/discovery recency. While a pre-load override is active, clamp to
+	 * `min(recorded, grok updatedAt)` so grok's load bump does not resurface the row.
+	 */
+	private _effectiveListedModifiedTime(session: AcpSessionInfo): number {
+		const grokMs = this._parseUpdatedAtMs(session.updatedAt);
+		const preLoadMs = this._preLoadUpdatedAt.get(session.sessionId);
+		if (preLoadMs !== undefined && grokMs !== undefined) {
+			return Math.min(preLoadMs, grokMs);
+		}
+		if (preLoadMs !== undefined) {
+			return preLoadMs;
+		}
+		if (grokMs !== undefined) {
+			return grokMs;
+		}
+		return 0;
+	}
+
+	/** Snapshot list `updatedAt` before session/load or resume bumps it on grok. */
+	private _capturePreLoadUpdatedAt(sessionId: string): void {
+		const listedMs = this._listedUpdatedAtMs(sessionId);
+		if (listedMs !== undefined) {
+			this._preLoadUpdatedAt.set(sessionId, listedMs);
+		}
+	}
+
+	private _clearPreLoadUpdatedAt(sessionId: string): void {
+		this._preLoadUpdatedAt.delete(sessionId);
+	}
+
+	/** Apply a captured pre-load time onto a restore backing that still has none. */
+	private _applyPreLoadModifiedTime(backing: IGrokBuildChatBacking): void {
+		const captured = this._preLoadUpdatedAt.get(backing.sessionId);
+		if (captured === undefined) {
+			return;
+		}
+		if (backing.modifiedTime <= 0) {
+			backing.modifiedTime = captured;
+		}
 	}
 
 	private async _createChat(chat: URI, context: URI | IAgentChatContext, options?: IAgentCreateChatOptions): Promise<IAgentCreateChatResult | void> {
@@ -1303,7 +1376,13 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			}
 		}
 
-		const backing = this._storeBacking(chat, { sessionId: sessionNew.sessionId, model: modelWithThinkingLevel(model, reasoningEffort), reasoningEffort }, workingDirectories);
+		const createdAt = Date.now();
+		const backing = this._storeBacking(
+			chat,
+			{ sessionId: sessionNew.sessionId, model: modelWithThinkingLevel(model, reasoningEffort), reasoningEffort },
+			workingDirectories,
+			{ startTime: createdAt, modifiedTime: createdAt },
+		);
 		backing.cliCurrentModelId = cliCurrentModelId;
 		this._attachClientMcpServer(backing, createMcp);
 		if (setModelApplied && createModelId && model?.id === createModelId && createContext && !createContext.ignored) {
@@ -1486,7 +1565,6 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			// Switching models without a supported contextSize clears any prior override.
 			backing.contextWindowOverride = undefined;
 		}
-		backing.modifiedTime = Date.now();
 		this._emitProviderDataChange(chat, backing);
 		this._publishContextUsage(backing);
 	}
@@ -1505,6 +1583,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		this._cancelPendingPermissionsForChat(chat);
 		this._disposeClientMcp(backing);
 		await this._closeSessionIfAdvertised(backing);
+		this._clearPreLoadUpdatedAt(backing.sessionId);
 		this._sessionToChat.delete(backing.sessionId);
 		this._backings.delete(key);
 		this._activeClients.delete(key);
@@ -1557,7 +1636,9 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			errorMessage,
 			promptIndex: backing.turnPromptIndex,
 		});
+		// Only a finished user turn advances recency — not restore, model, or title.
 		backing.modifiedTime = Date.now();
+		this._clearPreLoadUpdatedAt(backing.sessionId);
 	}
 
 	/**
@@ -2385,6 +2466,9 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			throw grokCannotRestoreSessionError();
 		}
 		const cwd = await this._cwdForLoad(backing);
+		// cwd lookup may have filled `_listedSessions`; capture before grok bumps updatedAt.
+		this._capturePreLoadUpdatedAt(backing.sessionId);
+		this._applyPreLoadModifiedTime(backing);
 		if (this._capabilities.loadSession) {
 			const replay = createGrokHistoryReplay(backing.sessionId);
 			this._historyReplays.set(backing.sessionId, replay);
@@ -2412,7 +2496,6 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 				}
 				await this._reapplyReasoningEffort(client, backing);
 				this._applyRestoredContextWindow(backing, result.models);
-				backing.modifiedTime = Date.now();
 				backing.replaySuppressChunkTotals = undefined;
 				// Prefer last replayed gauge (turn_completed / chunk / compaction);
 				// otherwise the persisted contextTokens seed. No-ops when the host
@@ -2553,6 +2636,7 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 			this._disposeClientMcp(backing);
 		}
 		this._backings.delete(key);
+		this._clearPreLoadUpdatedAt(sessionId);
 		if (this._sessionToChat.get(sessionId)?.toString() === chat.toString()) {
 			this._sessionToChat.delete(sessionId);
 		}
@@ -2854,7 +2938,6 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		const title = readGrokSessionTitle(params.update);
 		if (title) {
 			backing.summary = title;
-			backing.modifiedTime = Date.now();
 		}
 		const tokensChanged = this._noteTotalTokens(backing, params.update?._meta)
 			|| this._noteTotalTokens(backing, params._meta);
