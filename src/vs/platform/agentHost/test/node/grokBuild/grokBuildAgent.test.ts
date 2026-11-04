@@ -1680,6 +1680,84 @@ suite('GrokBuildAgent', () => {
 		assert.strictEqual(row.modifiedTime, Date.parse(postLoadIso));
 	});
 
+	test('reconnect load after list refresh keeps original pre-load modifiedTime until a turn', async () => {
+		const peer = store.add(makeFakePeer());
+		const client = store.add(new AcpClient(peer.transport));
+		const agent = createAgent();
+		agent.bindTestClient(client, LIVE_CAPABILITIES);
+
+		const sessionId = 'sess-mtime-reconnect';
+		const preLoadIso = '2026-01-10T08:00:00.000Z';
+		const preLoadMs = Date.parse(preLoadIso);
+		const postLoadIso = '2026-11-04T19:30:00.000Z';
+		const postReconnectIso = '2026-11-04T19:45:00.000Z';
+
+		const seedList = agent.listChatsToMigrate();
+		const seedReq = await readNextMessage(peer.outbound);
+		peer.push({
+			jsonrpc: '2.0',
+			id: seedReq.id,
+			result: { sessions: [{ sessionId, cwd: '/tmp/proj', title: 'Reconnect', updatedAt: preLoadIso }] },
+		});
+		await seedList;
+
+		const chat = URI.from({ scheme: GROK_BUILD_AGENT_PROVIDER_ID, path: '/chat/mtime-reconnect' });
+		const context = chatContext(chat);
+		const restoring = agent.getChatMetadata(chat, context, encodeGrokBuildChat({ sessionId, cwd: '/tmp/proj' }), { activation: 'restore' });
+		const load = await readNextMessage(peer.outbound);
+		assert.strictEqual(load.method, 'session/load');
+		peer.push({ jsonrpc: '2.0', id: load.id, result: {} });
+		await restoring;
+		assert.strictEqual((await agent.getChatMetadata(chat, context))?.modifiedTime, preLoadMs);
+
+		// Post-load list refresh caches grok's bumped updatedAt.
+		const refreshed = agent.listChatsToMigrate();
+		const refreshReq = await readNextMessage(peer.outbound);
+		peer.push({
+			jsonrpc: '2.0',
+			id: refreshReq.id,
+			result: { sessions: [{ sessionId, cwd: '/tmp/proj', title: 'Reconnect', updatedAt: postLoadIso }] },
+		});
+		const afterRefresh = await refreshed;
+		assert.ok(Array.isArray(afterRefresh));
+		assert.strictEqual(afterRefresh.find(entry => entry.summary === 'Reconnect')?.modifiedTime, preLoadMs);
+
+		// New connection generation: second load must not adopt the bumped list time.
+		const peer2 = store.add(makeFakePeer());
+		const client2 = store.add(new AcpClient(peer2.transport));
+		agent.bindTestClient(client2, LIVE_CAPABILITIES);
+		const restoring2 = agent.getChatMetadata(chat, context, undefined, { activation: 'restore' });
+		const load2 = await readNextMessage(peer2.outbound);
+		assert.strictEqual(load2.method, 'session/load');
+		peer2.push({ jsonrpc: '2.0', id: load2.id, result: {} });
+		await restoring2;
+		assert.strictEqual((await agent.getChatMetadata(chat, context))?.modifiedTime, preLoadMs);
+
+		const listedAgain = agent.listChatsToMigrate();
+		const listReq2 = await readNextMessage(peer2.outbound);
+		peer2.push({
+			jsonrpc: '2.0',
+			id: listReq2.id,
+			result: { sessions: [{ sessionId, cwd: '/tmp/proj', title: 'Reconnect', updatedAt: postReconnectIso }] },
+		});
+		const chats = await listedAgain;
+		assert.ok(Array.isArray(chats));
+		const row = chats.find(entry => entry.summary === 'Reconnect');
+		assert.ok(row);
+		assert.strictEqual(row.modifiedTime, preLoadMs);
+		assert.strictEqual(row.startTime, preLoadMs);
+
+		const beforeSend = Date.now();
+		const send = agent.chats.sendMessage(chat, 'hi', [URI.file('/tmp/proj')], undefined, 'turn-reconnect-mtime', undefined, context);
+		const prompt = await readNextMessage(peer2.outbound);
+		assert.strictEqual(prompt.method, 'session/prompt');
+		peer2.push({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
+		await send;
+		const afterTurn = await agent.getChatMetadata(chat, context);
+		assert.ok((afterTurn?.modifiedTime ?? 0) >= beforeSend);
+		assert.notStrictEqual(afterTurn?.modifiedTime, preLoadMs);
+	});
+
 	test('invalid or missing updatedAt lists as 0, never Date.now()', async () => {
 		const peer = store.add(makeFakePeer());
 		const client = store.add(new AcpClient(peer.transport));

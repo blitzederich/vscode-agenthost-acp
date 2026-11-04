@@ -810,6 +810,8 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 	 * Pre-`session/load` / `session/resume` `updatedAt` from the cached list row.
 	 * Grok bumps list `updatedAt` on every load; listing uses
 	 * `min(recorded, grok updatedAt)` until a real turn clears the entry.
+	 * Re-capture (e.g. reconnect load) keeps `min(existing, listed)` so a
+	 * post-load list refresh cannot raise the override.
 	 */
 	private readonly _preLoadUpdatedAt = new Map<string, number>();
 	private _discoveryPromise: Promise<void> | undefined;
@@ -1186,7 +1188,8 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		const directories = workingDirectories
 			?? (sameSession ? existing?.workingDirectories : undefined)
 			?? (persisted.cwd ? [URI.file(persisted.cwd)] : undefined);
-		const listedMs = this._listedUpdatedAtMs(persisted.sessionId);
+		// Prefer an active pre-load override over a post-load bumped list row.
+		const listedMs = this._seedListedUpdatedAtMs(persisted.sessionId);
 		const startTime = sameSession && existing
 			? existing.startTime
 			: (initTimes?.startTime ?? listedMs ?? 0);
@@ -1276,6 +1279,19 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 	}
 
 	/**
+	 * List `updatedAt` for seeding a backing, clamped by any active pre-load
+	 * override so a refreshed `_listedSessions` bump cannot raise modifiedTime.
+	 */
+	private _seedListedUpdatedAtMs(sessionId: string): number | undefined {
+		const listedMs = this._listedUpdatedAtMs(sessionId);
+		const preLoadMs = this._preLoadUpdatedAt.get(sessionId);
+		if (preLoadMs !== undefined && listedMs !== undefined) {
+			return Math.min(preLoadMs, listedMs);
+		}
+		return preLoadMs ?? listedMs;
+	}
+
+	/**
 	 * List/discovery recency. While a pre-load override is active, clamp to
 	 * `min(recorded, grok updatedAt)` so grok's load bump does not resurface the row.
 	 */
@@ -1294,12 +1310,18 @@ export class GrokBuildAgent extends Disposable implements IAgent {
 		return 0;
 	}
 
-	/** Snapshot list `updatedAt` before session/load or resume bumps it on grok. */
+	/**
+	 * Snapshot list `updatedAt` before session/load or resume bumps it on grok.
+	 * If an override already exists (reconnect load with no intervening turn),
+	 * keep `min(existing, listed)` — never raise it from a post-load list refresh.
+	 */
 	private _capturePreLoadUpdatedAt(sessionId: string): void {
 		const listedMs = this._listedUpdatedAtMs(sessionId);
-		if (listedMs !== undefined) {
-			this._preLoadUpdatedAt.set(sessionId, listedMs);
+		if (listedMs === undefined) {
+			return;
 		}
+		const existing = this._preLoadUpdatedAt.get(sessionId);
+		this._preLoadUpdatedAt.set(sessionId, existing !== undefined ? Math.min(existing, listedMs) : listedMs);
 	}
 
 	private _clearPreLoadUpdatedAt(sessionId: string): void {
