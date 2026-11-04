@@ -5,6 +5,8 @@
 
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { URI } from '../../../../base/common/uri.js';
+import { appendEscapedMarkdownCodeBlockFence, appendEscapedMarkdownInlineCode } from '../../../../base/common/htmlContent.js';
+import { isHighSurrogate, isLowSurrogate } from '../../../../base/common/strings.js';
 import { localize } from '../../../../nls.js';
 import { AgentPermissionKind, type IAgentToolPendingConfirmationSignal } from '../../common/agent.js';
 import { ContextSizeConfigKey, createContextSizeConfigSchemaPropertyFromLimits } from '../../common/agentModelConfiguration.js';
@@ -20,6 +22,7 @@ import {
 	todosFromToolInput,
 	type IGrokTodoItem,
 } from './grokBuildUx.js';
+import { parseGrokClientToolTarget, type IGrokClientToolTarget } from './grokBuildClientToolMcpServer.js';
 import type {
 	AcpModelState,
 	AcpPermissionOption,
@@ -35,7 +38,7 @@ import type {
 
 export interface IGrokBuildToolCallEntry {
 	readonly toolCallId: string;
-	readonly toolName: string;
+	toolName: string;
 	displayName: string;
 	readonly permissionKind: AgentPermissionKind;
 	readonly permissionPath?: string;
@@ -43,6 +46,23 @@ export interface IGrokBuildToolCallEntry {
 	readonly subagentDescription?: string;
 	/** Plan markdown attached when `_x.ai/exit_plan_mode` arrives. */
 	planContent?: string;
+	/**
+	 * Workbench client tool correlated on grok's toolCallId. While our `client`
+	 * MCP server is attached, ACP updates for this id are tracked only — the
+	 * Client card is opened at MCP `tools/call` (Start with contributor Client).
+	 * A failure before that opens one non-Client card instead.
+	 */
+	clientTool?: IGrokClientToolTarget;
+	/**
+	 * True once {@link GrokBuildAgent} fired Start{contributor: Client} for this
+	 * id. Later grok Complete/Failed updates are ignored (workbench owns Complete).
+	 */
+	clientExecutionStarted?: boolean;
+	/**
+	 * User cancelled the approval ChatInput before MCP — do not open a card if
+	 * grok later sends a terminal update for this id.
+	 */
+	cancelledBeforeClientStart?: boolean;
 	started: boolean;
 	completed: boolean;
 }
@@ -58,6 +78,12 @@ export interface IGrokBuildMapState {
 	 * The first source that produces todos owns the turn.
 	 */
 	todoSource?: 'tool' | 'plan';
+	/**
+	 * True when this chat's HTTP `client` MCP server is attached. Client-tool
+	 * `use_tool` / `client__*` ACP updates are tracked only (no card until MCP
+	 * or a pre-MCP failure) so a user's own MCP server named `client` is left alone.
+	 */
+	clientMcpAttached?: boolean;
 }
 
 /** Host display title for grok's `exit_plan_mode` / `_x.ai/exit_plan_mode` tool card. */
@@ -65,13 +91,16 @@ export const GROK_PRESENT_PLAN_DISPLAY_NAME = localize('grokBuild.tool.presentPl
 /** Host display title for grok's `ask_user_question` / `_x.ai/ask_user_question` tool card. */
 export const GROK_ASK_USER_DISPLAY_NAME = localize('grokBuild.tool.askUser', "Ask User");
 
-export function createGrokBuildMapState(turnId: string): IGrokBuildMapState {
+export function createGrokBuildMapState(turnId: string, options?: {
+	readonly clientMcpAttached?: boolean;
+}): IGrokBuildMapState {
 	return {
 		turnId,
 		markdownPartId: undefined,
 		reasoningPartId: undefined,
 		toolCalls: new Map(),
 		planSnapshots: 0,
+		clientMcpAttached: options?.clientMcpAttached,
 	};
 }
 
@@ -449,6 +478,14 @@ function toolInputText(update: AcpToolCallUpdate, entry?: IGrokBuildToolCallEntr
 			return '';
 		}
 	}
+	// Prefer the nested tool_input for client use_tool cards (not the wrapper).
+	if (entry?.clientTool) {
+		try {
+			return JSON.stringify(entry.clientTool.args);
+		} catch {
+			return '{}';
+		}
+	}
 	if (update.rawInput === undefined || update.rawInput === null) {
 		return update.title ?? '';
 	}
@@ -495,6 +532,12 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 		return [];
 	}
 
+	const clientTarget = state.clientMcpAttached ? parseGrokClientToolTarget(update) : undefined;
+	const existingEntry = state.toolCalls.get(toolCallId);
+	if (clientTarget || existingEntry?.clientTool) {
+		return mapTrackedClientToolCall(state, update, clientTarget);
+	}
+
 	const xaiName = xaiToolMeta(update)?.name;
 	if (xaiName === 'todo_write' || update.title === 'todo_write') {
 		const todos = todosFromToolInput(update.rawInput);
@@ -508,7 +551,7 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 	}
 
 	const identity = resolveToolIdentity(update);
-	let entry = state.toolCalls.get(toolCallId);
+	let entry = existingEntry;
 	const actions: (SessionAction | ChatAction)[] = [];
 	const meta = () => toolCallMeta(entry!);
 
@@ -656,6 +699,137 @@ function mapToolCall(state: IGrokBuildMapState, update: AcpToolCallUpdate): (Ses
 	}
 
 	return actions;
+}
+
+/**
+ * Track grok `use_tool` / `client__*` ACP updates without opening a card.
+ * MCP `tools/call` opens the Client card; a terminal failure before that opens
+ * one non-Client card (Start → Ready NotNeeded → Complete failed).
+ */
+function mapTrackedClientToolCall(
+	state: IGrokBuildMapState,
+	update: AcpToolCallUpdate,
+	clientTarget: IGrokClientToolTarget | undefined,
+): (SessionAction | ChatAction)[] {
+	const toolCallId = update.toolCallId!;
+	let entry = state.toolCalls.get(toolCallId);
+	const target = clientTarget ?? entry?.clientTool;
+	if (!entry && target) {
+		entry = {
+			toolCallId,
+			toolName: target.toolName,
+			displayName: target.toolName,
+			permissionKind: AgentPermissionKind.CustomTool,
+			clientTool: target,
+			started: false,
+			completed: false,
+		};
+		state.toolCalls.set(toolCallId, entry);
+	} else if (entry && target) {
+		entry.clientTool = target;
+		entry.toolName = target.toolName;
+		entry.displayName = target.toolName;
+	}
+	if (!entry) {
+		return [];
+	}
+
+	const status = (update.status ?? '').toLowerCase();
+	const terminal = status === 'completed' || status === 'failed' || status === 'cancelled';
+	if (entry.clientExecutionStarted || entry.cancelledBeforeClientStart) {
+		if (terminal) {
+			entry.completed = true;
+		}
+		return [];
+	}
+
+	if (!terminal || entry.completed) {
+		return [];
+	}
+
+	// Failure (or cancel) before MCP tools/call — one non-Client card so the
+	// turn does not end with a Streaming part.
+	entry.completed = true;
+	entry.started = true;
+	state.markdownPartId = undefined;
+	const input = toolInputText(update, entry);
+	const contentMessage = textFromToolCallContent(update.content);
+	const rawOutputText = rawOutputAsText(update.rawOutput);
+	const outputText = rawOutputText ?? contentMessage;
+	const failureMessage = outputText || 'Tool call failed';
+	const success = status === 'completed';
+	const result: ToolCallResult = {
+		success,
+		pastTenseMessage: success
+			? entry.displayName
+			: (status === 'cancelled'
+				? cancelledToolMessage(entry.displayName)
+				: `${entry.displayName} failed`),
+		content: outputText
+			? [{ type: ToolResultContentType.Text, text: outputText }]
+			: [],
+		...(!success ? { error: { message: failureMessage } } : {}),
+	};
+	return [
+		{
+			type: ActionType.ChatToolCallStart,
+			turnId: state.turnId,
+			toolCallId,
+			toolName: entry.toolName,
+			displayName: entry.displayName,
+		},
+		{
+			type: ActionType.ChatToolCallReady,
+			turnId: state.turnId,
+			toolCallId,
+			invocationMessage: entry.displayName,
+			toolInput: input,
+			confirmed: ToolCallConfirmationReason.NotNeeded,
+		},
+		{
+			type: ActionType.ChatToolCallComplete,
+			turnId: state.turnId,
+			toolCallId,
+			result,
+		},
+	];
+}
+
+/**
+ * Mark a tracked client-tool id as having an open Client card (Start already
+ * fired from MCP tools/call). Subsequent grok terminal updates are ignored.
+ */
+export function markGrokClientToolExecutionStarted(state: IGrokBuildMapState, toolCallId: string, toolName: string, args: Record<string, unknown>): void {
+	let entry = state.toolCalls.get(toolCallId);
+	if (!entry) {
+		entry = {
+			toolCallId,
+			toolName,
+			displayName: toolName,
+			permissionKind: AgentPermissionKind.CustomTool,
+			clientTool: { toolName, args },
+			started: true,
+			completed: false,
+			clientExecutionStarted: true,
+		};
+		state.toolCalls.set(toolCallId, entry);
+		return;
+	}
+	entry.started = true;
+	entry.clientExecutionStarted = true;
+	entry.clientTool = { toolName, args };
+	entry.toolName = toolName;
+	entry.displayName = toolName;
+}
+
+/** Suppress a pre-MCP failure card after the user cancels the approval ChatInput. */
+export function markGrokClientToolCancelledBeforeStart(state: IGrokBuildMapState, toolCallId: string): void {
+	const entry = state.toolCalls.get(toolCallId);
+	if (!entry) {
+		return;
+	}
+	entry.cancelledBeforeClientStart = true;
+	entry.completed = true;
 }
 
 function rawOutputAsText(rawOutput: unknown): string | undefined {
@@ -1123,6 +1297,87 @@ export function selectPermissionOptionId(
 	// Last resort: first option whose kind string contains allow/reject.
 	const fuzzy = options.find(o => approved ? o.kind.includes('allow') : o.kind.includes('reject'));
 	return fuzzy?.optionId ?? options[0]?.optionId;
+}
+
+/**
+ * Client-tool permission answers for grok: `allow_once` / `reject_once` only.
+ * Never selects `allow_always` or `reject_always`. Missing the once-scoped
+ * option → `undefined` (caller answers grok `cancelled`).
+ */
+export function selectClientToolPermissionOptionId(
+	options: readonly { readonly optionId: string; readonly kind: string }[],
+	approved: boolean,
+): string | undefined {
+	const kind = approved ? 'allow_once' : 'reject_once';
+	return options.find(o => o.kind === kind)?.optionId;
+}
+
+/** Cap for JSON args embedded in the client-tool approval ChatInput message. */
+export const GROK_CLIENT_TOOL_APPROVAL_ARGS_MAX_CHARS = 32 * 1024;
+
+/**
+ * Truncate `text` to at most `maxChars` UTF-16 code units without splitting a
+ * surrogate pair (so an emoji straddling the limit is dropped as a whole).
+ */
+export function truncateGrokClientToolApprovalArgsText(text: string, maxChars: number = GROK_CLIENT_TOOL_APPROVAL_ARGS_MAX_CHARS): string {
+	if (text.length <= maxChars) {
+		return text;
+	}
+	let end = maxChars;
+	if (end > 0 && isHighSurrogate(text.charCodeAt(end - 1)) && isLowSurrogate(text.charCodeAt(end))) {
+		end -= 1;
+	}
+	return text.slice(0, end);
+}
+
+/**
+ * Serialize and bound client-tool args for the approval message. A hostile/huge
+ * payload is cut at {@link GROK_CLIENT_TOOL_APPROVAL_ARGS_MAX_CHARS} on a
+ * code-point boundary; the ChatInput message adds a size marker after the fence.
+ */
+export function formatGrokClientToolApprovalArgsText(args: Record<string, unknown>): string {
+	let text: string;
+	try {
+		text = JSON.stringify(args);
+	} catch {
+		text = '{}';
+	}
+	return truncateGrokClientToolApprovalArgsText(text);
+}
+
+/**
+ * ChatInput approval copy: tool name as inline code, args inside a code fence
+ * longer than any backtick run in the content so markdown/links in args stay inert.
+ * When args exceed the inline cap, a plain localized size line follows the fence.
+ */
+export function formatGrokClientToolApprovalMessage(toolName: string, args: Record<string, unknown>): string {
+	let fullText: string;
+	try {
+		fullText = JSON.stringify(args);
+	} catch {
+		fullText = '{}';
+	}
+	const shownText = truncateGrokClientToolApprovalArgsText(fullText);
+	const safeName = appendEscapedMarkdownInlineCode(toolName);
+	const fencedArgs = appendEscapedMarkdownCodeBlockFence(shownText, 'json');
+	const message = localize(
+		'grokBuild.clientTool.approval.message',
+		"Allow client tool {0} with arguments:\n\n{1}",
+		safeName,
+		fencedArgs,
+	);
+	if (shownText.length >= fullText.length) {
+		return message;
+	}
+	const shownKb = GROK_CLIENT_TOOL_APPROVAL_ARGS_MAX_CHARS / 1024;
+	const totalKb = Math.ceil(fullText.length / 1024);
+	const truncationNote = localize(
+		'grokBuild.clientTool.approval.argsTruncated',
+		"Shown {0} KB of {1} KB",
+		shownKb,
+		totalKb,
+	);
+	return `${message}\n\n${truncationNote}`;
 }
 
 /** Whether an ACP session update kind should be ignored by the mapper. */

@@ -166,9 +166,9 @@ Reject ends the prompt with `stopReason: "cancelled"`.
 | `chats` | **Implemented** | See table above |
 | `materializeChat` | **Implemented** | Decodes `{ sessionId, model, cwd, reasoningEffort }` and attaches it with `session/load` or `session/resume`. `providerData === undefined` recovers a discovered session (same path as `recoverLegacyChat`) |
 | `respondToPermissionRequest` | **Implemented** | Maps approve → `allow_once` / deny → `reject_once`. Preset `allowEdits` answers `allow-once` for edit prompts that offer `allow-edits-session`, before this method runs. It never selects `allow-edits-session` |
-| `getOrCreateActiveClient` / `removeActiveClient` | **Implemented** | Minimal in-memory handles |
-| `onClientToolCallComplete` | Stub | No-op |
-| `respondToUserInputRequest` | **Implemented** | Resolves parked `_x.ai/exit_plan_mode` plan reviews (approve / revise+feedback / abandon) and `_x.ai/ask_user_question` prompts (accepted answers / skip_interview / cancelled) |
+| `getOrCreateActiveClient` / `removeActiveClient` | **Implemented** | Writes into `ActiveClientToolSet`; refreshes the client-tools HTTP MCP `tools/list` snapshot |
+| `onClientToolCallComplete` | **Implemented** | Resolves a parked HTTP MCP `tools/call` for the workbench client-tools server |
+| `respondToUserInputRequest` | **Implemented** | Resolves parked `_x.ai/exit_plan_mode` plan reviews (approve / revise+feedback / abandon), `_x.ai/ask_user_question` prompts (accepted answers / skip_interview / cancelled), and client-tool Allow once / Reject ChatInputs |
 | `resolveChatConfig` / `getInheritedChatConfig` / `chatConfigCompletions` | **Implemented** | Schema is mode (`interactive` \| `plan`) plus `grokPermissionPreset` (`ask` default, `allowEdits`). Completions stay empty |
 | `getChatCustomizations` | **Implemented** | Host customizations plus a read-only Grok Build skill directory from `available_commands_update` |
 | `getProtectedResources` | **Implemented** | `[]` — CLI owns grok.com auth; never GitHub-gated |
@@ -240,6 +240,57 @@ Launch argv is unchanged: `--permission-mode` stays `default`. Presets and plan 
 | Logging | The default log level is Info. Info, warn, and error must not contain an authenticate result (email, team, tier, team id, team name, subscription tier), a skill name, or an MCP server name. `redactGrokAuthenticateText` replaces a flat JSON object that carries those fields with `[redacted-authenticate]`, then leftover fields, then email addresses with `[redacted-email]`. ACP parse failures log the fixed string `parse error on ACP line` at error and the line only at trace, after redaction. Unrecognized messages log `unrecognized ACP message` at warn and the payload at trace. A response whose id is not a number (such as `skills-reload`) is logged at trace. Stderr is stored and traced only after redaction. Warn and error lines that include an error message use `grokLogSummary` (the first line, redacted), so a stderr tail does not land at the default level. The thrown error still includes the redacted tail, which may name a skill; it must not contain an email, team, or tier. The authenticate result is never logged at any level. |
 | E2E | `test/node/grokBuild/grokBuildE2E.test.ts`. It writes a fake ACP process, points `HOME` and `USERPROFILE` at a temp directory, unsets `XAI_API_KEY`, and spawns that process through the real stdio path (`bindTestBinaryResolver` only; spawn is not replaced). It expects the recorded assistant text `REPLAY-OK`, argv equal to `GROK_BUILD_ACP_ARGV` (`--permission-mode` then `default`, never `--always-approve`), and no `auth.json` under the temp home. It does not stat the real home. On grok 1.0.70 a credential-free replay is not possible: without credentials, `initialize` works, `authenticate { methodId: "grok.com" }` hangs for more than 20 seconds, `session/new` fails with "Authentication required", and grok makes 0 requests to `--xai-api-base-url`. With a dummy `XAI_API_KEY`, grok calls `GET /models` and `/api-key` on that URL, but `authMethods` is still only `grok.com`, `authenticate` still hangs, and `session/new` still fails. The CI-safe e2e is this fake ACP process. Run it with the grokBuild unit tests (mocha, `HOME` set to an empty temp directory, `XAI_API_KEY` unset). |
 
+## Client tools MCP (workbench language / vscode.lm tools)
+
+When `chat.agentHost.grokBuildAgent.clientToolsMcp.enabled` is true (default),
+each chat starts a **127.0.0.1** HTTP MCP server named `client` with a random
+bearer token and passes it in `mcpServers` for `session/new`, `session/load`,
+and `session/resume` as
+`{ type: 'http', name: 'client', url, headers: [{ name: 'Authorization', value: 'Bearer …' }] }`.
+Missing/invalid tokens return 401. GET probes return 405; `server/discover`
+returns JSON-RPC `-32601` (both OK for grok 1.0.70).
+
+Tools come from the session's `ActiveClientToolSet` (workbench
+`ILanguageModelToolsService` / enabled tool sets via
+`agentHostActiveClientService`), not from custom LSP wrappers. Grok surfaces
+them as `client__<tool>` through search_tool/use_tool. Live 1.0.70 first emits
+ACP `tool_call` with title/`x.ai` name `use_tool` and
+`rawInput.tool_name: 'client__<tool>'`, then usually
+`session/request_permission`, then MCP `tools/call`.
+
+While our `client` MCP is attached, those ACP updates are **tracked only**
+(`pendingGrokClientToolCalls`) — no Start/Delta/Ready for grok's id. Approval
+uses `ChatInputRequested` (single-select **Allow once** / **Reject**,
+`allowFreeformInput: false`; tool name as inline code; args truncated to ~4 KB
+inside a backtick fence so markdown stays inert), not `pending_confirmation`.
+Answers map to grok `allow_once` / `reject_once` only — never `allow_always` /
+`reject_always` (missing `reject_once` → grok `cancelled`). Allowed id+args
+are remembered in `approvedClientCalls` for the turn. Cancel/dispose completes
+the ChatInput as Cancel and answers grok `cancelled` (no card if cancelled
+before MCP).
+
+At MCP `tools/call`, the host correlates FIFO by tool name + args. Fresh-id
+fallback is always unapproved. A matched id is approved only when stored args
+structurally equal the MCP args (otherwise ask again with the real args).
+Grok auto-allow without `request_permission` also asks first. Reject returns
+MCP `isError` with `User declined` and opens no card. MCP abort during the
+question closes ChatInput as Cancel. On allow, it fires
+`Start{contributor: Client}` then `Ready{confirmed: NotNeeded, toolInput}` on
+grok's id (Client must be set at Start — the reducer ignores a late Client on
+Ready), parks on `pendingClientToolCalls`, and settles when
+`onClientToolCallComplete` runs. Grok's later Complete/Failed updates for that
+id are ignored (workbench owns Complete). A grok failure before MCP opens
+exactly one non-Client card: Start → Ready NotNeeded → Complete(failed).
+Without our `client` MCP server attached, a user's own server named `client`
+is left alone.
+
+Mid-session tool-set changes update the live `tools/list` snapshot
+(`listChanged: true`). grok 1.0.70 does not advertise
+`x.ai/session/update_mcp_servers`, so a server that was omitted at session
+start (setting off, or start failure) is only added on the next
+`session/load` / `session/resume`. The HTTP server is disposed with the chat
+and with agent shutdown.
+
 ### Deferred
 
 - `sessionCapabilities.additionalDirectories` (not advertised on 1.0.70).
@@ -248,6 +299,8 @@ Launch argv is unchanged: `--permission-mode` stays `default`. Presets and plan 
 - `session/delete`.
 - Child subagent chats. Captured traffic has no child session id to attach.
 - Relaunching to change permission mode or plan mode. The argv stays `default`.
+- Pushing `notifications/tools/list_changed` to connected streamable-HTTP
+  clients (plain JSON POST responses only today; grok re-lists via search_tool).
 
 ## Open TODOs
 

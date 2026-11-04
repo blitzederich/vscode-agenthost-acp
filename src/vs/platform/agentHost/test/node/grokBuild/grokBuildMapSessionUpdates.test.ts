@@ -16,7 +16,11 @@ import { ContextSizeConfigKey } from '../../../common/agentModelConfiguration.js
 import {
 	createGrokBuildMapState,
 	createGrokContextSizeConfigSchemaProperty,
+	formatGrokClientToolApprovalArgsText,
+	formatGrokClientToolApprovalMessage,
 	GROK_ASK_USER_DISPLAY_NAME,
+	GROK_CLIENT_TOOL_APPROVAL_ARGS_MAX_CHARS,
+	truncateGrokClientToolApprovalArgsText,
 	GROK_COPILOT_USAGE_INFO_KEY,
 	GROK_PRESENT_PLAN_DISPLAY_NAME,
 	mapExitPlanContent,
@@ -25,12 +29,14 @@ import {
 	mapTurnCompleted,
 	mapTurnStarted,
 	mapUsage,
+	markGrokClientToolExecutionStarted,
 	readGrokCompactionCurrentTokens,
 	readGrokContextWindows,
 	readGrokCurrentModelContextWindow,
 	readGrokMaxContextWindow,
 	readGrokModelChangedContextWindow,
 	readGrokTotalTokens,
+	selectClientToolPermissionOptionId,
 	selectPermissionOptionId,
 	toGrokUsageInfo,
 	withGrokContextUsage,
@@ -678,5 +684,175 @@ suite('GrokBuild mapSessionUpdates', () => {
 			tokenLimit: 256000,
 			messagesLength: 5,
 		});
+	});
+
+	test('tracks live use_tool client__ without emitting a card until pre-MCP failure', () => {
+		const state = createGrokBuildMapState('turn-client', { clientMcpAttached: true });
+		const start = mapSessionUpdate(state, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'tool_call',
+				toolCallId: 'grok-client-1',
+				title: 'use_tool',
+				kind: 'other',
+				status: 'pending',
+				rawInput: { tool_name: 'client__workspace_echo', tool_input: { msg: 'hi' } },
+				_meta: { 'x.ai/tool': { name: 'use_tool', namespace: 'grok_build' } },
+			},
+		});
+		assert.deepStrictEqual(start, []);
+		assert.strictEqual(state.toolCalls.get('grok-client-1')?.toolName, 'workspace_echo');
+		assert.strictEqual(state.toolCalls.get('grok-client-1')?.started, false);
+
+		const titled = mapSessionUpdate(state, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'tool_call_update',
+				toolCallId: 'grok-client-1',
+				title: 'client__workspace_echo',
+				kind: 'other',
+				status: 'in_progress',
+			},
+		});
+		assert.deepStrictEqual(titled, []);
+
+		const failed = mapSessionUpdate(state, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'tool_call_update',
+				toolCallId: 'grok-client-1',
+				title: 'client__workspace_echo',
+				status: 'failed',
+				rawOutput: { error: 'boom before mcp' },
+			},
+		});
+		assert.strictEqual(failed.length, 3);
+		assert.strictEqual(failed[0]!.type, ActionType.ChatToolCallStart);
+		assert.strictEqual((failed[0] as { toolName: string }).toolName, 'workspace_echo');
+		assert.strictEqual((failed[0] as { contributor?: unknown }).contributor, undefined);
+		assert.strictEqual(failed[1]!.type, ActionType.ChatToolCallReady);
+		assert.strictEqual((failed[1] as { confirmed?: string }).confirmed, 'not-needed');
+		assert.strictEqual(failed[2]!.type, ActionType.ChatToolCallComplete);
+		assert.strictEqual((failed[2] as { result: { success: boolean } }).result.success, false);
+	});
+
+	test('ignores grok terminal updates after Client execution started', () => {
+		const state = createGrokBuildMapState('turn-client-done', { clientMcpAttached: true });
+		mapSessionUpdate(state, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'tool_call',
+				toolCallId: 'grok-client-2',
+				title: 'use_tool',
+				status: 'pending',
+				rawInput: { tool_name: 'client__workspace_echo', tool_input: { msg: 'hi' } },
+				_meta: { 'x.ai/tool': { name: 'use_tool', namespace: 'grok_build' } },
+			},
+		});
+		markGrokClientToolExecutionStarted(state, 'grok-client-2', 'workspace_echo', { msg: 'hi' });
+		const done = mapSessionUpdate(state, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'tool_call_update',
+				toolCallId: 'grok-client-2',
+				title: 'client__workspace_echo',
+				status: 'completed',
+				rawOutput: { type: 'MCP', output: 'ok' },
+			},
+		});
+		assert.deepStrictEqual(done, []);
+	});
+
+	test('leaves use_tool client__ untouched when our client MCP server is off', () => {
+		const state = createGrokBuildMapState('turn-user-client', { clientMcpAttached: false });
+		const start = mapSessionUpdate(state, {
+			sessionId: 's',
+			update: {
+				sessionUpdate: 'tool_call',
+				toolCallId: 'user-mcp-1',
+				title: 'use_tool',
+				status: 'pending',
+				rawInput: { tool_name: 'client__workspace_echo', tool_input: { msg: 'hi' } },
+				_meta: { 'x.ai/tool': { name: 'use_tool', namespace: 'grok_build' } },
+			},
+		});
+		assert.ok(start.some(a => a.type === ActionType.ChatToolCallStart));
+		const startAction = start.find(a => a.type === ActionType.ChatToolCallStart) as {
+			toolName: string;
+			displayName: string;
+			contributor?: unknown;
+		};
+		assert.strictEqual(startAction.toolName, 'use_tool');
+		assert.strictEqual(startAction.displayName, 'use_tool');
+		assert.strictEqual(startAction.contributor, undefined);
+		assert.ok(start.some(a => a.type === ActionType.ChatToolCallReady));
+	});
+
+	test('selectClientToolPermissionOptionId uses allow_once / reject_once only', () => {
+		const options = [
+			{ optionId: 'allow-edits-session', kind: 'allow_always' },
+			{ optionId: 'allow-once', kind: 'allow_once' },
+			{ optionId: 'reject-always', kind: 'reject_always' },
+			{ optionId: 'reject-once', kind: 'reject_once' },
+		];
+		assert.strictEqual(selectClientToolPermissionOptionId(options, true), 'allow-once');
+		assert.strictEqual(selectClientToolPermissionOptionId(options, false), 'reject-once');
+
+		const noRejectOnce = [
+			{ optionId: 'allow-once', kind: 'allow_once' },
+			{ optionId: 'reject-always', kind: 'reject_always' },
+			{ optionId: 'reject', kind: 'reject' },
+		];
+		assert.strictEqual(selectClientToolPermissionOptionId(noRejectOnce, false), undefined);
+		assert.strictEqual(selectClientToolPermissionOptionId([{ optionId: 'allow-edits-session', kind: 'allow_always' }], true), undefined);
+	});
+
+	test('formatGrokClientToolApprovalMessage bounds huge args and fences markdown', () => {
+		const huge = { blob: 'x'.repeat(500 * 1024) };
+		const hugeMessage = formatGrokClientToolApprovalMessage('get_errors', huge);
+		const hugeArgs = formatGrokClientToolApprovalArgsText(huge);
+		assert.strictEqual(hugeArgs.length, GROK_CLIENT_TOOL_APPROVAL_ARGS_MAX_CHARS);
+		assert.ok(hugeMessage.length < GROK_CLIENT_TOOL_APPROVAL_ARGS_MAX_CHARS + 512);
+		assert.ok(hugeMessage.includes('Shown 32 KB of'));
+		assert.ok(!hugeMessage.includes('…(truncated)'));
+		assert.ok(!hugeArgs.includes('…(truncated)'));
+
+		const underLimit = { ok: true, n: 1 };
+		const underMessage = formatGrokClientToolApprovalMessage('get_errors', underLimit);
+		const underArgs = formatGrokClientToolApprovalArgsText(underLimit);
+		assert.strictEqual(underArgs, JSON.stringify(underLimit));
+		assert.ok(!underMessage.includes('Shown 32 KB of'));
+		assert.ok(!underMessage.includes('…(truncated)'));
+
+		// High surrogate of 😀 at index MAX-1 would be orphaned by a naive slice(0, MAX).
+		const prefix = 'a'.repeat(GROK_CLIENT_TOOL_APPROVAL_ARGS_MAX_CHARS - 1);
+		const emoji = '😀'; // U+1F600 → two UTF-16 code units
+		const straddling = prefix + emoji + 'tail';
+		const straddlingArgs = truncateGrokClientToolApprovalArgsText(straddling);
+		assert.strictEqual(straddlingArgs, prefix);
+		assert.strictEqual(straddlingArgs.length, GROK_CLIENT_TOOL_APPROVAL_ARGS_MAX_CHARS - 1);
+		assert.ok(!straddlingArgs.includes('\uD83D'));
+		assert.ok(!straddlingArgs.includes(emoji));
+
+		const hostile = {
+			a: '**x**',
+			b: '[x](command:foo)',
+			c: '![](https://e)',
+			d: '```',
+		};
+		const message = formatGrokClientToolApprovalMessage('get_errors', hostile);
+		assert.ok(message.includes('`get_errors`') || message.includes('`` get_errors ``'));
+		const fenceOpen = message.indexOf('```');
+		assert.ok(fenceOpen >= 0);
+		const afterFence = message.slice(fenceOpen);
+		assert.ok(afterFence.includes('**x**'));
+		assert.ok(afterFence.includes('[x](command:foo)'));
+		assert.ok(afterFence.includes('![](https://e)'));
+		assert.ok(afterFence.includes('```'));
+		// Hostile markdown must not appear as raw ChatInput prose before the fence.
+		const beforeFence = message.slice(0, fenceOpen);
+		assert.ok(!beforeFence.includes('**x**'));
+		assert.ok(!beforeFence.includes('command:foo'));
+		assert.ok(!beforeFence.includes('![](https://e)'));
 	});
 });
